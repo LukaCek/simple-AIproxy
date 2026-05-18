@@ -1,0 +1,96 @@
+name: Deploy FastAPI LLM Proxy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create dummy config.yml for testing
+        run: |
+          cat > config.yml << 'EOF'
+          groups: {}
+          EOF
+
+      - name: Start services with docker compose
+        run: docker compose up -d
+
+      - name: Wait for server to be healthy
+        run: |
+          echo "Waiting for server to be healthy..."
+          for i in {1..30}; do
+            if curl -f http://localhost:8000 > /dev/null 2>&1; then
+              echo "Server is healthy!"
+              exit 0
+            fi
+            echo "Attempt $i/30 - server not ready yet, waiting..."
+            sleep 2
+          done
+          echo "Server health check failed!"
+          docker compose logs
+          exit 1
+
+      - name: Clean up
+        if: always()
+        run: docker compose down -v
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARM64 builds
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-platform Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/simple-aiproxy:latest
+            ghcr.io/${{ github.repository_owner }}/simple-aiproxy:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: cd ${{ secrets.DEPLOY_PATH }} && ./update.sh

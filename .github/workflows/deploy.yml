@@ -2,11 +2,12 @@ name: Deploy FastAPI LLM Proxy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
+  release:
+    types: [published]  # Akcija se bo zagnala, ko objaviš nov Release
+  workflow_dispatch:    # Bonus: Doda gumb za ročni zagon akcije v GitHub vmesniku!
 
 jobs:
   test:

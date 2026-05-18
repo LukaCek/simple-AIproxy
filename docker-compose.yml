@@ -1,0 +1,12 @@
+version: "3.9"
+
+services:
+  llm-proxy:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.yml:/app/config.yml:rw
+      - ./app.db:/app/app.db:rw
+    mem_limit: 512m

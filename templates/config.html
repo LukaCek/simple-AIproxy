@@ -1,0 +1,22 @@
+{% extends "layout.html" %}
+{% block content %}
+<section class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+  <div class="flex items-center justify-between gap-4">
+    <div>
+      <h2 class="text-xl font-semibold text-slate-900">YAML Configuration</h2>
+      <p class="mt-1 text-sm text-slate-500">Edit groups, providers, model mapping, and comments.</p>
+    </div>
+    <form action="/admin/config/save" method="post">
+      <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Save YAML</button>
+    </form>
+  </div>
+  <form action="/admin/config/save" method="post" class="mt-6">
+    <textarea name="yaml_text" rows="24" class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">{{ yaml_text }}</textarea>
+  </form>
+</section>
+{% if message %}
+<div class="mt-6 rounded-3xl border border-emerald-200 bg-emerald-50 p-4 text-emerald-900 shadow-sm">
+  {{ message }}
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,31 @@
+groups:
+  smartFast:
+    description: "High-priority fast group for premium workloads"
+    endpoints:
+      - name: openaiFast
+        description: "OpenAI backend optimized for speed"
+        url: "https://api.openai.com/v1/chat/completions"
+        api_key: ""
+        model: "gpt-4o-mini"
+        priority: 10
+      - name: localFastFallback
+        description: "Local fallback server for fast responses"
+        url: "http://127.0.0.1:8080/v1/chat/completions"
+        api_key: ""
+        model: "local-fast"
+        priority: 20
+  dumbSlow:
+    description: "Lower-priority group for cheaper or slower models"
+    endpoints:
+      - name: openaiSlow
+        description: "OpenAI standard model for lower-cost usage"
+        url: "https://api.openai.com/v1/chat/completions"
+        api_key: ""
+        model: "gpt-4o"
+        priority: 10
+      - name: anotherProvider
+        description: "Alternative provider endpoint with slow throughput"
+        url: "https://example-provider.local/v1/chat/completions"
+        api_key: ""
+        model: "slow-llm-v1"
+        priority: 20

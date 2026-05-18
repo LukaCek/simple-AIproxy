@@ -222,6 +222,9 @@ async def stream_provider_response(response: httpx.Response):
         if chunk:
             yield chunk
 
+@app.get("/")
+async def health_check():
+    return {"status": "ok", "message": "Proxy deluje!"}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, background_tasks: BackgroundTasks, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> StreamingResponse:

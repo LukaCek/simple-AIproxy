@@ -15,11 +15,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create dummy config.yml for testing
+      - name: Create dummy config.yml and app.db for testing
         run: |
-          cat > config.yml << 'EOF'
-          groups: {}
+          cat > config.yml << EOF
+          groups: []
+          providers: []
           EOF
+          touch app.db
 
       - name: Start services with docker compose
         run: docker compose up -d

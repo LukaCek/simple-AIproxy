@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 import json
@@ -272,7 +273,8 @@ async def test_group_prompt(group_name: str, prompt: str) -> Dict[str, Any]:
             payload["model"] = model_name
         headers = build_provider_headers(endpoint)
         try:
-            async with http_client.stream("POST", endpoint["url"], json=payload, headers=headers, timeout=30.0) as response:
+            target_url = resolve_endpoint_url(endpoint)
+            async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=30.0) as response:
                 body = await response.aread()
                 text = body.decode("utf-8", errors="replace")
                 if response.status_code == 200:
@@ -369,6 +371,24 @@ def resolve_group(group_name: str) -> List[Dict[str, Any]]:
     return sorted_endpoints
 
 
+def resolve_endpoint_url(endpoint: Dict[str, Any]) -> str:
+    raw_url = str(endpoint.get("url", "") or "").strip()
+    if not raw_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Endpoint URL is missing")
+
+    parsed = urlparse(raw_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Endpoint URL is invalid")
+
+    path = parsed.path or ""
+    normalized_path = path.rstrip("/")
+    if "chat/completions" not in normalized_path.lower():
+        if normalized_path.endswith("/v1") or normalized_path.endswith("/openai/v1") or normalized_path.endswith("/v1beta2") or normalized_path.endswith("/v1beta3") or normalized_path == "":
+            normalized_path = normalized_path + "/chat/completions"
+    new_parsed = parsed._replace(path=normalized_path)
+    return urlunparse(new_parsed)
+
+
 def build_provider_headers(endpoint: Dict[str, Any]) -> Dict[str, str]:
     headers = {
         "Content-Type": "application/json",
@@ -406,8 +426,9 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
         provider_payload = dict(payload)
         provider_payload["model"] = provider_model
         headers = build_provider_headers(endpoint)
+        target_url = resolve_endpoint_url(endpoint)
         try:
-            async with http_client.stream("POST", endpoint["url"], json=provider_payload, headers=headers, timeout=30.0) as response:
+            async with http_client.stream("POST", target_url, json=provider_payload, headers=headers, timeout=30.0) as response:
                 if response.status_code == 200:
                     async def proxy_stream() -> Any:
                         async for chunk in response.aiter_bytes():

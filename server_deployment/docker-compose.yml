@@ -1,7 +1,7 @@
 services:
   llm-proxy:
     # Replace YOUR_GITHUB_USERNAME with your actual GitHub username
-    image: ghcr.io/YOUR_GITHUB_USERNAME/simple-aiproxy:latest
+    image: ghcr.io/lukacek/simple-aiproxy:latest
     restart: unless-stopped
     ports:
       - "8000:8000"

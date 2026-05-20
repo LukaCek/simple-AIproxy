@@ -24,7 +24,7 @@ DB_PATH = BASE_DIR / "app.db"
 
 app = FastAPI(title="LLM API Gateway")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-config_lock = threading.Lock()
+config_lock = threading.RLock()
 config_data: Dict[str, Any] = {}
 http_client: Optional[httpx.AsyncClient] = None
 watchdog_observer: Optional[Observer] = None

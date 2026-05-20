@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+import json
 import secrets
 import yaml
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request, Response, status
@@ -244,6 +245,71 @@ def find_provider(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def get_groups() -> List[Dict[str, Any]]:
+    groups_list: List[Dict[str, Any]] = []
+    with config_lock:
+        groups = config_data.get("groups", {})
+        for group_name, group in groups.items():
+            if not isinstance(group, dict):
+                continue
+            groups_list.append(
+                {
+                    "name": group_name,
+                    "description": group.get("description", ""),
+                    "endpoints": group.get("endpoints", []),
+                }
+            )
+    return groups_list
+
+
+async def test_group_prompt(group_name: str, prompt: str) -> Dict[str, Any]:
+    endpoints = resolve_group(group_name)
+    payload = {"model": None, "messages": [{"role": "user", "content": prompt}]}
+    last_error = None
+    for endpoint in endpoints:
+        model_name = endpoint.get("model")
+        if model_name:
+            payload["model"] = model_name
+        headers = build_provider_headers(endpoint)
+        try:
+            async with http_client.stream("POST", endpoint["url"], json=payload, headers=headers, timeout=30.0) as response:
+                body = await response.aread()
+                text = body.decode("utf-8", errors="replace")
+                if response.status_code == 200:
+                    try:
+                        parsed = json.loads(text)
+                        output = json.dumps(parsed, indent=2, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        output = text
+                    return {
+                        "success": True,
+                        "provider": endpoint.get("name", "unknown"),
+                        "status_code": response.status_code,
+                        "response": output,
+                    }
+                if response.status_code == 429 or 500 <= response.status_code < 600:
+                    last_error = f"{endpoint.get('name', 'unknown')} returned {response.status_code}"
+                    continue
+                return {
+                    "success": False,
+                    "provider": endpoint.get("name", "unknown"),
+                    "status_code": response.status_code,
+                    "response": text,
+                }
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
+            last_error = f"{endpoint.get('name', 'unknown')} failed: {exc}"
+            continue
+        except Exception as exc:
+            last_error = f"{endpoint.get('name', 'unknown')} unexpected error: {exc}"
+            continue
+    return {
+        "success": False,
+        "provider": endpoints[-1].get("name", "unknown") if endpoints else "unknown",
+        "status_code": 502,
+        "response": last_error or "All provider endpoints failed",
+    }
+
+
 def add_provider(name: str, base_url: str, api_key: str, description: str, group_name: str = "default") -> None:
     with config_lock:
         data = config_data
@@ -456,6 +522,43 @@ async def admin_providers_add(
 async def admin_providers_delete(name: str) -> Dict[str, Any]:
     delete_provider(name)
     return {"status": "ok", "message": f"Provider '{name}' deleted."}
+
+
+@app.get("/admin/playground", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
+def admin_playground(request: Request, result: Optional[str] = None, provider: Optional[str] = None, status_code: Optional[int] = None, error: Optional[str] = None) -> Any:
+    return templates.TemplateResponse(
+        "playground.html",
+        {
+            "request": request,
+            "groups": get_groups(),
+            "result": result,
+            "provider": provider,
+            "status_code": status_code,
+            "error": error,
+        },
+    )
+
+
+@app.post("/admin/playground", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
+async def admin_playground_run(
+    request: Request,
+    group: str = Form(...),
+    prompt: str = Form(...),
+) -> Any:
+    response = await test_group_prompt(group, prompt)
+    return templates.TemplateResponse(
+        "playground.html",
+        {
+            "request": request,
+            "groups": get_groups(),
+            "result": response.get("response"),
+            "provider": response.get("provider"),
+            "status_code": response.get("status_code"),
+            "error": None if response.get("success") else response.get("response"),
+            "selected_group": group,
+            "prompt": prompt,
+        },
+    )
 
 
 @app.post("/admin/config/update", dependencies=[Depends(verify_admin)])

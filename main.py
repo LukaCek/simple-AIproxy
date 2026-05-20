@@ -209,6 +209,87 @@ def create_api_key(name: str) -> str:
     return token
 
 
+def get_providers() -> List[Dict[str, Any]]:
+    providers: List[Dict[str, Any]] = []
+    with config_lock:
+        groups = config_data.get("groups", {})
+        for group_name, group in groups.items():
+            if not isinstance(group, dict):
+                continue
+            for endpoint in group.get("endpoints", []):
+                providers.append(
+                    {
+                        "name": endpoint.get("name", ""),
+                        "url": endpoint.get("url", ""),
+                        "api_key": endpoint.get("api_key", ""),
+                        "description": endpoint.get("description", ""),
+                        "group": group_name,
+                        "model": endpoint.get("model", ""),
+                        "priority": endpoint.get("priority", 100),
+                    }
+                )
+    return providers
+
+
+def find_provider(name: str) -> Optional[Dict[str, Any]]:
+    with config_lock:
+        groups = config_data.get("groups", {})
+        for group_name, group in groups.items():
+            if not isinstance(group, dict):
+                continue
+            endpoints = group.get("endpoints", [])
+            for endpoint in endpoints:
+                if endpoint.get("name") == name:
+                    return {"group": group_name, "endpoint": endpoint}
+    return None
+
+
+def add_provider(name: str, base_url: str, api_key: str, description: str, group_name: str = "default") -> None:
+    with config_lock:
+        data = config_data
+        groups = data.setdefault("groups", {})
+        group = groups.setdefault(group_name, {"description": "Admin-created provider group", "endpoints": []})
+        if not isinstance(group, dict):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid groups config")
+        endpoints = group.setdefault("endpoints", [])
+        if any(
+            endpoint.get("name") == name
+            for group_item in groups.values()
+            if isinstance(group_item, dict)
+            for endpoint in group_item.get("endpoints", [])
+        ):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider name '{name}' already exists")
+        endpoints.append(
+            {
+                "name": name,
+                "url": base_url,
+                "api_key": api_key,
+                "description": description,
+                "model": name,
+                "priority": 100,
+            }
+        )
+        save_config(data)
+
+
+def delete_provider(name: str) -> None:
+    with config_lock:
+        data = config_data
+        groups = data.get("groups", {})
+        deleted = False
+        for group in groups.values():
+            if not isinstance(group, dict):
+                continue
+            endpoints = group.get("endpoints", [])
+            filtered = [endpoint for endpoint in endpoints if endpoint.get("name") != name]
+            if len(filtered) != len(endpoints):
+                group["endpoints"] = filtered
+                deleted = True
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{name}' not found")
+        save_config(data)
+
+
 def resolve_group(group_name: str) -> List[Dict[str, Any]]:
     with config_lock:
         groups = config_data.get("groups", {})
@@ -353,6 +434,28 @@ async def admin_config_save(yaml_text: str = Form(...)) -> RedirectResponse:
         return RedirectResponse(url="/admin/config", status_code=status.HTTP_303_SEE_OTHER)
     except yaml.YAMLError as exc:
         return HTMLResponse(content=f"Invalid YAML: {exc}", status_code=400)
+
+
+@app.get("/admin/providers", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
+def admin_providers(request: Request) -> Any:
+    return templates.TemplateResponse("providers.html", {"request": request, "providers": get_providers()})
+
+
+@app.post("/admin/providers", dependencies=[Depends(verify_admin)])
+async def admin_providers_add(
+    name: str = Form(...),
+    base_url: str = Form(...),
+    api_key: str = Form(""),
+    description: str = Form(""),
+) -> RedirectResponse:
+    add_provider(name=name.strip(), base_url=base_url.strip(), api_key=api_key.strip(), description=description.strip())
+    return RedirectResponse(url="/admin/providers", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.delete("/admin/providers/{name}", dependencies=[Depends(verify_admin)])
+async def admin_providers_delete(name: str) -> Dict[str, Any]:
+    delete_provider(name)
+    return {"status": "ok", "message": f"Provider '{name}' deleted."}
 
 
 @app.post("/admin/config/update", dependencies=[Depends(verify_admin)])

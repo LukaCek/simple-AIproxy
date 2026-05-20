@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+import secrets
 import yaml
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from watchdog.events import FileSystemEventHandler
@@ -26,6 +28,21 @@ config_lock = threading.Lock()
 config_data: Dict[str, Any] = {}
 http_client: Optional[httpx.AsyncClient] = None
 watchdog_observer: Optional[Observer] = None
+
+admin_security = HTTPBasic()
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+
+
+def verify_admin(credentials: HTTPBasicCredentials = Depends(admin_security)) -> None:
+    is_valid_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
+    is_valid_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not (is_valid_username and is_valid_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -300,23 +317,23 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=last_error or "All provider endpoints failed")
 
 
-@app.get("/admin/keys", response_class=HTMLResponse)
+@app.get("/admin/keys", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_keys(request: Request) -> Any:
     return templates.TemplateResponse("keys.html", {"request": request, "api_keys": list_api_keys()})
 
 
-@app.post("/admin/keys/new")
+@app.post("/admin/keys/new", dependencies=[Depends(verify_admin)])
 async def admin_keys_new(name: str = Form(...)) -> RedirectResponse:
     create_api_key(name)
     return RedirectResponse(url="/admin/keys", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@app.get("/admin/logs", response_class=HTMLResponse)
+@app.get("/admin/logs", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_logs(request: Request) -> Any:
     return templates.TemplateResponse("logs.html", {"request": request, "logs": list_logs()})
 
 
-@app.get("/admin/config", response_class=HTMLResponse)
+@app.get("/admin/config", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_config(request: Request, message: Optional[str] = None) -> Any:
     with config_lock:
         yaml_text = yaml.safe_dump(config_data, sort_keys=False)
@@ -326,7 +343,7 @@ def admin_config(request: Request, message: Optional[str] = None) -> Any:
     )
 
 
-@app.post("/admin/config/save")
+@app.post("/admin/config/save", dependencies=[Depends(verify_admin)])
 async def admin_config_save(yaml_text: str = Form(...)) -> RedirectResponse:
     try:
         parsed = yaml.safe_load(yaml_text)
@@ -338,12 +355,12 @@ async def admin_config_save(yaml_text: str = Form(...)) -> RedirectResponse:
         return HTMLResponse(content=f"Invalid YAML: {exc}", status_code=400)
 
 
-@app.post("/admin/config/update")
+@app.post("/admin/config/update", dependencies=[Depends(verify_admin)])
 async def api_config_update(payload: Dict[str, Any]) -> Dict[str, Any]:
     save_config(payload)
     return {"status": "ok", "message": "Configuration updated."}
 
 
-@app.get("/admin", response_class=HTMLResponse)
+@app.get("/admin", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_root(request: Request) -> RedirectResponse:
     return RedirectResponse(url="/admin/keys")

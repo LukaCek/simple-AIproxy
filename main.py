@@ -476,7 +476,9 @@ def add_provider(name: str, base_url: str, api_key: str, description: str, model
         data = config_data
         providers = data.setdefault("providers", [])
         if not isinstance(providers, list):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid providers config")
+            # Coerce invalid providers config to empty list to allow admin fixes via UI
+            providers = []
+            data["providers"] = providers
         if any(provider.get("name") == name for provider in providers if isinstance(provider, dict)):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider name '{name}' already exists")
         providers.append(
@@ -496,7 +498,9 @@ def delete_provider(name: str) -> None:
         data = config_data
         providers = data.get("providers", [])
         if not isinstance(providers, list):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid providers config")
+            # Coerce invalid providers config to empty list to allow admin fixes via UI
+            providers = []
+            data["providers"] = providers
         before = len(providers)
         providers = [provider for provider in providers if provider.get("name") != name]
         if len(providers) == before:

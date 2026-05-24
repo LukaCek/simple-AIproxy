@@ -57,10 +57,7 @@
         <label class="mb-2 block text-sm font-medium text-slate-700" for="api_key">API Key</label>
         <input id="api_key" name="api_key" class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Bearer token or API key" />
       </div>
-      <div>
-        <label class="mb-2 block text-sm font-medium text-slate-700" for="models">Models</label>
-        <input id="models" name="models" required class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Enter comma-separated model names" />
-      </div>
+      <!-- Models are discovered automatically from the provider endpoint -->
       <div>
         <label class="mb-2 block text-sm font-medium text-slate-700" for="description">Comment / Description</label>
         <textarea id="description" name="description" rows="4" class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Optional note about this provider"></textarea>

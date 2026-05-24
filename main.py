@@ -103,27 +103,81 @@ def save_config(data: Dict[str, Any]) -> None:
         config_data = data
 
 
-def add_provider(name: str, base_url: str, api_key: str, description: str, models: List[str]) -> None:
-    normalized_models = [str(model).strip() for model in models if str(model).strip()]
-    if not normalized_models:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one model is required for a provider")
-    with config_lock:
-        data = config_data
-        providers = data.setdefault("providers", [])
-        if not isinstance(providers, list):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid providers config")
-        if any(provider.get("name") == name for provider in providers if isinstance(provider, dict)):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider name '{name}' already exists")
-        providers.append(
-            {
-                "name": name,
-                "url": base_url,
-                "api_key": api_key,
-                "description": description,
-                "models": normalized_models,
-            }
-        )
-        save_config(data)
+async def discover_models(base_url: str, api_key: str) -> List[str]:
+    """Attempt to discover available model ids from a provider's models endpoint.
+
+    Tries a few common candidate URLs and parses several response shapes.
+    Returns a list of model id strings (may be empty on failure).
+    """
+    if not base_url:
+        return []
+    candidates: List[str] = []
+    base = base_url.rstrip("/")
+    candidates.append(base + "/v1/models")
+    candidates.append(base + "/models")
+    try:
+        parsed = urlparse(base_url)
+        root = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+        candidates.append(root.rstrip("/") + "/v1/models")
+        candidates.append(root.rstrip("/") + "/models")
+    except Exception:
+        pass
+
+    headers = {"User-Agent": "llm-proxy/1.0"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    found: List[str] = []
+    for url in candidates:
+        try:
+            resp = await http_client.get(url, headers=headers, timeout=10.0)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            # not JSON
+            continue
+
+        # data could be: {"data": [{"id": "..."}, ...]}, {"models": [...]}, or a flat list
+        candidates_list: List[str] = []
+        if isinstance(data, dict):
+            if isinstance(data.get("data"), list):
+                for item in data.get("data", []):
+                    if isinstance(item, dict):
+                        v = item.get("id") or item.get("name")
+                        if v:
+                            candidates_list.append(str(v))
+                    elif isinstance(item, str):
+                        candidates_list.append(item)
+            if not candidates_list and isinstance(data.get("models"), list):
+                for item in data.get("models", []):
+                    if isinstance(item, dict):
+                        v = item.get("id") or item.get("name")
+                        if v:
+                            candidates_list.append(str(v))
+                    elif isinstance(item, str):
+                        candidates_list.append(item)
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    v = item.get("id") or item.get("name")
+                    if v:
+                        candidates_list.append(str(v))
+                elif isinstance(item, str):
+                    candidates_list.append(item)
+
+        # dedupe while preserving order
+        for m in candidates_list:
+            if m and m not in found:
+                found.append(m)
+
+        if found:
+            break
+
+    return found
 
 
 def normalize_config_schema(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -685,9 +739,11 @@ async def admin_providers_add(
     base_url: str = Form(...),
     api_key: str = Form(""),
     description: str = Form(""),
-    models_value: str = Form(""),
 ) -> RedirectResponse:
-    add_provider(name=name.strip(), base_url=base_url.strip(), api_key=api_key.strip(), description=description.strip(), models=[model.strip() for model in models_value.split(",") if model.strip()])
+    discovered = await discover_models(base_url.strip(), api_key.strip())
+    if not discovered:
+        discovered = [name.strip()]
+    add_provider(name=name.strip(), base_url=base_url.strip(), api_key=api_key.strip(), description=description.strip(), models=discovered)
     return RedirectResponse(url="/admin/providers", status_code=status.HTTP_303_SEE_OTHER)
 
 

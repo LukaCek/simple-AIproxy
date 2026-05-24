@@ -5,24 +5,30 @@
     <div class="flex items-center justify-between gap-4">
       <div>
         <h2 class="text-xl font-semibold text-slate-900">Playground</h2>
-        <p class="mt-1 text-sm text-slate-500">Quickly test your configured model groups and view available modes.</p>
+        <p class="mt-1 text-sm text-slate-500">Select a provider and model, then test the prompt directly.</p>
       </div>
     </div>
     <div class="mt-6 grid gap-6 lg:grid-cols-[1fr_360px]">
       <div class="space-y-4">
         <form action="/admin/playground" method="post" class="space-y-6">
           <div>
-            <label class="mb-2 block text-sm font-medium text-slate-700" for="group">Mode / Group</label>
-            <select id="group" name="group" required class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
-              <option value="">Select a mode</option>
-              {% for group in groups %}
-              <option value="{{ group.name }}" {% if selected_group == group.name %}selected{% endif %}>{{ group.name }}{% if group.description %} — {{ group.description }}{% endif %}</option>
+            <label class="mb-2 block text-sm font-medium text-slate-700" for="provider">Provider</label>
+            <select id="provider" name="provider" required onchange="updateModels()" class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
+              <option value="">Select a provider</option>
+              {% for provider in providers %}
+              <option value="{{ provider.name }}" {% if selected_provider == provider.name %}selected{% endif %}>{{ provider.name }}</option>
               {% endfor %}
             </select>
           </div>
           <div>
+            <label class="mb-2 block text-sm font-medium text-slate-700" for="model">Model</label>
+            <select id="model" name="model" required class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
+              <option value="">Select a model</option>
+            </select>
+          </div>
+          <div>
             <label class="mb-2 block text-sm font-medium text-slate-700" for="prompt">Prompt</label>
-            <textarea id="prompt" name="prompt" rows="8" required class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Enter the text you want to send to the selected model group">{{ prompt or '' }}</textarea>
+            <textarea id="prompt" name="prompt" rows="8" required class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Enter the text you want to send to the selected model">{{ prompt or '' }}</textarea>
           </div>
           <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Run Test</button>
         </form>
@@ -32,6 +38,10 @@
             <div>
               <p class="text-sm text-slate-500">Provider:</p>
               <p class="font-medium text-slate-900">{{ provider or '-' }}</p>
+            </div>
+            <div>
+              <p class="text-sm text-slate-500">Model</p>
+              <p class="font-medium text-slate-900">{{ selected_model or '-' }}</p>
             </div>
             <div>
               <p class="text-sm text-slate-500">Status</p>
@@ -48,34 +58,63 @@
         {% endif %}
       </div>
       <aside class="rounded-3xl border border-slate-200 bg-slate-50 p-6 shadow-sm">
-        <h3 class="text-lg font-semibold text-slate-900">Available Modes</h3>
-        <p class="mt-2 text-sm text-slate-500">Model groups currently configured in your proxy.</p>
+        <h3 class="text-lg font-semibold text-slate-900">Configured Providers</h3>
+        <p class="mt-2 text-sm text-slate-500">Select a provider to see its available models.</p>
         <div class="mt-4 space-y-4">
-          {% for group in groups %}
+          {% for provider in providers %}
           <div class="rounded-3xl border border-slate-200 bg-white p-4">
-            <h4 class="font-semibold text-slate-900">{{ group.name }}</h4>
-            {% if group.description %}
-            <p class="mt-1 text-sm text-slate-500">{{ group.description }}</p>
-            {% endif %}
-            {% if group.endpoints %}
-            <div class="mt-3 space-y-2 text-sm text-slate-700">
-              {% for endpoint in group.endpoints %}
-              <div class="rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                <p class="font-medium text-slate-800">{{ endpoint.name or 'unknown' }}</p>
-                <p class="text-slate-500">{{ endpoint.url or '-' }}</p>
-              </div>
-              {% endfor %}
-            </div>
-            {% else %}
-            <p class="mt-3 text-sm text-slate-500">No endpoints configured for this mode.</p>
-            {% endif %}
+            <h4 class="font-semibold text-slate-900">{{ provider.name }}</h4>
+            <p class="mt-1 text-sm text-slate-500 break-all">{{ provider.url }}</p>
+            <p class="mt-3 text-sm text-slate-700">Models: {{ provider.models | join(', ') }}</p>
           </div>
           {% else %}
-          <p class="text-sm text-slate-500">No modes configured yet. Add providers or groups in the config.</p>
+          <p class="text-sm text-slate-500">No providers configured yet. Add providers in the admin panel.</p>
           {% endfor %}
         </div>
       </aside>
     </div>
   </section>
 </div>
+<script>
+  const providerModels = {
+    {% for provider in providers %}
+    "{{ provider.name }}": {{ provider.models | tojson }},
+    {% endfor %}
+  };
+
+  function setSelectedModel() {
+    const selectedProvider = "{{ selected_provider | default('') }}";
+    const selectedModel = "{{ selected_model | default('') }}";
+    const modelSelect = document.getElementById('model');
+    modelSelect.innerHTML = '<option value="">Select a model</option>';
+    if (selectedProvider && providerModels[selectedProvider]) {
+      providerModels[selectedProvider].forEach(model => {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model;
+        if (selectedModel === model) {
+          option.selected = true;
+        }
+        modelSelect.appendChild(option);
+      });
+    }
+  }
+
+  function updateModels() {
+    const providerSelect = document.getElementById('provider');
+    const modelSelect = document.getElementById('model');
+    const models = providerModels[providerSelect.value] || [];
+    modelSelect.innerHTML = '<option value="">Select a model</option>';
+    models.forEach(model => {
+      const option = document.createElement('option');
+      option.value = model;
+      option.textContent = model;
+      modelSelect.appendChild(option);
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', function() {
+    setSelectedModel();
+  });
+</script>
 {% endblock %}

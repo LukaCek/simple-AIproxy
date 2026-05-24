@@ -92,7 +92,7 @@ def load_config() -> Dict[str, Any]:
             raise FileNotFoundError(f"Missing config file: {CONFIG_PATH}")
         with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
             data = yaml.safe_load(handle) or {}
-        return data
+        return normalize_config_schema(data)
 
 
 def save_config(data: Dict[str, Any]) -> None:
@@ -101,6 +101,107 @@ def save_config(data: Dict[str, Any]) -> None:
             yaml.safe_dump(data, handle, sort_keys=False)
         global config_data
         config_data = data
+
+
+def add_provider(name: str, base_url: str, api_key: str, description: str, models: List[str]) -> None:
+    normalized_models = [str(model).strip() for model in models if str(model).strip()]
+    if not normalized_models:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one model is required for a provider")
+    with config_lock:
+        data = config_data
+        providers = data.setdefault("providers", [])
+        if not isinstance(providers, list):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid providers config")
+        if any(provider.get("name") == name for provider in providers if isinstance(provider, dict)):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider name '{name}' already exists")
+        providers.append(
+            {
+                "name": name,
+                "url": base_url,
+                "api_key": api_key,
+                "description": description,
+                "models": normalized_models,
+            }
+        )
+        save_config(data)
+
+
+def normalize_config_schema(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"providers": [], "groups": {}}
+
+    if "providers" not in data:
+        providers: List[Dict[str, Any]] = []
+        provider_names: Dict[str, Dict[str, Any]] = {}
+        groups = data.get("groups", {})
+        new_groups: Dict[str, Any] = {}
+        if isinstance(groups, dict):
+            for group_name, group in groups.items():
+                if not isinstance(group, dict):
+                    continue
+                members: List[Dict[str, Any]] = []
+                for endpoint in group.get("endpoints", []):
+                    if not isinstance(endpoint, dict):
+                        continue
+                    provider_name = str(endpoint.get("name", "")).strip()
+                    if not provider_name:
+                        continue
+                    model_name = endpoint.get("model") or provider_name
+                    if provider_name not in provider_names:
+                        provider = {
+                            "name": provider_name,
+                            "url": endpoint.get("url", ""),
+                            "api_key": endpoint.get("api_key", ""),
+                            "description": endpoint.get("description", ""),
+                            "models": [model_name] if model_name else [],
+                        }
+                        provider_names[provider_name] = provider
+                        providers.append(provider)
+                    else:
+                        provider = provider_names[provider_name]
+                        if model_name and model_name not in provider.get("models", []):
+                            provider["models"].append(model_name)
+                    members.append({"provider": provider_name, "model": model_name})
+                new_groups[group_name] = {
+                    "description": group.get("description", ""),
+                    "members": members,
+                }
+        data["providers"] = providers
+        data["groups"] = new_groups
+
+    if isinstance(data.get("providers"), list):
+        normalized_providers: List[Dict[str, Any]] = []
+        for provider in data.get("providers", []):
+            if not isinstance(provider, dict):
+                continue
+            models = provider.get("models")
+            if models is None:
+                maybe_model = provider.get("model")
+                provider["models"] = [maybe_model] if maybe_model else []
+            elif not isinstance(models, list):
+                provider["models"] = [models]
+            else:
+                provider["models"] = [str(item) for item in models if item is not None]
+            normalized_providers.append(provider)
+        data["providers"] = normalized_providers
+
+    groups = data.get("groups", {})
+    if isinstance(groups, dict):
+        for group in groups.values():
+            if not isinstance(group, dict):
+                continue
+            if "members" not in group and "endpoints" in group:
+                members: List[Dict[str, Any]] = []
+                for endpoint in group.get("endpoints", []):
+                    if not isinstance(endpoint, dict):
+                        continue
+                    members.append({
+                        "provider": endpoint.get("name"),
+                        "model": endpoint.get("model") or endpoint.get("name"),
+                    })
+                group["members"] = members
+                group.pop("endpoints", None)
+    return data
 
 
 def reload_config() -> None:
@@ -212,38 +313,39 @@ def create_api_key(name: str) -> str:
 
 
 def get_providers() -> List[Dict[str, Any]]:
-    providers: List[Dict[str, Any]] = []
+    providers_list: List[Dict[str, Any]] = []
     with config_lock:
-        groups = config_data.get("groups", {})
-        for group_name, group in groups.items():
-            if not isinstance(group, dict):
+        for provider in config_data.get("providers", []):
+            if not isinstance(provider, dict):
                 continue
-            for endpoint in group.get("endpoints", []):
-                providers.append(
-                    {
-                        "name": endpoint.get("name", ""),
-                        "url": endpoint.get("url", ""),
-                        "api_key": endpoint.get("api_key", ""),
-                        "description": endpoint.get("description", ""),
-                        "group": group_name,
-                        "model": endpoint.get("model", ""),
-                        "priority": endpoint.get("priority", 100),
-                    }
-                )
-    return providers
+            providers_list.append(
+                {
+                    "name": provider.get("name", ""),
+                    "url": provider.get("url", ""),
+                    "api_key": provider.get("api_key", ""),
+                    "description": provider.get("description", ""),
+                    "models": provider.get("models", []),
+                }
+            )
+    return providers_list
 
 
 def find_provider(name: str) -> Optional[Dict[str, Any]]:
     with config_lock:
-        groups = config_data.get("groups", {})
-        for group_name, group in groups.items():
-            if not isinstance(group, dict):
+        for provider in config_data.get("providers", []):
+            if not isinstance(provider, dict):
                 continue
-            endpoints = group.get("endpoints", [])
-            for endpoint in endpoints:
-                if endpoint.get("name") == name:
-                    return {"group": group_name, "endpoint": endpoint}
+            if provider.get("name") == name:
+                return provider
     return None
+
+
+def get_models_for_provider(provider_name: str) -> List[str]:
+    provider = find_provider(provider_name)
+    if provider is None:
+        return []
+    models = provider.get("models", [])
+    return [str(model) for model in models if model is not None]
 
 
 def get_groups() -> List[Dict[str, Any]]:
@@ -257,7 +359,7 @@ def get_groups() -> List[Dict[str, Any]]:
                 {
                     "name": group_name,
                     "description": group.get("description", ""),
-                    "endpoints": group.get("endpoints", []),
+                    "members": group.get("members", []),
                 }
             )
     return groups_list
@@ -312,29 +414,24 @@ async def test_group_prompt(group_name: str, prompt: str) -> Dict[str, Any]:
     }
 
 
-def add_provider(name: str, base_url: str, api_key: str, description: str, group_name: str = "default") -> None:
+def add_provider(name: str, base_url: str, api_key: str, description: str, models: List[str]) -> None:
+    normalized_models = [str(model).strip() for model in models if str(model).strip()]
+    if not normalized_models:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one model is required for a provider")
     with config_lock:
         data = config_data
-        groups = data.setdefault("groups", {})
-        group = groups.setdefault(group_name, {"description": "Admin-created provider group", "endpoints": []})
-        if not isinstance(group, dict):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid groups config")
-        endpoints = group.setdefault("endpoints", [])
-        if any(
-            endpoint.get("name") == name
-            for group_item in groups.values()
-            if isinstance(group_item, dict)
-            for endpoint in group_item.get("endpoints", [])
-        ):
+        providers = data.setdefault("providers", [])
+        if not isinstance(providers, list):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid providers config")
+        if any(provider.get("name") == name for provider in providers if isinstance(provider, dict)):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider name '{name}' already exists")
-        endpoints.append(
+        providers.append(
             {
                 "name": name,
                 "url": base_url,
                 "api_key": api_key,
                 "description": description,
-                "model": name,
-                "priority": 100,
+                "models": normalized_models,
             }
         )
         save_config(data)
@@ -343,18 +440,22 @@ def add_provider(name: str, base_url: str, api_key: str, description: str, group
 def delete_provider(name: str) -> None:
     with config_lock:
         data = config_data
-        groups = data.get("groups", {})
-        deleted = False
-        for group in groups.values():
-            if not isinstance(group, dict):
-                continue
-            endpoints = group.get("endpoints", [])
-            filtered = [endpoint for endpoint in endpoints if endpoint.get("name") != name]
-            if len(filtered) != len(endpoints):
-                group["endpoints"] = filtered
-                deleted = True
-        if not deleted:
+        providers = data.get("providers", [])
+        if not isinstance(providers, list):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid providers config")
+        before = len(providers)
+        providers = [provider for provider in providers if provider.get("name") != name]
+        if len(providers) == before:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{name}' not found")
+        data["providers"] = providers
+        groups = data.get("groups", {})
+        if isinstance(groups, dict):
+            for group in groups.values():
+                if not isinstance(group, dict):
+                    continue
+                members = group.get("members", [])
+                if isinstance(members, list):
+                    group["members"] = [member for member in members if member.get("provider") != name]
         save_config(data)
 
 
@@ -364,11 +465,61 @@ def resolve_group(group_name: str) -> List[Dict[str, Any]]:
         group = groups.get(group_name)
         if not group or not isinstance(group, dict):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model group '{group_name}' not configured")
-        endpoints = group.get("endpoints", [])
-    sorted_endpoints = sorted(endpoints, key=lambda item: item.get("priority", 1000))
-    if not sorted_endpoints:
+        members = group.get("members", [])
+        if not isinstance(members, list):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Invalid members configured for group '{group_name}'")
+        if not members:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"No members configured for group '{group_name}'")
+        provider_map = {provider.get("name"): provider for provider in config_data.get("providers", []) if isinstance(provider, dict)}
+        endpoints: List[Dict[str, Any]] = []
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            provider_name = member.get("provider")
+            model_name = member.get("model")
+            if not provider_name:
+                continue
+            provider = provider_map.get(provider_name)
+            if not provider:
+                continue
+            endpoint = {
+                "name": provider_name,
+                "url": provider.get("url", ""),
+                "api_key": provider.get("api_key", ""),
+                "description": provider.get("description", ""),
+                "model": model_name or (provider.get("models", [None])[0] if provider.get("models") else None),
+            }
+            endpoints.append(endpoint)
+    if not endpoints:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"No endpoints configured for group '{group_name}'")
-    return sorted_endpoints
+    return endpoints
+
+
+async def test_provider_model(provider_name: str, model_name: str, prompt: str) -> Dict[str, Any]:
+    provider = find_provider(provider_name)
+    if provider is None:
+        return {"success": False, "provider": provider_name, "status_code": 404, "response": f"Provider '{provider_name}' not found"}
+    if not model_name or model_name not in provider.get("models", []):
+        return {"success": False, "provider": provider_name, "status_code": 400, "response": f"Model '{model_name}' is not configured for provider '{provider_name}'"}
+    payload = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
+    headers = build_provider_headers(provider)
+    try:
+        target_url = resolve_endpoint_url(provider)
+        async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=30.0) as response:
+            body = await response.aread()
+            text = body.decode("utf-8", errors="replace")
+            if response.status_code == 200:
+                try:
+                    parsed = json.loads(text)
+                    output = json.dumps(parsed, indent=2, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    output = text
+                return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output}
+            return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": text}
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
+        return {"success": False, "provider": provider_name, "status_code": 502, "response": str(exc)}
+    except Exception as exc:
+        return {"success": False, "provider": provider_name, "status_code": 500, "response": str(exc)}
 
 
 def resolve_endpoint_url(endpoint: Dict[str, Any]) -> str:
@@ -534,8 +685,9 @@ async def admin_providers_add(
     base_url: str = Form(...),
     api_key: str = Form(""),
     description: str = Form(""),
+    models_value: str = Form(""),
 ) -> RedirectResponse:
-    add_provider(name=name.strip(), base_url=base_url.strip(), api_key=api_key.strip(), description=description.strip())
+    add_provider(name=name.strip(), base_url=base_url.strip(), api_key=api_key.strip(), description=description.strip(), models=[model.strip() for model in models_value.split(",") if model.strip()])
     return RedirectResponse(url="/admin/providers", status_code=status.HTTP_303_SEE_OTHER)
 
 
@@ -551,9 +703,10 @@ def admin_playground(request: Request, result: Optional[str] = None, provider: O
         "playground.html",
         {
             "request": request,
-            "groups": get_groups(),
+            "providers": get_providers(),
             "result": result,
             "provider": provider,
+            "selected_provider": provider,
             "status_code": status_code,
             "error": error,
         },
@@ -563,20 +716,22 @@ def admin_playground(request: Request, result: Optional[str] = None, provider: O
 @app.post("/admin/playground", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 async def admin_playground_run(
     request: Request,
-    group: str = Form(...),
+    provider: str = Form(...),
+    model: str = Form(...),
     prompt: str = Form(...),
 ) -> Any:
-    response = await test_group_prompt(group, prompt)
+    response = await test_provider_model(provider, model, prompt)
     return templates.TemplateResponse(
         "playground.html",
         {
             "request": request,
-            "groups": get_groups(),
+            "providers": get_providers(),
             "result": response.get("response"),
             "provider": response.get("provider"),
+            "selected_model": model,
             "status_code": response.get("status_code"),
             "error": None if response.get("success") else response.get("response"),
-            "selected_group": group,
+            "selected_provider": provider,
             "prompt": prompt,
         },
     )

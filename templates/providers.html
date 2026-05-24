@@ -5,7 +5,7 @@
     <div class="flex items-center justify-between gap-4">
       <div>
         <h2 class="text-xl font-semibold text-slate-900">Providers</h2>
-        <p class="mt-1 text-sm text-slate-500">Manage configured endpoints that your groups can route to.</p>
+        <p class="mt-1 text-sm text-slate-500">Manage configured provider endpoints and their supported model names.</p>
       </div>
     </div>
     <div class="mt-6 overflow-x-auto">
@@ -14,7 +14,7 @@
           <tr>
             <th class="px-4 py-3 font-semibold text-slate-700">Name</th>
             <th class="px-4 py-3 font-semibold text-slate-700">Base URL</th>
-            <th class="px-4 py-3 font-semibold text-slate-700">Group</th>
+            <th class="px-4 py-3 font-semibold text-slate-700">Models</th>
             <th class="px-4 py-3 font-semibold text-slate-700">Comment</th>
             <th class="px-4 py-3 font-semibold text-slate-700">Actions</th>
           </tr>
@@ -24,8 +24,8 @@
           <tr>
             <td class="px-4 py-4 text-slate-700">{{ provider.name }}</td>
             <td class="px-4 py-4 break-all text-slate-900">{{ provider.url }}</td>
-            <td class="px-4 py-4 text-slate-700">{{ provider.group }}</td>
-            <td class="px-4 py-4 text-slate-700">{{ provider.description or "-" }}</td>
+            <td class="px-4 py-4 text-slate-700">{{ provider.models | join(', ') }}</td>
+            <td class="px-4 py-4 text-slate-700">{{ provider.description or '-' }}</td>
             <td class="px-4 py-4">
               <button type="button" onclick="deleteProvider({{ provider.name | tojson }})" class="rounded-2xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-rose-700">Delete</button>
             </td>
@@ -42,7 +42,7 @@
   <section class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
     <div>
       <h3 class="text-lg font-semibold text-slate-900">Add New Provider</h3>
-      <p class="mt-2 text-sm text-slate-500">Add a provider endpoint to the configuration quickly.</p>
+      <p class="mt-2 text-sm text-slate-500">Define a provider with one or more model names.</p>
     </div>
     <form action="/admin/providers" method="post" class="mt-6 space-y-4">
       <div>
@@ -56,6 +56,10 @@
       <div>
         <label class="mb-2 block text-sm font-medium text-slate-700" for="api_key">API Key</label>
         <input id="api_key" name="api_key" class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Bearer token or API key" />
+      </div>
+      <div>
+        <label class="mb-2 block text-sm font-medium text-slate-700" for="models">Models</label>
+        <input id="models" name="models" required class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Enter comma-separated model names" />
       </div>
       <div>
         <label class="mb-2 block text-sm font-medium text-slate-700" for="description">Comment / Description</label>

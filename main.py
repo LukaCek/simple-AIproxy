@@ -390,6 +390,22 @@ def get_providers() -> List[Dict[str, Any]]:
     return providers_list
 
 
+def get_default_codex_provider() -> Dict[str, Any]:
+    return {
+        "name": "codex",
+        "url": "https://api.codex.ai/v1/chat/completions",
+        "description": "Codex OAuth provider for model gpt-5.5",
+        "models": ["gpt-5.5"],
+        "oauth": True,
+        "client_id": os.getenv("CODEX_CLIENT_ID", ""),
+        "client_secret": os.getenv("CODEX_CLIENT_SECRET", ""),
+        "authorize_url": "https://auth.codex.ai/oauth/authorize",
+        "token_url": "https://auth.codex.ai/oauth/token",
+        "redirect_uri": "",
+        "scopes": ["openid", "profile"],
+    }
+
+
 def find_provider(name: str) -> Optional[Dict[str, Any]]:
     with config_lock:
         for provider in config_data.get("providers", []):
@@ -482,7 +498,7 @@ async def test_group_prompt(group_name: str, prompt: str) -> Dict[str, Any]:
     }
 
 
-def add_provider(name: str, base_url: str, api_key: str, description: str, models: List[str]) -> None:
+def add_provider(name: str, base_url: str, api_key: str, description: str, models: List[str], extra: Optional[Dict[str, Any]] = None) -> None:
     normalized_models = [str(model).strip() for model in models if str(model).strip()]
     if not normalized_models:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one model is required for a provider")
@@ -495,15 +511,16 @@ def add_provider(name: str, base_url: str, api_key: str, description: str, model
             data["providers"] = providers
         if any(provider.get("name") == name for provider in providers if isinstance(provider, dict)):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider name '{name}' already exists")
-        providers.append(
-            {
-                "name": name,
-                "url": base_url,
-                "api_key": api_key,
-                "description": description,
-                "models": normalized_models,
-            }
-        )
+        provider_obj = {
+            "name": name,
+            "url": base_url,
+            "api_key": api_key,
+            "description": description,
+            "models": normalized_models,
+        }
+        if extra:
+            provider_obj.update(extra)
+        providers.append(provider_obj)
         save_config(data)
 
 
@@ -806,10 +823,45 @@ async def admin_config_save(yaml_text: str = Form(...)) -> RedirectResponse:
 
 @app.get("/admin/providers", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_providers(request: Request, message: Optional[str] = None) -> Any:
+    providers = get_providers()
     return templates.TemplateResponse(
         "providers.html",
-        {"request": request, "providers": get_providers(), "message": message},
+        {
+            "request": request,
+            "providers": providers,
+            "message": message,
+            "codex_exists": any(provider.get("name") == "codex" for provider in providers),
+        },
     )
+
+
+@app.get("/admin/providers/add-codex", response_class=RedirectResponse, dependencies=[Depends(verify_admin)])
+async def admin_providers_add_codex(request: Request) -> RedirectResponse:
+    provider = find_provider("codex")
+    if provider is None:
+        provider = get_default_codex_provider()
+        if not provider["client_id"] or not provider["client_secret"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing Codex OAuth credentials: set CODEX_CLIENT_ID and CODEX_CLIENT_SECRET or add them to config.yml",
+            )
+        add_provider(
+            name=provider["name"],
+            base_url=provider["url"],
+            api_key="",
+            description=provider["description"],
+            models=provider["models"],
+            extra={
+                "oauth": provider["oauth"],
+                "client_id": provider["client_id"],
+                "client_secret": provider["client_secret"],
+                "authorize_url": provider["authorize_url"],
+                "token_url": provider["token_url"],
+                "redirect_uri": provider["redirect_uri"],
+                "scopes": provider["scopes"],
+            },
+        )
+    return RedirectResponse(url="/admin/providers/codex/oauth/login", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/admin/providers/{name}/oauth/login", dependencies=[Depends(verify_admin)])

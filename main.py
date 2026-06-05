@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import httpx
 import json
@@ -30,6 +30,7 @@ config_lock = threading.RLock()
 config_data: Dict[str, Any] = {}
 http_client: Optional[httpx.AsyncClient] = None
 watchdog_observer: Optional[Observer] = None
+oauth_state_store: Dict[str, Dict[str, Any]] = {}
 
 admin_security = HTTPBasic()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -379,6 +380,11 @@ def get_providers() -> List[Dict[str, Any]]:
                     "api_key": provider.get("api_key", ""),
                     "description": provider.get("description", ""),
                     "models": provider.get("models", []),
+                    "oauth": bool(provider.get("oauth")),
+                    "authorize_url": provider.get("authorize_url", ""),
+                    "token_url": provider.get("token_url", ""),
+                    "redirect_uri": provider.get("redirect_uri", ""),
+                    "access_token": provider.get("access_token", ""),
                 }
             )
     return providers_list
@@ -400,6 +406,14 @@ def get_models_for_provider(provider_name: str) -> List[str]:
         return []
     models = provider.get("models", [])
     return [str(model) for model in models if model is not None]
+
+
+def get_oauth_callback_url(request: Request, provider_name: str, provider: Dict[str, Any]) -> str:
+    redirect_uri = provider.get("redirect_uri")
+    if redirect_uri:
+        return str(redirect_uri)
+    base_url = f"{request.url.scheme}://{request.url.netloc}"
+    return base_url + f"/admin/providers/{provider_name}/oauth/callback"
 
 
 def get_groups() -> List[Dict[str, Any]]:
@@ -545,6 +559,7 @@ def resolve_group(group_name: str) -> List[Dict[str, Any]]:
                 "url": provider.get("url", ""),
                 "api_key": provider.get("api_key", ""),
                 "description": provider.get("description", ""),
+                "oauth": provider.get("oauth", False),
                 "model": model_name or (provider.get("models", [None])[0] if provider.get("models") else None),
             }
             endpoints.append(endpoint)
@@ -604,10 +619,67 @@ def build_provider_headers(endpoint: Dict[str, Any]) -> Dict[str, str]:
         "Accept": "text/event-stream, application/json",
         "User-Agent": "llm-proxy/1.0",
     }
-    api_key = endpoint.get("api_key")
+    api_key = endpoint.get("api_key") or endpoint.get("access_token")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
+
+
+def build_oauth_authorize_url(request: Request, provider: Dict[str, Any], state: str) -> str:
+    authorize_url = str(provider.get("authorize_url", ""))
+    if not authorize_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth provider does not have authorize_url configured")
+    callback = get_oauth_callback_url(request, provider.get("name", ""), provider)
+    scope = provider.get("scopes")
+    if isinstance(scope, list):
+        scope = " ".join(str(item) for item in scope if item)
+    elif scope is None:
+        scope = ""
+    query_params = {
+        "client_id": provider.get("client_id", ""),
+        "response_type": "code",
+        "redirect_uri": callback,
+        "state": state,
+    }
+    if scope:
+        query_params["scope"] = scope
+    query = "&".join(f"{key}={quote(str(value))}" for key, value in query_params.items() if value is not None)
+    return authorize_url + ("&" if "?" in authorize_url else "?") + query
+
+
+async def exchange_oauth_code(request: Request, provider: Dict[str, Any], code: str) -> Dict[str, Any]:
+    token_url = str(provider.get("token_url", ""))
+    if not token_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth provider does not have token_url configured")
+    callback = get_oauth_callback_url(request, provider.get("name", ""), provider)
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": callback,
+        "client_id": provider.get("client_id", ""),
+        "client_secret": provider.get("client_secret", ""),
+    }
+    headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
+    response = await http_client.post(token_url, data=data, headers=headers, timeout=30.0)
+    try:
+        token_data = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Invalid token response from OAuth provider: {exc}")
+    access_token = token_data.get("access_token") or token_data.get("token")
+    if not access_token:
+        raise HTTPException(status_code=502, detail=f"OAuth token response missing access_token: {token_data}")
+    refresh_token = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in")
+    result = {"access_token": access_token}
+    if refresh_token:
+        result["refresh_token"] = refresh_token
+    if expires_in is not None:
+        try:
+            expires_at = datetime.utcnow().timestamp() + float(expires_in)
+            result["expires_at"] = datetime.utcfromtimestamp(expires_at).isoformat()
+        except Exception:
+            pass
+    return result
 
 
 async def stream_provider_response(response: httpx.Response):
@@ -733,8 +805,52 @@ async def admin_config_save(yaml_text: str = Form(...)) -> RedirectResponse:
 
 
 @app.get("/admin/providers", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
-def admin_providers(request: Request) -> Any:
-    return templates.TemplateResponse("providers.html", {"request": request, "providers": get_providers()})
+def admin_providers(request: Request, message: Optional[str] = None) -> Any:
+    return templates.TemplateResponse(
+        "providers.html",
+        {"request": request, "providers": get_providers(), "message": message},
+    )
+
+
+@app.get("/admin/providers/{name}/oauth/login", dependencies=[Depends(verify_admin)])
+def admin_provider_oauth_login(name: str, request: Request) -> RedirectResponse:
+    provider = find_provider(name)
+    if provider is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{name}' not found")
+    if not provider.get("oauth"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider '{name}' is not configured for OAuth")
+    authorize_url = provider.get("authorize_url")
+    client_id = provider.get("client_id")
+    if not authorize_url or not client_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider '{name}' OAuth configuration is incomplete")
+    state = uuid.uuid4().hex
+    oauth_state_store[state] = {"provider": name, "created_at": datetime.utcnow().isoformat()}
+    redirect_url = build_oauth_authorize_url(request, provider, state)
+    return RedirectResponse(url=redirect_url)
+
+
+@app.get("/admin/providers/{name}/oauth/callback")
+async def admin_provider_oauth_callback(name: str, request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None) -> RedirectResponse:
+    if error:
+        return RedirectResponse(url=f"/admin/providers?message=OAuth+error:+{quote(error)}")
+    if not code or not state:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing OAuth code or state")
+    stored = oauth_state_store.pop(state, None)
+    if not stored or stored.get("provider") != name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth state")
+    provider = find_provider(name)
+    if provider is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{name}' not found")
+    token_data = await exchange_oauth_code(request, provider, code)
+    with config_lock:
+        provider["access_token"] = token_data.get("access_token")
+        if token_data.get("refresh_token"):
+            provider["refresh_token"] = token_data.get("refresh_token")
+        if token_data.get("expires_at"):
+            provider["expires_at"] = token_data.get("expires_at")
+        provider["api_key"] = token_data.get("access_token")
+        save_config(config_data)
+    return RedirectResponse(url="/admin/providers?message=OAuth+login+completed")
 
 
 @app.post("/admin/providers", dependencies=[Depends(verify_admin)])

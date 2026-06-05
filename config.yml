@@ -1,2 +1,16 @@
-providers: []
+providers:
+  - name: codex
+    url: https://api.codex.ai/v1/chat/completions
+    description: Codex OAuth provider for model gpt-5.5
+    models:
+      - gpt-5.5
+    oauth: true
+    client_id: "<YOUR_CLIENT_ID>"
+    client_secret: "<YOUR_CLIENT_SECRET>"
+    authorize_url: https://auth.codex.ai/oauth/authorize
+    token_url: https://auth.codex.ai/oauth/token
+    redirect_uri: http://localhost:8000/admin/providers/codex/oauth/callback
+    scopes:
+      - openid
+      - profile
 groups: {}

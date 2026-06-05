@@ -8,6 +8,11 @@
         <p class="mt-1 text-sm text-slate-500">Manage configured provider endpoints and their supported model names.</p>
       </div>
     </div>
+    {% if message %}
+    <div class="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
+      {{ message }}
+    </div>
+    {% endif %}
     <div class="mt-6 overflow-x-auto">
       <table class="min-w-full divide-y divide-slate-200 text-left text-sm">
         <thead class="bg-slate-50">
@@ -27,6 +32,9 @@
             <td class="px-4 py-4 text-slate-700">{{ provider.models | join(', ') }}</td>
             <td class="px-4 py-4 text-slate-700">{{ provider.description or '-' }}</td>
             <td class="px-4 py-4">
+              {% if provider.oauth %}
+              <a href="/admin/providers/{{ provider.name | urlencode }}/oauth/login" class="mr-2 inline-flex rounded-2xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-700">Login OAuth</a>
+              {% endif %}
               <button type="button" onclick="deleteProvider({{ provider.name | tojson }})" class="rounded-2xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-rose-700">Delete</button>
             </td>
           </tr>

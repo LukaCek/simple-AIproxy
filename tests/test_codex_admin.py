@@ -48,6 +48,35 @@ def test_add_codex_profile_does_not_duplicate_group_member(tmp_path, monkeypatch
     ]
 
 
+def test_admin_keys_page_renders_with_current_starlette_template_api(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = {"providers": [], "groups": {}}
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/keys", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert response.status_code == 200
+    assert "API Keys" in response.text
+
+
+def test_admin_providers_page_renders_codex_import_form(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = {"providers": [], "groups": {}}
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/providers", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert response.status_code == 200
+    assert "Codex OAuth pool" in response.text
+    assert "/admin/providers/codex-token" in response.text
+
+
 def test_admin_codex_token_form_adds_profile(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yml"
     config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")

@@ -1037,7 +1037,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
 
 @app.get("/admin/keys", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_keys(request: Request) -> Any:
-    return templates.TemplateResponse("keys.html", {"request": request, "api_keys": list_api_keys()})
+    return templates.TemplateResponse(request=request, name="keys.html", context={"api_keys": list_api_keys()})
 
 
 @app.post("/admin/keys/new", dependencies=[Depends(verify_admin)])
@@ -1048,7 +1048,7 @@ async def admin_keys_new(name: str = Form(...)) -> RedirectResponse:
 
 @app.get("/admin/logs", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_logs(request: Request) -> Any:
-    return templates.TemplateResponse("logs.html", {"request": request, "logs": list_logs()})
+    return templates.TemplateResponse(request=request, name="logs.html", context={"logs": list_logs()})
 
 
 @app.get("/admin/config", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
@@ -1056,8 +1056,9 @@ def admin_config(request: Request, message: Optional[str] = None) -> Any:
     with config_lock:
         yaml_text = yaml.safe_dump(config_data, sort_keys=False)
     return templates.TemplateResponse(
-        "config.html",
-        {"request": request, "yaml_text": yaml_text, "message": message},
+        request=request,
+        name="config.html",
+        context={"yaml_text": yaml_text, "message": message},
     )
 
 
@@ -1077,9 +1078,9 @@ async def admin_config_save(yaml_text: str = Form(...)) -> RedirectResponse:
 def admin_providers(request: Request, message: Optional[str] = None) -> Any:
     providers = get_providers()
     return templates.TemplateResponse(
-        "providers.html",
-        {
-            "request": request,
+        request=request,
+        name="providers.html",
+        context={
             "providers": providers,
             "message": message,
             "codex_exists": any(provider.get("name") == "codex" for provider in providers),
@@ -1175,9 +1176,9 @@ async def admin_providers_delete(name: str) -> Dict[str, Any]:
 @app.get("/admin/playground", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_playground(request: Request, result: Optional[str] = None, provider: Optional[str] = None, status_code: Optional[int] = None, error: Optional[str] = None) -> Any:
     return templates.TemplateResponse(
-        "playground.html",
-        {
-            "request": request,
+        request=request,
+        name="playground.html",
+        context={
             "providers": get_providers(),
             "result": result,
             "provider": provider,
@@ -1197,9 +1198,9 @@ async def admin_playground_run(
 ) -> Any:
     response = await test_provider_model(provider, model, prompt)
     return templates.TemplateResponse(
-        "playground.html",
-        {
-            "request": request,
+        request=request,
+        name="playground.html",
+        context={
             "providers": get_providers(),
             "result": response.get("response"),
             "provider": response.get("provider"),

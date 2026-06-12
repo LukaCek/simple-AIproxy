@@ -538,6 +538,69 @@ def add_provider(name: str, base_url: str, api_key: str, description: str, model
         save_config(data)
 
 
+def ensure_group_member(group_name: str, provider_name: str, model_name: str, description: str = "", strategy: str = "round_robin") -> None:
+    """Ensure a provider/model pair is exposed through a model group.
+
+    This keeps the admin Codex helper safe to click repeatedly: it creates the
+    gpt-5.5 pool when missing and avoids duplicate member rows when a profile is
+    edited or re-imported.
+    """
+    with config_lock:
+        data = config_data
+        groups = data.setdefault("groups", {})
+        if not isinstance(groups, dict):
+            groups = {}
+            data["groups"] = groups
+        group = groups.setdefault(group_name, {"description": description, "strategy": strategy, "members": []})
+        if not isinstance(group, dict):
+            group = {"description": description, "strategy": strategy, "members": []}
+            groups[group_name] = group
+        group.setdefault("description", description)
+        group.setdefault("strategy", strategy)
+        members = group.setdefault("members", [])
+        if not isinstance(members, list):
+            members = []
+            group["members"] = members
+        exists = any(isinstance(member, dict) and member.get("provider") == provider_name and member.get("model") == model_name for member in members)
+        if not exists:
+            members.append({"provider": provider_name, "model": model_name})
+        save_config(data)
+
+
+def add_codex_profile(name: str, access_token: str = "", refresh_token: str = "", description: str = "") -> None:
+    base_provider = get_default_codex_provider()
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Codex profile name is required")
+    add_provider(
+        name=clean_name,
+        base_url=base_provider["url"],
+        api_key=access_token.strip(),
+        description=description.strip() or base_provider["description"],
+        models=base_provider["models"],
+        extra={
+            "api_mode": base_provider["api_mode"],
+            "oauth": base_provider["oauth"],
+            "client_id": base_provider["client_id"],
+            "client_secret": base_provider["client_secret"],
+            "authorize_url": base_provider["authorize_url"],
+            "token_url": base_provider["token_url"],
+            "redirect_uri": base_provider["redirect_uri"],
+            "scopes": base_provider["scopes"],
+            "access_token": access_token.strip(),
+            "refresh_token": refresh_token.strip(),
+            "expires_at": "",
+        },
+    )
+    ensure_group_member(
+        "gpt-5.5",
+        clean_name,
+        "gpt-5.5",
+        description="Balanced Codex pool for Hermes/OpenAI-compatible clients",
+        strategy="round_robin",
+    )
+
+
 def delete_provider(name: str) -> None:
     with config_lock:
         data = config_data
@@ -1027,36 +1090,25 @@ def admin_providers(request: Request, message: Optional[str] = None) -> Any:
 @app.get("/admin/providers/add-codex", response_class=RedirectResponse, dependencies=[Depends(verify_admin)])
 async def admin_providers_add_codex(request: Request) -> RedirectResponse:
     del request
-    base_provider = get_default_codex_provider()
     existing = {provider.get("name") for provider in get_providers()}
     name = "codex"
     suffix = 1
     while name in existing:
         suffix += 1
         name = f"codex-{suffix}"
-    provider = dict(base_provider)
-    provider["name"] = name
-    add_provider(
-        name=provider["name"],
-        base_url=provider["url"],
-        api_key="",
-        description=provider["description"],
-        models=provider["models"],
-        extra={
-            "api_mode": provider["api_mode"],
-            "oauth": provider["oauth"],
-            "client_id": provider["client_id"],
-            "client_secret": provider["client_secret"],
-            "authorize_url": provider["authorize_url"],
-            "token_url": provider["token_url"],
-            "redirect_uri": provider["redirect_uri"],
-            "scopes": provider["scopes"],
-            "access_token": "",
-            "refresh_token": "",
-            "expires_at": "",
-        },
-    )
-    return RedirectResponse(url=f"/admin/providers?message=Added+Codex+profile+template:+{quote(name)}", status_code=status.HTTP_303_SEE_OTHER)
+    add_codex_profile(name=name)
+    return RedirectResponse(url=f"/admin/providers?message=Added+Codex+profile+template+and+gpt-5.5+pool+member:+{quote(name)}", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/providers/codex-token", response_class=RedirectResponse, dependencies=[Depends(verify_admin)])
+async def admin_providers_add_codex_token(
+    name: str = Form(...),
+    access_token: str = Form(""),
+    refresh_token: str = Form(""),
+    description: str = Form(""),
+) -> RedirectResponse:
+    add_codex_profile(name=name, access_token=access_token, refresh_token=refresh_token, description=description)
+    return RedirectResponse(url=f"/admin/providers?message=Added+Codex+profile+and+gpt-5.5+pool+member:+{quote(name.strip())}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/admin/providers/{name}/oauth/login", dependencies=[Depends(verify_admin)])

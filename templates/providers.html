@@ -13,9 +13,36 @@
       {{ message }}
     </div>
     {% endif %}
-    <div class="mt-4">
-      <form action="/admin/providers/add-codex" method="get">
-        <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Add / Connect Codex OAuth</button>
+    <div class="mt-4 rounded-2xl border border-sky-100 bg-sky-50 p-4">
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h3 class="text-sm font-semibold text-sky-950">Codex OAuth pool</h3>
+          <p class="mt-1 text-sm text-sky-800">Create a Codex profile and automatically add it to the <code>gpt-5.5</code> round-robin pool.</p>
+        </div>
+        <form action="/admin/providers/add-codex" method="get">
+          <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Add empty Codex profile</button>
+        </form>
+      </div>
+      <form action="/admin/providers/codex-token" method="post" class="mt-4 grid gap-3 lg:grid-cols-2">
+        <div>
+          <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-sky-900" for="codex_name">Profile name</label>
+          <input id="codex_name" name="name" required class="w-full rounded-2xl border border-sky-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-200" placeholder="codex-a" />
+        </div>
+        <div>
+          <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-sky-900" for="codex_description">Description</label>
+          <input id="codex_description" name="description" class="w-full rounded-2xl border border-sky-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-200" placeholder="Laptop Codex login" />
+        </div>
+        <div class="lg:col-span-2">
+          <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-sky-900" for="codex_access_token">Access token</label>
+          <input id="codex_access_token" name="access_token" type="password" autocomplete="off" class="w-full rounded-2xl border border-sky-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-200" placeholder="Paste Codex access_token" />
+        </div>
+        <div class="lg:col-span-2">
+          <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-sky-900" for="codex_refresh_token">Refresh token</label>
+          <input id="codex_refresh_token" name="refresh_token" type="password" autocomplete="off" class="w-full rounded-2xl border border-sky-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-200" placeholder="Paste Codex refresh_token" />
+        </div>
+        <div class="lg:col-span-2">
+          <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-sky-700 px-4 py-3 text-sm font-semibold text-white transition hover:bg-sky-800">Generate Codex profile key</button>
+        </div>
       </form>
     </div>
     <div class="mt-6 overflow-x-auto">

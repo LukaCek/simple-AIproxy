@@ -1,11 +1,17 @@
 services:
   llm-proxy:
-    # Replace YOUR_GITHUB_USERNAME with your actual GitHub username
     image: ghcr.io/lukacek/simple-aiproxy:latest
+    container_name: llm-proxy
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    env_file:
+      - .env
     volumes:
       - ./config.yml:/app/config.yml:rw
       - ./app.db:/app/app.db:rw
     mem_limit: 512m
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

@@ -1,0 +1,56 @@
+# Production starter config for ~/docker/simple-AIproxy/config.yml
+# Keep real tokens only on the server. Never commit real access_token/refresh_token values.
+
+providers:
+  - name: codex-a
+    url: https://chatgpt.com/backend-api/codex
+    description: First OpenAI Codex OAuth profile
+    models:
+      - gpt-5.5
+    api_mode: codex_responses
+    oauth: true
+    client_id: app_EMoamEEZ73f0CkXaXp7hrann
+    token_url: https://auth.openai.com/oauth/token
+    access_token: "PASTE_CODEX_A_ACCESS_TOKEN_HERE"
+    refresh_token: "PASTE_CODEX_A_REFRESH_TOKEN_HERE"
+    expires_at: ""
+
+  - name: codex-b
+    url: https://chatgpt.com/backend-api/codex
+    description: Second OpenAI Codex OAuth profile
+    models:
+      - gpt-5.5
+    api_mode: codex_responses
+    oauth: true
+    client_id: app_EMoamEEZ73f0CkXaXp7hrann
+    token_url: https://auth.openai.com/oauth/token
+    access_token: "PASTE_CODEX_B_ACCESS_TOKEN_HERE"
+    refresh_token: "PASTE_CODEX_B_REFRESH_TOKEN_HERE"
+    expires_at: ""
+
+  # Optional local Ollama through its OpenAI-compatible endpoint.
+  # This only works if the container can reach Ollama at this host.
+  - name: ollama-local
+    url: http://host.docker.internal:11434
+    description: Ollama OpenAI-compatible endpoint
+    models:
+      - llama3.2
+    api_key: ""
+    api_mode: openai_chat_completions
+
+groups:
+  gpt-5.5:
+    description: Balanced Codex pool for Hermes/OpenAI-compatible clients
+    strategy: round_robin
+    members:
+      - provider: codex-a
+        model: gpt-5.5
+      - provider: codex-b
+        model: gpt-5.5
+
+  local-llama:
+    description: Optional local Ollama model
+    strategy: fallback
+    members:
+      - provider: ollama-local
+        model: llama3.2

@@ -26,6 +26,17 @@ This directory contains the GitHub Actions workflow and server deployment script
 - Connects to Oracle ARM server via SSH
 - Executes `./update.sh` to pull latest image and restart container
 
+## Production server files
+
+For the current production layout at `/home/ubuntu/docker/simple-AIproxy`, use:
+
+- `server_deployment/docker-compose.yml`
+- `server_deployment/.env.example` copied to server as `.env`
+- `server_deployment/config.production.example.yml` copied to server as `config.yml`
+- `server_deployment/update.sh`
+
+Detailed server-side instructions are in `server_deployment/PRODUCTION_SETUP.md`.
+
 ## Setup Instructions
 
 ### Step 1: Set GitHub Secrets

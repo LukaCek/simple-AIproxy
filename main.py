@@ -1,12 +1,12 @@
-import asyncio
 import os
 import sqlite3
 import threading
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 
 import httpx
 import json
@@ -15,7 +15,6 @@ import yaml
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -31,6 +30,8 @@ config_data: Dict[str, Any] = {}
 http_client: Optional[httpx.AsyncClient] = None
 watchdog_observer: Optional[Observer] = None
 oauth_state_store: Dict[str, Dict[str, Any]] = {}
+route_counters: Dict[str, int] = {}
+route_counters_lock = threading.Lock()
 
 admin_security = HTTPBasic()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -235,12 +236,15 @@ def normalize_config_schema(data: Dict[str, Any]) -> Dict[str, Any]:
                 provider["models"] = [maybe_model] if maybe_model else []
             elif not isinstance(models, list):
                 provider["models"] = [models]
-            else:
-                provider["models"] = [str(item) for item in models if item is not None]
+            provider["models"] = [str(item) for item in provider.get("models", []) if item is not None and str(item).strip()]
+            provider.setdefault("api_mode", "openai_chat_completions")
             normalized_providers.append(provider)
         data["providers"] = normalized_providers
 
     groups = data.get("groups", {})
+    if not isinstance(groups, dict):
+        data["groups"] = {}
+        groups = data["groups"]
     if isinstance(groups, dict):
         for group in groups.values():
             if not isinstance(group, dict):
@@ -385,24 +389,34 @@ def get_providers() -> List[Dict[str, Any]]:
                     "token_url": provider.get("token_url", ""),
                     "redirect_uri": provider.get("redirect_uri", ""),
                     "access_token": provider.get("access_token", ""),
+                    "api_mode": provider.get("api_mode", "openai_chat_completions"),
+                    "expires_at": provider.get("expires_at", ""),
                 }
             )
     return providers_list
 
 
 def get_default_codex_provider() -> Dict[str, Any]:
+    """Template for OpenAI Codex/ChatGPT OAuth tokens.
+
+    Codex is not a normal /v1/chat/completions backend. The proxy exposes a
+    chat-completions facade, but forwards Codex profiles through a Responses API
+    adapter against chatgpt.com/backend-api/codex. Tokens can be pasted/imported
+    into config.yml, or refreshed when refresh_token is present.
+    """
     return {
         "name": "codex",
-        "url": "https://api.codex.ai/v1/chat/completions",
-        "description": "Codex OAuth provider for model gpt-5.5",
+        "url": "https://chatgpt.com/backend-api/codex",
+        "description": "OpenAI Codex OAuth profile (Responses adapter)",
         "models": ["gpt-5.5"],
+        "api_mode": "codex_responses",
         "oauth": True,
-        "client_id": os.getenv("CODEX_CLIENT_ID", ""),
+        "client_id": os.getenv("CODEX_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann"),
         "client_secret": os.getenv("CODEX_CLIENT_SECRET", ""),
-        "authorize_url": "https://auth.codex.ai/oauth/authorize",
-        "token_url": "https://auth.codex.ai/oauth/token",
+        "authorize_url": "",
+        "token_url": "https://auth.openai.com/oauth/token",
         "redirect_uri": "",
-        "scopes": ["openid", "profile"],
+        "scopes": [],
     }
 
 
@@ -577,6 +591,13 @@ def resolve_group(group_name: str) -> List[Dict[str, Any]]:
                 "api_key": provider.get("api_key", ""),
                 "description": provider.get("description", ""),
                 "oauth": provider.get("oauth", False),
+                "api_mode": provider.get("api_mode", "openai_chat_completions"),
+                "access_token": provider.get("access_token", ""),
+                "refresh_token": provider.get("refresh_token", ""),
+                "token_url": provider.get("token_url", ""),
+                "client_id": provider.get("client_id", ""),
+                "client_secret": provider.get("client_secret", ""),
+                "expires_at": provider.get("expires_at", ""),
                 "model": model_name or (provider.get("models", [None])[0] if provider.get("models") else None),
             }
             endpoints.append(endpoint)
@@ -624,7 +645,9 @@ def resolve_endpoint_url(endpoint: Dict[str, Any]) -> str:
     path = parsed.path or ""
     normalized_path = path.rstrip("/")
     if "chat/completions" not in normalized_path.lower():
-        if normalized_path.endswith("/v1") or normalized_path.endswith("/openai/v1") or normalized_path.endswith("/v1beta2") or normalized_path.endswith("/v1beta3") or normalized_path == "":
+        if normalized_path == "":
+            normalized_path = "/v1/chat/completions"
+        elif normalized_path.endswith("/v1") or normalized_path.endswith("/openai/v1") or normalized_path.endswith("/v1beta2") or normalized_path.endswith("/v1beta3"):
             normalized_path = normalized_path + "/chat/completions"
     new_parsed = parsed._replace(path=normalized_path)
     return urlunparse(new_parsed)
@@ -660,7 +683,7 @@ def build_oauth_authorize_url(request: Request, provider: Dict[str, Any], state:
     }
     if scope:
         query_params["scope"] = scope
-    query = "&".join(f"{key}={quote(str(value))}" for key, value in query_params.items() if value is not None)
+    query = urlencode({key: str(value) for key, value in query_params.items() if value is not None})
     return authorize_url + ("&" if "?" in authorize_url else "?") + query
 
 
@@ -699,6 +722,161 @@ async def exchange_oauth_code(request: Request, provider: Dict[str, Any], code: 
     return result
 
 
+def parse_expires_at(value: Any) -> Optional[float]:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def provider_token_expiring(provider: Dict[str, Any], skew_seconds: int = 60) -> bool:
+    expires_at = parse_expires_at(provider.get("expires_at"))
+    return expires_at is not None and expires_at <= time.time() + skew_seconds
+
+
+async def refresh_provider_token(provider_name: str, provider: Dict[str, Any]) -> None:
+    refresh_token = provider.get("refresh_token")
+    token_url = provider.get("token_url")
+    client_id = provider.get("client_id")
+    if not refresh_token or not token_url or not client_id:
+        return
+    data = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id}
+    if provider.get("client_secret"):
+        data["client_secret"] = provider.get("client_secret")
+    response = await http_client.post(str(token_url), data=data, headers={"Accept": "application/json"}, timeout=30.0)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Token refresh failed for {provider_name}: {response.text}")
+    token_data = response.json()
+    access_token = token_data.get("access_token") or token_data.get("token")
+    if not access_token:
+        raise HTTPException(status_code=502, detail=f"Token refresh response for {provider_name} did not include access_token")
+    with config_lock:
+        live_provider = find_provider(provider_name)
+        if live_provider is None:
+            return
+        live_provider["access_token"] = access_token
+        live_provider["api_key"] = access_token
+        provider["access_token"] = access_token
+        provider["api_key"] = access_token
+        if token_data.get("refresh_token"):
+            live_provider["refresh_token"] = token_data["refresh_token"]
+            provider["refresh_token"] = token_data["refresh_token"]
+        if token_data.get("expires_in") is not None:
+            expires_at = datetime.utcnow() + timedelta(seconds=float(token_data["expires_in"]))
+            live_provider["expires_at"] = expires_at.isoformat()
+            provider["expires_at"] = live_provider["expires_at"]
+        save_config(config_data)
+
+
+async def ensure_provider_token(endpoint: Dict[str, Any]) -> None:
+    if endpoint.get("oauth") and provider_token_expiring(endpoint):
+        await refresh_provider_token(str(endpoint.get("name", "")), endpoint)
+
+
+def route_endpoints(group_name: str, endpoints: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    with config_lock:
+        strategy = str(config_data.get("groups", {}).get(group_name, {}).get("strategy", "round_robin"))
+    if strategy != "round_robin" or len(endpoints) <= 1:
+        return endpoints
+    with route_counters_lock:
+        index = route_counters.get(group_name, 0) % len(endpoints)
+        route_counters[group_name] = route_counters.get(group_name, 0) + 1
+    return endpoints[index:] + endpoints[:index]
+
+
+def resolve_responses_url(endpoint: Dict[str, Any]) -> str:
+    raw_url = str(endpoint.get("url", "") or "").strip().rstrip("/")
+    if not raw_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Endpoint URL is missing")
+    parsed = urlparse(raw_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Endpoint URL is invalid")
+    path = (parsed.path or "").rstrip("/")
+    if not path.endswith("/responses"):
+        path += "/responses"
+    return urlunparse(parsed._replace(path=path))
+
+
+def extract_response_text(data: Any) -> str:
+    if not isinstance(data, dict):
+        return str(data)
+    if isinstance(data.get("output_text"), str):
+        return data["output_text"]
+    texts: List[str] = []
+    for item in data.get("output", []) if isinstance(data.get("output"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) if isinstance(item.get("content"), list) else []:
+            if isinstance(content, dict):
+                text = content.get("text") or content.get("value")
+                if text:
+                    texts.append(str(text))
+    if texts:
+        return "".join(texts)
+    if isinstance(data.get("choices"), list) and data["choices"]:
+        choice = data["choices"][0]
+        msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+        if isinstance(msg, dict) and msg.get("content"):
+            return str(msg["content"])
+    return json.dumps(data, ensure_ascii=False)
+
+
+def chat_completion_from_text(model: str, text: str) -> Dict[str, Any]:
+    return {
+        "id": "chatcmpl-" + uuid.uuid4().hex,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+    }
+
+
+def sse_chat_chunks(model: str, text: str):
+    chunk_id = "chatcmpl-" + uuid.uuid4().hex
+    created = int(time.time())
+    first = {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+    yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n".encode("utf-8")
+    body = {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
+    yield f"data: {json.dumps(body, ensure_ascii=False)}\n\n".encode("utf-8")
+    end = {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+    yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n".encode("utf-8")
+    yield b"data: [DONE]\n\n"
+
+
+def chat_to_responses_payload(payload: Dict[str, Any], model: str) -> Dict[str, Any]:
+    messages = payload.get("messages", [])
+    input_messages = []
+    instructions: Optional[str] = None
+    for message in messages if isinstance(messages, list) else []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if role == "system":
+            instructions = (instructions + "\n" if instructions else "") + str(content)
+            continue
+        input_messages.append({"role": role, "content": content})
+    converted: Dict[str, Any] = {"model": model, "input": input_messages or str(payload.get("prompt", ""))}
+    if instructions:
+        converted["instructions"] = instructions
+    if payload.get("temperature") is not None:
+        converted["temperature"] = payload.get("temperature")
+    if payload.get("max_tokens") is not None:
+        converted["max_output_tokens"] = payload.get("max_tokens")
+    return converted
+
+
+async def send_responses_adapter(endpoint: Dict[str, Any], payload: Dict[str, Any]) -> httpx.Response:
+    model = str(endpoint.get("model") or payload.get("model") or "")
+    converted = chat_to_responses_payload(payload, model)
+    target_url = resolve_responses_url(endpoint)
+    return await http_client.post(target_url, json=converted, headers=build_provider_headers(endpoint), timeout=60.0)
+
+
 async def stream_provider_response(response: httpx.Response):
     async for chunk in response.aiter_bytes():
         if chunk:
@@ -708,60 +886,81 @@ async def stream_provider_response(response: httpx.Response):
 async def health_check():
     return {"status": "ok", "message": "Proxy deluje!"}
 
+@app.get("/v1/models")
+async def list_openai_models(api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    with config_lock:
+        groups = config_data.get("groups", {})
+        data = []
+        if isinstance(groups, dict):
+            for group_name in groups:
+                data.append({"id": group_name, "object": "model", "created": 0, "owned_by": "simple-aiproxy"})
+    return {"object": "list", "data": data}
+
+
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, background_tasks: BackgroundTasks, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> StreamingResponse:
+async def chat_completions(request: Request, background_tasks: BackgroundTasks, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Response:
     payload = await request.json()
     group_name = payload.get("model")
     if not group_name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing model group in request payload")
-    endpoints = resolve_group(group_name)
+    endpoints = route_endpoints(str(group_name), resolve_group(str(group_name)))
     api_key_value = api_key_record["key"]
     started_at = datetime.utcnow().isoformat()
     last_error: Optional[str] = None
+    fallback_statuses = {401, 403, 408, 409, 425, 429, 500, 502, 503, 504}
     for endpoint in endpoints:
-        provider_name = endpoint.get("name", "unknown")
-        provider_model = endpoint.get("model")
+        provider_name = str(endpoint.get("name", "unknown"))
+        provider_model = str(endpoint.get("model") or "")
         provider_payload = dict(payload)
         provider_payload["model"] = provider_model
-        headers = build_provider_headers(endpoint)
-        target_url = resolve_endpoint_url(endpoint)
         try:
-            async with http_client.stream("POST", target_url, json=provider_payload, headers=headers, timeout=30.0) as response:
+            await ensure_provider_token(endpoint)
+            api_mode = str(endpoint.get("api_mode", "openai_chat_completions"))
+            if api_mode in {"openai_responses", "codex_responses"}:
+                response = await send_responses_adapter(endpoint, provider_payload)
+                content = response.content
                 if response.status_code == 200:
-                    async def proxy_stream() -> Any:
+                    try:
+                        text = extract_response_text(response.json())
+                    except Exception:
+                        text = content.decode("utf-8", errors="replace")
+                    ended_at = datetime.utcnow().isoformat()
+                    background_tasks.add_task(insert_log, api_key_value, str(group_name), provider_name, provider_model, 200, started_at, ended_at, None)
+                    if payload.get("stream"):
+                        return StreamingResponse(sse_chat_chunks(provider_model, text), status_code=200, media_type="text/event-stream")
+                    return Response(json.dumps(chat_completion_from_text(provider_model, text), ensure_ascii=False), status_code=200, media_type="application/json")
+                error_msg = content.decode("utf-8", errors="replace")
+                if response.status_code in fallback_statuses:
+                    last_error = f"{provider_name} returned {response.status_code}: {error_msg}"
+                    continue
+                ended_at = datetime.utcnow().isoformat()
+                background_tasks.add_task(insert_log, api_key_value, str(group_name), provider_name, provider_model, response.status_code, started_at, ended_at, error_msg)
+                return Response(content, status_code=response.status_code, media_type=response.headers.get("content-type", "application/json"))
+
+            headers = build_provider_headers(endpoint)
+            target_url = resolve_endpoint_url(endpoint)
+            request_obj = http_client.build_request("POST", target_url, json=provider_payload, headers=headers)
+            response = await http_client.send(request_obj, stream=True)
+            if response.status_code == 200:
+                async def proxy_stream() -> Any:
+                    try:
                         async for chunk in response.aiter_bytes():
                             yield chunk
-                    ended_at = datetime.utcnow().isoformat()
-                    background_tasks.add_task(
-                        insert_log,
-                        api_key_value,
-                        group_name,
-                        provider_name,
-                        provider_model,
-                        response.status_code,
-                        started_at,
-                        ended_at,
-                        None,
-                    )
-                    return StreamingResponse(proxy_stream(), status_code=200, media_type=response.headers.get("content-type", "application/json"))
-                if response.status_code == 429 or 500 <= response.status_code < 600:
-                    last_error = f"{provider_name} returned {response.status_code}"
-                    continue
-                content = await response.aread()
-                error_msg = content.decode("utf-8", errors="replace")
+                    finally:
+                        await response.aclose()
                 ended_at = datetime.utcnow().isoformat()
-                background_tasks.add_task(
-                    insert_log,
-                    api_key_value,
-                    group_name,
-                    provider_name,
-                    provider_model,
-                    response.status_code,
-                    started_at,
-                    ended_at,
-                    error_msg,
-                )
-                return Response(content, status_code=response.status_code, media_type=response.headers.get("content-type", "application/json"))
+                background_tasks.add_task(insert_log, api_key_value, str(group_name), provider_name, provider_model, response.status_code, started_at, ended_at, None)
+                return StreamingResponse(proxy_stream(), status_code=200, media_type=response.headers.get("content-type", "application/json"))
+            content = await response.aread()
+            await response.aclose()
+            error_msg = content.decode("utf-8", errors="replace")
+            if response.status_code in fallback_statuses:
+                last_error = f"{provider_name} returned {response.status_code}: {error_msg}"
+                continue
+            ended_at = datetime.utcnow().isoformat()
+            background_tasks.add_task(insert_log, api_key_value, str(group_name), provider_name, provider_model, response.status_code, started_at, ended_at, error_msg)
+            return Response(content, status_code=response.status_code, media_type=response.headers.get("content-type", "application/json"))
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
             last_error = f"{provider_name} failed: {exc}"
             continue
@@ -769,17 +968,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             last_error = f"{provider_name} unexpected error: {exc}"
             continue
     ended_at = datetime.utcnow().isoformat()
-    background_tasks.add_task(
-        insert_log,
-        api_key_value,
-        group_name,
-        endpoints[-1].get("name", "unknown"),
-        endpoints[-1].get("model", "unknown"),
-        502,
-        started_at,
-        ended_at,
-        last_error,
-    )
+    background_tasks.add_task(insert_log, api_key_value, str(group_name), endpoints[-1].get("name", "unknown"), endpoints[-1].get("model", "unknown"), 502, started_at, ended_at, last_error)
     raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=last_error or "All provider endpoints failed")
 
 
@@ -837,31 +1026,37 @@ def admin_providers(request: Request, message: Optional[str] = None) -> Any:
 
 @app.get("/admin/providers/add-codex", response_class=RedirectResponse, dependencies=[Depends(verify_admin)])
 async def admin_providers_add_codex(request: Request) -> RedirectResponse:
-    provider = find_provider("codex")
-    if provider is None:
-        provider = get_default_codex_provider()
-        if not provider["client_id"] or not provider["client_secret"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Missing Codex OAuth credentials: set CODEX_CLIENT_ID and CODEX_CLIENT_SECRET or add them to config.yml",
-            )
-        add_provider(
-            name=provider["name"],
-            base_url=provider["url"],
-            api_key="",
-            description=provider["description"],
-            models=provider["models"],
-            extra={
-                "oauth": provider["oauth"],
-                "client_id": provider["client_id"],
-                "client_secret": provider["client_secret"],
-                "authorize_url": provider["authorize_url"],
-                "token_url": provider["token_url"],
-                "redirect_uri": provider["redirect_uri"],
-                "scopes": provider["scopes"],
-            },
-        )
-    return RedirectResponse(url="/admin/providers/codex/oauth/login", status_code=status.HTTP_303_SEE_OTHER)
+    del request
+    base_provider = get_default_codex_provider()
+    existing = {provider.get("name") for provider in get_providers()}
+    name = "codex"
+    suffix = 1
+    while name in existing:
+        suffix += 1
+        name = f"codex-{suffix}"
+    provider = dict(base_provider)
+    provider["name"] = name
+    add_provider(
+        name=provider["name"],
+        base_url=provider["url"],
+        api_key="",
+        description=provider["description"],
+        models=provider["models"],
+        extra={
+            "api_mode": provider["api_mode"],
+            "oauth": provider["oauth"],
+            "client_id": provider["client_id"],
+            "client_secret": provider["client_secret"],
+            "authorize_url": provider["authorize_url"],
+            "token_url": provider["token_url"],
+            "redirect_uri": provider["redirect_uri"],
+            "scopes": provider["scopes"],
+            "access_token": "",
+            "refresh_token": "",
+            "expires_at": "",
+        },
+    )
+    return RedirectResponse(url=f"/admin/providers?message=Added+Codex+profile+template:+{quote(name)}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/admin/providers/{name}/oauth/login", dependencies=[Depends(verify_admin)])

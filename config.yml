@@ -1,16 +1,54 @@
+# Example config. Client-facing model names are groups under `groups`.
+# Put real secrets in server-side env or a deployment-only config.yml, not git.
 providers:
-  - name: codex
-    url: https://api.codex.ai/v1/chat/completions
-    description: Codex OAuth provider for model gpt-5.5
+  - name: codex-a
+    url: https://chatgpt.com/backend-api/codex
+    description: First OpenAI Codex OAuth profile; paste/import tokens on the server
     models:
       - gpt-5.5
+    api_mode: codex_responses
     oauth: true
-    client_id: "<YOUR_CLIENT_ID>"
-    client_secret: "<YOUR_CLIENT_SECRET>"
-    authorize_url: https://auth.codex.ai/oauth/authorize
-    token_url: https://auth.codex.ai/oauth/token
-    redirect_uri: http://localhost:8000/admin/providers/codex/oauth/callback
-    scopes:
-      - openid
-      - profile
-groups: {}
+    client_id: app_EMoamEEZ73f0CkXaXp7hrann
+    token_url: https://auth.openai.com/oauth/token
+    access_token: ""
+    refresh_token: ""
+    expires_at: ""
+
+  - name: codex-b
+    url: https://chatgpt.com/backend-api/codex
+    description: Second OpenAI Codex OAuth profile; used evenly by round-robin
+    models:
+      - gpt-5.5
+    api_mode: codex_responses
+    oauth: true
+    client_id: app_EMoamEEZ73f0CkXaXp7hrann
+    token_url: https://auth.openai.com/oauth/token
+    access_token: ""
+    refresh_token: ""
+    expires_at: ""
+
+  # OpenAI-compatible example, including Ollama (base host is normalized to /v1/chat/completions)
+  - name: ollama-local
+    url: http://localhost:11434
+    description: Ollama OpenAI-compatible endpoint
+    models:
+      - llama3.2
+    api_key: ""
+    api_mode: openai_chat_completions
+
+groups:
+  gpt-5.5:
+    description: Balanced Codex profile pool
+    strategy: round_robin
+    members:
+      - provider: codex-a
+        model: gpt-5.5
+      - provider: codex-b
+        model: gpt-5.5
+
+  local-llama:
+    description: Local Ollama model
+    strategy: fallback
+    members:
+      - provider: ollama-local
+        model: llama3.2

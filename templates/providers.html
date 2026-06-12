@@ -37,8 +37,10 @@
             <td class="px-4 py-4 text-slate-700">{{ provider.models | join(', ') }}</td>
             <td class="px-4 py-4 text-slate-700">{{ provider.description or '-' }}</td>
             <td class="px-4 py-4">
-              {% if provider.oauth %}
+              {% if provider.oauth and provider.authorize_url %}
               <a href="/admin/providers/{{ provider.name | e }}/oauth/login" class="mr-2 inline-flex rounded-2xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-700">Login OAuth</a>
+              {% elif provider.oauth %}
+              <span class="mr-2 inline-flex rounded-2xl bg-amber-100 px-4 py-2 text-sm font-semibold text-amber-800">Paste tokens in config</span>
               {% endif %}
               <button type="button" onclick="deleteProvider({{ provider.name | tojson }})" class="rounded-2xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-rose-700">Delete</button>
             </td>

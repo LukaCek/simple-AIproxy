@@ -177,6 +177,17 @@ def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch
     assert fake.requests[0]["json"]["input"] == [{"role": "user", "content": "hi"}]
     assert fake.requests[0]["json"]["instructions"] == "You are a helpful assistant."
     assert fake.requests[0]["json"]["store"] is False
+    assert fake.requests[0]["json"]["stream"] is True
+
+
+def test_extract_response_text_from_responses_sse():
+    body = b'''event: response.output_text.delta\ndata: {"delta":"hel"}\n\nevent: response.output_text.delta\ndata: {"delta":"lo"}\n\ndata: [DONE]\n\n'''
+    assert main.extract_response_text_from_sse(body) == "hello"
+
+
+def test_extract_response_text_from_chat_sse():
+    body = b'''data: {"choices":[{"delta":{"content":"hel"}}]}\n\ndata: {"choices":[{"delta":{"content":"lo"}}]}\n\ndata: [DONE]\n\n'''
+    assert main.extract_response_text_from_sse(body) == "hello"
 
 
 def test_responses_adapter_accepts_top_level_and_system_instructions():

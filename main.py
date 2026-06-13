@@ -1095,6 +1095,37 @@ def resolve_responses_url(endpoint: Dict[str, Any]) -> str:
     return urlunparse(parsed._replace(path=path))
 
 
+def extract_response_text_from_sse(body: bytes | str) -> str:
+    text_body = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+    texts: List[str] = []
+    for line in text_body.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data_text = line[5:].strip()
+        if not data_text or data_text == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_text)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            for key in ("delta", "text", "output_text"):
+                value = data.get(key)
+                if isinstance(value, str):
+                    texts.append(value)
+            if isinstance(data.get("choices"), list):
+                for choice in data["choices"]:
+                    delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                    if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                        texts.append(delta["content"])
+            if isinstance(data.get("content"), list):
+                for content in data["content"]:
+                    if isinstance(content, dict) and isinstance(content.get("text"), str):
+                        texts.append(content["text"])
+    return "".join(texts)
+
+
 def extract_response_text(data: Any) -> str:
     if not isinstance(data, dict):
         return str(data)
@@ -1161,6 +1192,7 @@ def chat_to_responses_payload(payload: Dict[str, Any], model: str) -> Dict[str, 
     # Codex/ChatGPT Responses requires explicit non-storage. Default to false so
     # OpenAI-compatible callers do not need to know about the Responses API quirk.
     converted["store"] = bool(payload.get("store")) if payload.get("store") is not None else False
+    converted["stream"] = True
     if payload.get("temperature") is not None:
         converted["temperature"] = payload.get("temperature")
     if payload.get("max_tokens") is not None:
@@ -1247,7 +1279,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                     try:
                         text = extract_response_text(response.json())
                     except Exception:
-                        text = content.decode("utf-8", errors="replace")
+                        text = extract_response_text_from_sse(content) or content.decode("utf-8", errors="replace")
                     ended_at, first_ms, total_ms = timing(first_response_at)
                     insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, text, None)
                     if payload.get("stream"):

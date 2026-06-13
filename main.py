@@ -34,6 +34,7 @@ watchdog_observer: Optional[Observer] = None
 oauth_state_store: Dict[str, Dict[str, Any]] = {}
 route_counters: Dict[str, int] = {}
 route_counters_lock = threading.Lock()
+PROVIDER_TEST_TIMEOUT_SECONDS = 3600.0
 
 admin_security = HTTPBasic()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -714,7 +715,7 @@ async def test_group_prompt(group_name: str, prompt: str) -> Dict[str, Any]:
         headers = build_provider_headers(endpoint)
         try:
             target_url = resolve_endpoint_url(endpoint)
-            async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=30.0) as response:
+            async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=PROVIDER_TEST_TIMEOUT_SECONDS) as response:
                 body = await response.aread()
                 text = body.decode("utf-8", errors="replace")
                 if response.status_code == 200:
@@ -976,7 +977,7 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str) 
     headers = build_provider_headers(provider)
     try:
         target_url = resolve_endpoint_url(provider)
-        async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=30.0) as response:
+        async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=PROVIDER_TEST_TIMEOUT_SECONDS) as response:
             body = await response.aread()
             text = body.decode("utf-8", errors="replace")
             if response.status_code == 200:
@@ -1016,7 +1017,7 @@ async def test_provider_candidate(name: str, base_url: str, api_key: str, models
     headers = build_provider_headers(provider)
     try:
         target_url = resolve_endpoint_url(provider)
-        async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=30.0) as response:
+        async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=PROVIDER_TEST_TIMEOUT_SECONDS) as response:
             body = await response.aread()
             text = body.decode("utf-8", errors="replace")
             preview = text[:4000]

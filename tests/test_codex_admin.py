@@ -1,7 +1,9 @@
+import asyncio
 import sqlite3
 import sys
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -114,6 +116,48 @@ def test_admin_provider_test_endpoint_tests_without_saving(tmp_path, monkeypatch
     assert response.status_code == 200
     assert response.json()["response"] == "OK"
     assert main.config_data["providers"] == []
+
+
+class FakeProviderTestStream:
+    def __init__(self, client, url, json=None, headers=None, timeout=None):
+        self.client = client
+        self.url = url
+        self.json = json
+        self.headers = headers
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        self.client.calls.append({"url": self.url, "json": self.json, "headers": self.headers, "timeout": self.timeout})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]}, request=httpx.Request("POST", self.url))
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class FakeProviderTestClient:
+    def __init__(self):
+        self.calls = []
+
+    def stream(self, method, url, json=None, headers=None, timeout=None):
+        assert method == "POST"
+        return FakeProviderTestStream(self, url, json=json, headers=headers, timeout=timeout)
+
+
+def test_provider_candidate_uses_one_hour_timeout_for_slow_ollama_load(monkeypatch):
+    fake = FakeProviderTestClient()
+    monkeypatch.setattr(main, "http_client", fake)
+
+    result = asyncio.run(
+        main.test_provider_candidate(
+            name="ollama-local",
+            base_url="http://ollama.local:11434/v1",
+            api_key="",
+            models_text="llama3.2",
+        )
+    )
+
+    assert result["success"] is True
+    assert fake.calls[0]["timeout"] == 3600.0
 
 
 def test_admin_codex_token_form_adds_profile(tmp_path, monkeypatch):

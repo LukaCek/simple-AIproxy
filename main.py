@@ -1195,8 +1195,6 @@ def chat_to_responses_payload(payload: Dict[str, Any], model: str) -> Dict[str, 
     converted["stream"] = True
     if payload.get("temperature") is not None:
         converted["temperature"] = payload.get("temperature")
-    if payload.get("max_tokens") is not None:
-        converted["max_output_tokens"] = payload.get("max_tokens")
     return converted
 
 

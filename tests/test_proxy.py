@@ -207,4 +207,4 @@ def test_responses_adapter_accepts_top_level_and_system_instructions():
     assert converted["instructions"] == "Top level instruction.\nSystem instruction."
     assert converted["input"] == [{"role": "user", "content": "hi"}]
     assert converted["store"] is False
-    assert converted["max_output_tokens"] == 10
+    assert "max_output_tokens" not in converted

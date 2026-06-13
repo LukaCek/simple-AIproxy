@@ -1110,10 +1110,14 @@ def extract_response_text_from_sse(body: bytes | str) -> str:
         except Exception:
             continue
         if isinstance(data, dict):
-            for key in ("delta", "text", "output_text"):
-                value = data.get(key)
-                if isinstance(value, str):
-                    texts.append(value)
+            value = data.get("delta")
+            if not isinstance(value, str):
+                value = data.get("text")
+            if not isinstance(value, str):
+                value = data.get("output_text")
+            if isinstance(value, str):
+                texts.append(value)
+                continue
             if isinstance(data.get("choices"), list):
                 for choice in data["choices"]:
                     delta = choice.get("delta", {}) if isinstance(choice, dict) else {}

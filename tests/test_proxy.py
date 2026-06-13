@@ -180,8 +180,8 @@ def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch
     assert fake.requests[0]["json"]["stream"] is True
 
 
-def test_extract_response_text_from_responses_sse():
-    body = b'''event: response.output_text.delta\ndata: {"delta":"hel"}\n\nevent: response.output_text.delta\ndata: {"delta":"lo"}\n\ndata: [DONE]\n\n'''
+def test_extract_response_text_from_responses_sse_prefers_delta_once():
+    body = b'''event: response.output_text.delta\ndata: {"delta":"hel","text":"hel"}\n\nevent: response.output_text.delta\ndata: {"delta":"lo","text":"lo"}\n\ndata: [DONE]\n\n'''
     assert main.extract_response_text_from_sse(body) == "hello"
 
 

@@ -13,27 +13,41 @@
         <tr>
           <th class="px-4 py-3 font-semibold text-slate-700">Time</th>
           <th class="px-4 py-3 font-semibold text-slate-700">API Key</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">Group</th>
+          <th class="px-4 py-3 font-semibold text-slate-700">Requested model</th>
           <th class="px-4 py-3 font-semibold text-slate-700">Provider</th>
           <th class="px-4 py-3 font-semibold text-slate-700">Model</th>
           <th class="px-4 py-3 font-semibold text-slate-700">Status</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">Duration</th>
+          <th class="px-4 py-3 font-semibold text-slate-700">First token</th>
+          <th class="px-4 py-3 font-semibold text-slate-700">Total</th>
         </tr>
       </thead>
       <tbody class="divide-y divide-slate-200">
         {% for log in logs %}
         <tr>
           <td class="px-4 py-4 text-slate-700">{{ log.created_at }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.api_key or "-" }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.group_name }}</td>
+          <td class="px-4 py-4 text-slate-700">{{ log.api_key_display }}</td>
+          <td class="px-4 py-4 text-slate-700">{{ log.requested_model or log.group_name }}</td>
           <td class="px-4 py-4 text-slate-700">{{ log.provider_name }}</td>
           <td class="px-4 py-4 text-slate-700">{{ log.provider_model }}</td>
           <td class="px-4 py-4 text-slate-700">{{ log.status_code }}</td>
+          <td class="px-4 py-4 text-slate-700">{{ log.first_response }}</td>
           <td class="px-4 py-4 text-slate-700">{{ log.duration }}</td>
+        </tr>
+        <tr class="bg-slate-50/70">
+          <td colspan="8" class="px-4 py-3 text-xs text-slate-700">
+            <details>
+              <summary class="cursor-pointer font-semibold">Prompt / output / error</summary>
+              <div class="mt-3 grid gap-3 lg:grid-cols-3">
+                <div><div class="font-semibold text-slate-900">Prompt</div><pre class="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-2xl bg-white p-3">{{ log.prompt or '-' }}</pre></div>
+                <div><div class="font-semibold text-slate-900">Output</div><pre class="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-2xl bg-white p-3">{{ log.output or '-' }}</pre></div>
+                <div><div class="font-semibold text-slate-900">Error</div><pre class="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-2xl bg-white p-3">{{ log.error or '-' }}</pre></div>
+              </div>
+            </details>
+          </td>
         </tr>
         {% else %}
         <tr>
-          <td colspan="7" class="px-4 py-6 text-center text-slate-500">No logs yet.</td>
+          <td colspan="8" class="px-4 py-6 text-center text-slate-500">No logs yet.</td>
         </tr>
         {% endfor %}
       </tbody>

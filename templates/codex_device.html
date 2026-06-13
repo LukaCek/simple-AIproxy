@@ -1,0 +1,44 @@
+{% extends "layout.html" %}
+{% block content %}
+<section class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+  <h2 class="text-xl font-semibold text-slate-900">Codex device-code login</h2>
+  <p class="mt-2 text-sm text-slate-600">Profile: <strong>{{ profile_name }}</strong></p>
+  <div class="mt-6 rounded-3xl border border-sky-200 bg-sky-50 p-5">
+    <p class="text-sm text-sky-900">1. Open this OpenAI/Codex login page:</p>
+    <p class="mt-2"><a class="font-semibold text-sky-700 underline" href="{{ verification_url }}" target="_blank" rel="noopener">{{ verification_url }}</a></p>
+    <p class="mt-4 text-sm text-sky-900">2. Enter this one-time code:</p>
+    <div class="mt-2 inline-flex rounded-2xl bg-slate-900 px-5 py-3 font-mono text-2xl font-bold tracking-widest text-white">{{ user_code }}</div>
+    <p class="mt-4 text-xs text-sky-800">Device code expires in about 15 minutes. Never share this code with anyone you do not trust.</p>
+  </div>
+  <div id="status" class="mt-6 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">Waiting for login...</div>
+  <div class="mt-6 flex gap-3">
+    <a href="/admin/providers" class="rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-200">Back to providers</a>
+  </div>
+</section>
+<script>
+  const statusBox = document.getElementById('status');
+  async function pollCodexLogin() {
+    try {
+      const response = await fetch('/admin/providers/codex-device/{{ login_id }}/status', {
+        credentials: 'same-origin',
+        headers: {'Accept': 'application/json'}
+      });
+      const data = await response.json();
+      statusBox.textContent = data.message || data.status;
+      if (data.status === 'complete') {
+        statusBox.className = 'mt-6 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900';
+        setTimeout(() => { window.location.href = '/admin/providers?message=' + encodeURIComponent(data.message); }, 1200);
+        return;
+      }
+      if (data.status === 'expired') {
+        statusBox.className = 'mt-6 rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900';
+        return;
+      }
+    } catch (err) {
+      statusBox.textContent = 'Poll error: ' + err;
+    }
+    setTimeout(pollCodexLogin, Math.max(3000, Number('{{ interval }}') * 1000));
+  }
+  setTimeout(pollCodexLogin, Math.max(1000, Number('{{ interval }}') * 1000));
+</script>
+{% endblock %}

@@ -101,6 +101,41 @@ def test_chat_completions_uses_round_robin_between_providers(tmp_path, monkeypat
     assert fake.hosts == ["p1.local", "p2.local", "p1.local", "p2.local"]
 
 
+def test_direct_provider_model_is_routable_and_logged(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = FakeChatClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    main.route_counters.clear()
+    desired_config = {
+        "providers": [
+            {"name": "groq", "url": "http://groq.local/v1", "api_key": "k1", "models": ["llama-3.1-8b-instant"]},
+        ],
+        "groups": {},
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 200
+    assert fake.hosts == ["groq.local"]
+    with sqlite3.connect(tmp_path / "app.db") as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT api_key_name, requested_model, provider_name, provider_model, prompt, output, first_response_ms, total_ms FROM Logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["api_key_name"] == "test"
+    assert row["requested_model"] == "llama-3.1-8b-instant"
+    assert row["provider_name"] == "groq"
+    assert row["provider_model"] == "llama-3.1-8b-instant"
+    assert "hi" in row["prompt"]
+    assert "from groq.local" in row["output"]
+    assert row["first_response_ms"] is not None
+    assert row["total_ms"] is not None
+
+
 def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch):
     setup_key_db(tmp_path, monkeypatch)
     fake = FakeResponsesClient()

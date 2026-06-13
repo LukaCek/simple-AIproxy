@@ -1,4 +1,6 @@
 import os
+import base64
+import hashlib
 import sqlite3
 import threading
 import time
@@ -13,7 +15,7 @@ import json
 import secrets
 import yaml
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request, Response, status
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 from watchdog.events import FileSystemEventHandler
@@ -74,17 +76,38 @@ def init_database() -> None:
             CREATE TABLE IF NOT EXISTS Logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_key TEXT,
+                api_key_name TEXT,
+                requested_model TEXT,
                 group_name TEXT,
                 provider_name TEXT,
                 provider_model TEXT,
                 status_code INTEGER,
                 started_at TEXT,
+                first_response_at TEXT,
                 ended_at TEXT,
+                first_response_ms REAL,
+                total_ms REAL,
+                prompt TEXT,
+                output TEXT,
                 error TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        cursor.execute("PRAGMA table_info(Logs)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        migrations = {
+            "api_key_name": "TEXT",
+            "requested_model": "TEXT",
+            "first_response_at": "TEXT",
+            "first_response_ms": "REAL",
+            "total_ms": "REAL",
+            "prompt": "TEXT",
+            "output": "TEXT",
+        }
+        for column, column_type in migrations.items():
+            if column not in existing_columns:
+                cursor.execute(f"ALTER TABLE Logs ADD COLUMN {column} {column_type}")
         conn.commit()
 
 
@@ -331,36 +354,139 @@ def list_api_keys() -> List[Dict[str, Any]]:
         return [dict(row) for row in cursor.fetchall()]
 
 
+def truncate_text(value: Any, limit: int = 12000) -> str:
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… [truncated {len(text) - limit} chars]"
+
+
+def extract_prompt(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("messages") is not None:
+        return truncate_text(payload.get("messages"))
+    return truncate_text(payload.get("prompt", ""))
+
+
+def extract_output_from_chat_payload(data: Any) -> str:
+    if not isinstance(data, dict):
+        return truncate_text(data)
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        parts: List[str] = []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            content = message.get("content") or delta.get("content")
+            if content:
+                parts.append(str(content))
+        if parts:
+            return truncate_text("".join(parts))
+    return truncate_text(data)
+
+
+def extract_output_from_body(content: bytes, content_type: str = "") -> str:
+    text = content.decode("utf-8", errors="replace")
+    if "text/event-stream" in (content_type or "").lower():
+        parts: List[str] = []
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data_text = line[5:].strip()
+            if not data_text or data_text == "[DONE]":
+                continue
+            try:
+                parts.append(extract_output_from_chat_payload(json.loads(data_text)))
+            except Exception:
+                parts.append(data_text)
+        return truncate_text("".join(parts) or text)
+    try:
+        return extract_output_from_chat_payload(json.loads(text))
+    except Exception:
+        return truncate_text(text)
+
+
 def list_logs(limit: int = 200) -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT api_key, group_name, provider_name, provider_model, status_code, started_at, ended_at, error, created_at FROM Logs ORDER BY id DESC LIMIT ?",
+            """
+            SELECT api_key, api_key_name, requested_model, group_name, provider_name, provider_model,
+                   status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
+                   prompt, output, error, created_at
+            FROM Logs ORDER BY id DESC LIMIT ?
+            """,
             (limit,),
         )
         rows = [dict(row) for row in cursor.fetchall()]
     for row in rows:
-        try:
-            start = datetime.fromisoformat(row["started_at"]) if row["started_at"] else None
-            end = datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None
-            if start and end:
-                row["duration"] = f"{(end - start).total_seconds():.2f}s"
-            else:
+        if row.get("total_ms") is not None:
+            row["duration"] = f"{float(row['total_ms']) / 1000:.2f}s"
+        else:
+            try:
+                start_dt = datetime.fromisoformat(row["started_at"]) if row["started_at"] else None
+                end_dt = datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None
+                row["duration"] = f"{(end_dt - start_dt).total_seconds():.2f}s" if start_dt and end_dt else "-"
+            except Exception:
                 row["duration"] = "-"
-        except Exception:
-            row["duration"] = "-"
+        row["first_response"] = f"{float(row['first_response_ms']) / 1000:.2f}s" if row.get("first_response_ms") is not None else "-"
+        key = row.get("api_key") or ""
+        row["api_key_display"] = f"{row.get('api_key_name') or '-'} ({key[:6]}…{key[-4:]})" if key else (row.get("api_key_name") or "-")
     return rows
 
 
-def insert_log(api_key: Optional[str], group_name: str, provider_name: str, provider_model: str, status_code: int, started_at: str, ended_at: str, error: Optional[str]) -> None:
+def insert_log(
+    api_key: Optional[str],
+    api_key_name: Optional[str],
+    requested_model: str,
+    group_name: str,
+    provider_name: str,
+    provider_model: str,
+    status_code: int,
+    started_at: str,
+    first_response_at: Optional[str],
+    ended_at: str,
+    first_response_ms: Optional[float],
+    total_ms: Optional[float],
+    prompt: Optional[str],
+    output: Optional[str],
+    error: Optional[str],
+) -> None:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO Logs (api_key, group_name, provider_name, provider_model, status_code, started_at, ended_at, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (api_key, group_name, provider_name, provider_model, status_code, started_at, ended_at, error, datetime.utcnow().isoformat()),
+            """
+            INSERT INTO Logs (
+                api_key, api_key_name, requested_model, group_name, provider_name, provider_model,
+                status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
+                prompt, output, error, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                api_key,
+                api_key_name,
+                requested_model,
+                group_name,
+                provider_name,
+                provider_model,
+                status_code,
+                started_at,
+                first_response_at,
+                ended_at,
+                first_response_ms,
+                total_ms,
+                truncate_text(prompt or ""),
+                truncate_text(output or ""),
+                truncate_text(error or "", 4000) if error else None,
+                datetime.utcnow().isoformat(),
+            ),
         )
         conn.commit()
-
 
 def create_api_key(name: str) -> str:
     token = uuid.uuid4().hex
@@ -669,6 +795,48 @@ def resolve_group(group_name: str) -> List[Dict[str, Any]]:
     return endpoints
 
 
+def resolve_requested_model(model_name: str) -> List[Dict[str, Any]]:
+    """Resolve an OpenAI model name to provider endpoints.
+
+    Explicit groups still work for aliases/pools, but direct provider model names
+    are also routable. If multiple providers expose the same real model name,
+    they are treated as a round-robin pool under that model name.
+    """
+    try:
+        return resolve_group(model_name)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_404_NOT_FOUND:
+            raise
+    with config_lock:
+        endpoints: List[Dict[str, Any]] = []
+        for provider in config_data.get("providers", []):
+            if not isinstance(provider, dict):
+                continue
+            models = [str(model) for model in provider.get("models", []) if model is not None]
+            if model_name not in models:
+                continue
+            endpoints.append(
+                {
+                    "name": provider.get("name", ""),
+                    "url": provider.get("url", ""),
+                    "api_key": provider.get("api_key", ""),
+                    "description": provider.get("description", ""),
+                    "oauth": provider.get("oauth", False),
+                    "api_mode": provider.get("api_mode", "openai_chat_completions"),
+                    "access_token": provider.get("access_token", ""),
+                    "refresh_token": provider.get("refresh_token", ""),
+                    "token_url": provider.get("token_url", ""),
+                    "client_id": provider.get("client_id", ""),
+                    "client_secret": provider.get("client_secret", ""),
+                    "expires_at": provider.get("expires_at", ""),
+                    "model": model_name,
+                }
+            )
+    if not endpoints:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' not configured")
+    return endpoints
+
+
 async def test_provider_model(provider_name: str, model_name: str, prompt: str) -> Dict[str, Any]:
     provider = find_provider(provider_name)
     if provider is None:
@@ -784,6 +952,69 @@ async def exchange_oauth_code(request: Request, provider: Dict[str, Any], code: 
             pass
     return result
 
+
+
+def generate_pkce_pair() -> Dict[str, str]:
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+    return {"code_verifier": verifier, "code_challenge": challenge}
+
+
+async def request_codex_device_code(client_id: str) -> Dict[str, Any]:
+    issuer = "https://auth.openai.com"
+    response = await http_client.post(
+        f"{issuer}/api/accounts/deviceauth/usercode",
+        json={"client_id": client_id},
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        timeout=30.0,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Codex device-code request failed: {response.status_code} {response.text}")
+    data = response.json()
+    return {
+        "verification_url": f"{issuer}/codex/device",
+        "user_code": data.get("user_code") or data.get("usercode"),
+        "device_auth_id": data.get("device_auth_id"),
+        "interval": int(str(data.get("interval") or "5")),
+    }
+
+
+async def poll_codex_device_authorization(device_auth_id: str, user_code: str) -> Optional[Dict[str, Any]]:
+    issuer = "https://auth.openai.com"
+    response = await http_client.post(
+        f"{issuer}/api/accounts/deviceauth/token",
+        json={"device_auth_id": device_auth_id, "user_code": user_code},
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        timeout=30.0,
+    )
+    if response.status_code in {403, 404}:
+        return None
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Codex device authorization failed: {response.status_code} {response.text}")
+    return response.json()
+
+
+async def exchange_codex_device_code(client_id: str, authorization_code: str, code_verifier: str) -> Dict[str, Any]:
+    issuer = "https://auth.openai.com"
+    redirect_uri = f"{issuer}/deviceauth/callback"
+    response = await http_client.post(
+        f"{issuer}/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": authorization_code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        timeout=30.0,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Codex token exchange failed: {response.status_code} {response.text}")
+    token_data = response.json()
+    if not token_data.get("access_token"):
+        raise HTTPException(status_code=502, detail="Codex token exchange did not return access_token")
+    return token_data
 
 def parse_expires_at(value: Any) -> Optional[float]:
     if not value:
@@ -952,26 +1183,50 @@ async def health_check():
 @app.get("/v1/models")
 async def list_openai_models(api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
     del api_key_record
+    model_ids: List[str] = []
     with config_lock:
+        for provider in config_data.get("providers", []):
+            if not isinstance(provider, dict):
+                continue
+            for model in provider.get("models", []):
+                model_id = str(model).strip()
+                if model_id and model_id not in model_ids:
+                    model_ids.append(model_id)
         groups = config_data.get("groups", {})
-        data = []
         if isinstance(groups, dict):
             for group_name in groups:
-                data.append({"id": group_name, "object": "model", "created": 0, "owned_by": "simple-aiproxy"})
-    return {"object": "list", "data": data}
+                if group_name not in model_ids:
+                    model_ids.append(str(group_name))
+    return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "simple-aiproxy"} for model_id in model_ids]}
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, background_tasks: BackgroundTasks, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Response:
+    del background_tasks
     payload = await request.json()
-    group_name = payload.get("model")
-    if not group_name:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing model group in request payload")
-    endpoints = route_endpoints(str(group_name), resolve_group(str(group_name)))
+    requested_model = str(payload.get("model") or "")
+    if not requested_model:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing model in request payload")
+    endpoints = route_endpoints(requested_model, resolve_requested_model(requested_model))
     api_key_value = api_key_record["key"]
+    api_key_name = api_key_record["name"] if "name" in api_key_record.keys() else None
+    prompt_text = extract_prompt(payload)
+    started_monotonic = time.monotonic()
     started_at = datetime.utcnow().isoformat()
     last_error: Optional[str] = None
     fallback_statuses = {401, 403, 408, 409, 425, 429, 500, 502, 503, 504}
+
+    def timing(first_at: Optional[str] = None) -> tuple[str, Optional[float], float]:
+        ended = datetime.utcnow().isoformat()
+        total_ms = (time.monotonic() - started_monotonic) * 1000
+        first_ms: Optional[float] = None
+        if first_at:
+            try:
+                first_ms = (datetime.fromisoformat(first_at) - datetime.fromisoformat(started_at)).total_seconds() * 1000
+            except Exception:
+                first_ms = None
+        return ended, first_ms, total_ms
+
     for endpoint in endpoints:
         provider_name = str(endpoint.get("name", "unknown"))
         provider_model = str(endpoint.get("model") or "")
@@ -983,13 +1238,14 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             if api_mode in {"openai_responses", "codex_responses"}:
                 response = await send_responses_adapter(endpoint, provider_payload)
                 content = response.content
+                first_response_at = datetime.utcnow().isoformat()
                 if response.status_code == 200:
                     try:
                         text = extract_response_text(response.json())
                     except Exception:
                         text = content.decode("utf-8", errors="replace")
-                    ended_at = datetime.utcnow().isoformat()
-                    background_tasks.add_task(insert_log, api_key_value, str(group_name), provider_name, provider_model, 200, started_at, ended_at, None)
+                    ended_at, first_ms, total_ms = timing(first_response_at)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, text, None)
                     if payload.get("stream"):
                         return StreamingResponse(sse_chat_chunks(provider_model, text), status_code=200, media_type="text/event-stream")
                     return Response(json.dumps(chat_completion_from_text(provider_model, text), ensure_ascii=False), status_code=200, media_type="application/json")
@@ -997,43 +1253,64 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                 if response.status_code in fallback_statuses:
                     last_error = f"{provider_name} returned {response.status_code}: {error_msg}"
                     continue
-                ended_at = datetime.utcnow().isoformat()
-                background_tasks.add_task(insert_log, api_key_value, str(group_name), provider_name, provider_model, response.status_code, started_at, ended_at, error_msg)
+                ended_at, first_ms, total_ms = timing(first_response_at)
+                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
                 return Response(content, status_code=response.status_code, media_type=response.headers.get("content-type", "application/json"))
 
             headers = build_provider_headers(endpoint)
             target_url = resolve_endpoint_url(endpoint)
             request_obj = http_client.build_request("POST", target_url, json=provider_payload, headers=headers)
             response = await http_client.send(request_obj, stream=True)
+            content_type = response.headers.get("content-type", "application/json")
             if response.status_code == 200:
-                async def proxy_stream() -> Any:
-                    try:
-                        async for chunk in response.aiter_bytes():
-                            yield chunk
-                    finally:
-                        await response.aclose()
-                ended_at = datetime.utcnow().isoformat()
-                background_tasks.add_task(insert_log, api_key_value, str(group_name), provider_name, provider_model, response.status_code, started_at, ended_at, None)
-                return StreamingResponse(proxy_stream(), status_code=200, media_type=response.headers.get("content-type", "application/json"))
+                if payload.get("stream"):
+                    async def proxy_stream() -> Any:
+                        first_response_at: Optional[str] = None
+                        captured = bytearray()
+                        error_msg: Optional[str] = None
+                        try:
+                            async for chunk in response.aiter_bytes():
+                                if chunk and first_response_at is None:
+                                    first_response_at = datetime.utcnow().isoformat()
+                                if chunk and len(captured) < 12000:
+                                    captured.extend(chunk[: 12000 - len(captured)])
+                                yield chunk
+                        except Exception as exc:
+                            error_msg = str(exc)
+                            raise
+                        finally:
+                            await response.aclose()
+                            ended_at, first_ms, total_ms = timing(first_response_at)
+                            output_text = extract_output_from_body(bytes(captured), content_type) if captured else ""
+                            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200 if error_msg is None else 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, error_msg)
+                    return StreamingResponse(proxy_stream(), status_code=200, media_type=content_type)
+                content = await response.aread()
+                await response.aclose()
+                first_response_at = datetime.utcnow().isoformat()
+                ended_at, first_ms, total_ms = timing(first_response_at)
+                output_text = extract_output_from_body(content, content_type)
+                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, None)
+                return Response(content, status_code=200, media_type=content_type)
             content = await response.aread()
             await response.aclose()
+            first_response_at = datetime.utcnow().isoformat()
             error_msg = content.decode("utf-8", errors="replace")
             if response.status_code in fallback_statuses:
                 last_error = f"{provider_name} returned {response.status_code}: {error_msg}"
                 continue
-            ended_at = datetime.utcnow().isoformat()
-            background_tasks.add_task(insert_log, api_key_value, str(group_name), provider_name, provider_model, response.status_code, started_at, ended_at, error_msg)
-            return Response(content, status_code=response.status_code, media_type=response.headers.get("content-type", "application/json"))
+            ended_at, first_ms, total_ms = timing(first_response_at)
+            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+            return Response(content, status_code=response.status_code, media_type=content_type)
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
             last_error = f"{provider_name} failed: {exc}"
             continue
         except Exception as exc:
             last_error = f"{provider_name} unexpected error: {exc}"
             continue
-    ended_at = datetime.utcnow().isoformat()
-    background_tasks.add_task(insert_log, api_key_value, str(group_name), endpoints[-1].get("name", "unknown"), endpoints[-1].get("model", "unknown"), 502, started_at, ended_at, last_error)
+    ended_at, first_ms, total_ms = timing(None)
+    last_endpoint = endpoints[-1] if endpoints else {}
+    insert_log(api_key_value, api_key_name, requested_model, requested_model, str(last_endpoint.get("name", "unknown")), str(last_endpoint.get("model", "unknown")), 502, started_at, None, ended_at, first_ms, total_ms, prompt_text, None, last_error)
     raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=last_error or "All provider endpoints failed")
-
 
 @app.get("/admin/keys", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_keys(request: Request) -> Any:
@@ -1088,17 +1365,65 @@ def admin_providers(request: Request, message: Optional[str] = None) -> Any:
     )
 
 
-@app.get("/admin/providers/add-codex", response_class=RedirectResponse, dependencies=[Depends(verify_admin)])
-async def admin_providers_add_codex(request: Request) -> RedirectResponse:
-    del request
-    existing = {provider.get("name") for provider in get_providers()}
-    name = "codex"
-    suffix = 1
-    while name in existing:
-        suffix += 1
-        name = f"codex-{suffix}"
-    add_codex_profile(name=name)
-    return RedirectResponse(url=f"/admin/providers?message=Added+Codex+profile+template+and+gpt-5.5+pool+member:+{quote(name)}", status_code=status.HTTP_303_SEE_OTHER)
+@app.post("/admin/providers/codex-device/start", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
+async def admin_providers_codex_device_start(request: Request, name: str = Form(...), description: str = Form("")) -> Any:
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Codex profile name is required")
+    if find_provider(clean_name) is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider '{clean_name}' already exists")
+    client_id = get_default_codex_provider()["client_id"]
+    device = await request_codex_device_code(client_id)
+    if not device.get("user_code") or not device.get("device_auth_id"):
+        raise HTTPException(status_code=502, detail=f"Invalid Codex device-code response: {device}")
+    login_id = uuid.uuid4().hex
+    oauth_state_store[login_id] = {
+        "provider": clean_name,
+        "description": description.strip(),
+        "created_at": datetime.utcnow().isoformat(),
+        "client_id": client_id,
+        "device_auth_id": device["device_auth_id"],
+        "user_code": device["user_code"],
+        "interval": device["interval"],
+    }
+    return templates.TemplateResponse(
+        request=request,
+        name="codex_device.html",
+        context={
+            "login_id": login_id,
+            "profile_name": clean_name,
+            "verification_url": device["verification_url"],
+            "user_code": device["user_code"],
+            "interval": device["interval"],
+        },
+    )
+
+
+@app.get("/admin/providers/codex-device/{login_id}/status", dependencies=[Depends(verify_admin)])
+async def admin_providers_codex_device_status(login_id: str) -> JSONResponse:
+    state_data = oauth_state_store.get(login_id)
+    if not state_data:
+        return JSONResponse({"status": "expired", "message": "Login state expired or already completed."}, status_code=404)
+    created = datetime.fromisoformat(state_data["created_at"])
+    if datetime.utcnow() - created > timedelta(minutes=15):
+        oauth_state_store.pop(login_id, None)
+        return JSONResponse({"status": "expired", "message": "Device code expired. Start again."}, status_code=410)
+    code_resp = await poll_codex_device_authorization(state_data["device_auth_id"], state_data["user_code"])
+    if code_resp is None:
+        return JSONResponse({"status": "pending", "message": "Waiting for OpenAI device login..."})
+    authorization_code = code_resp.get("authorization_code")
+    code_verifier = code_resp.get("code_verifier")
+    if not authorization_code or not code_verifier:
+        raise HTTPException(status_code=502, detail=f"Codex device auth response missing authorization_code/code_verifier: {code_resp}")
+    tokens = await exchange_codex_device_code(state_data["client_id"], authorization_code, code_verifier)
+    add_codex_profile(
+        name=state_data["provider"],
+        access_token=tokens.get("access_token", ""),
+        refresh_token=tokens.get("refresh_token", ""),
+        description=state_data.get("description", ""),
+    )
+    oauth_state_store.pop(login_id, None)
+    return JSONResponse({"status": "complete", "message": f"Codex profile '{state_data['provider']}' logged in and added to gpt-5.5."})
 
 
 @app.post("/admin/providers/codex-token", response_class=RedirectResponse, dependencies=[Depends(verify_admin)])
@@ -1171,6 +1496,12 @@ async def admin_providers_add(
 async def admin_providers_delete(name: str) -> Dict[str, Any]:
     delete_provider(name)
     return {"status": "ok", "message": f"Provider '{name}' deleted."}
+
+
+@app.post("/admin/providers/{name}/delete", dependencies=[Depends(verify_admin)])
+async def admin_providers_delete_post(name: str) -> RedirectResponse:
+    delete_provider(name)
+    return RedirectResponse(url=f"/admin/providers?message=Deleted+provider:+{quote(name)}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/admin/playground", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])

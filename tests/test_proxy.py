@@ -175,6 +175,7 @@ def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch
 
     assert fake.requests[0]["url"] == "https://chatgpt.com/backend-api/codex/responses"
     assert fake.requests[0]["json"]["input"] == [{"role": "user", "content": "hi"}]
+    assert fake.requests[0]["json"]["instructions"] == "You are a helpful assistant."
     assert fake.requests[0]["json"]["store"] is False
 
 

@@ -1157,8 +1157,7 @@ def chat_to_responses_payload(payload: Dict[str, Any], model: str) -> Dict[str, 
             continue
         input_messages.append({"role": role, "content": content})
     converted: Dict[str, Any] = {"model": model, "input": input_messages or str(payload.get("prompt", ""))}
-    if instructions:
-        converted["instructions"] = instructions
+    converted["instructions"] = instructions or "You are a helpful assistant."
     # Codex/ChatGPT Responses requires explicit non-storage. Default to false so
     # OpenAI-compatible callers do not need to know about the Responses API quirk.
     converted["store"] = bool(payload.get("store")) if payload.get("store") is not None else False

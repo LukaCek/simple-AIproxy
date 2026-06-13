@@ -583,14 +583,80 @@ def get_groups() -> List[Dict[str, Any]]:
         for group_name, group in groups.items():
             if not isinstance(group, dict):
                 continue
+            members = group.get("members", [])
             groups_list.append(
                 {
                     "name": group_name,
                     "description": group.get("description", ""),
-                    "members": group.get("members", []),
+                    "strategy": group.get("strategy", "round_robin"),
+                    "members": members if isinstance(members, list) else [],
                 }
             )
     return groups_list
+
+
+def normalize_group_members(member_providers: List[str], member_models: List[str]) -> List[Dict[str, str]]:
+    members: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for provider_name, model_name in zip(member_providers, member_models):
+        clean_provider = provider_name.strip()
+        clean_model = model_name.strip()
+        if not clean_provider or not clean_model:
+            continue
+        key = (clean_provider, clean_model)
+        if key in seen:
+            continue
+        seen.add(key)
+        members.append({"provider": clean_provider, "model": clean_model})
+    return members
+
+
+def save_group(group_name: str, description: str, strategy: str, members: List[Dict[str, str]], original_name: Optional[str] = None) -> None:
+    clean_name = group_name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Group name is required")
+    clean_strategy = strategy.strip() or "round_robin"
+    if clean_strategy not in {"round_robin", "fallback"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Strategy must be round_robin or fallback")
+    if not members:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one group member is required")
+    with config_lock:
+        data = config_data
+        groups = data.setdefault("groups", {})
+        if not isinstance(groups, dict):
+            groups = {}
+            data["groups"] = groups
+        provider_map = {provider.get("name"): provider for provider in data.get("providers", []) if isinstance(provider, dict)}
+        for member in members:
+            provider_name = member["provider"]
+            model_name = member["model"]
+            provider = provider_map.get(provider_name)
+            if provider is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider '{provider_name}' does not exist")
+            models = [str(model) for model in provider.get("models", []) if model is not None]
+            if model_name not in models:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_name}' is not configured on provider '{provider_name}'")
+        if original_name and original_name != clean_name:
+            if clean_name in groups:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Group '{clean_name}' already exists")
+            groups.pop(original_name, None)
+        elif not original_name and clean_name in groups:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Group '{clean_name}' already exists")
+        groups[clean_name] = {
+            "description": description.strip(),
+            "strategy": clean_strategy,
+            "members": members,
+        }
+        save_config(data)
+
+
+def delete_group(group_name: str) -> None:
+    with config_lock:
+        groups = config_data.get("groups", {})
+        if not isinstance(groups, dict) or group_name not in groups:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Group '{group_name}' not found")
+        groups.pop(group_name)
+        save_config(config_data)
 
 
 async def test_group_prompt(group_name: str, prompt: str) -> Dict[str, Any]:
@@ -1403,6 +1469,48 @@ async def admin_config_save(yaml_text: str = Form(...)) -> RedirectResponse:
         return RedirectResponse(url="/admin/config", status_code=status.HTTP_303_SEE_OTHER)
     except yaml.YAMLError as exc:
         return HTMLResponse(content=f"Invalid YAML: {exc}", status_code=400)
+
+
+@app.get("/admin/groups", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
+def admin_groups(request: Request, message: Optional[str] = None) -> Any:
+    return templates.TemplateResponse(
+        request=request,
+        name="groups.html",
+        context={"groups": get_groups(), "providers": get_providers(), "message": message},
+    )
+
+
+@app.post("/admin/groups", dependencies=[Depends(verify_admin)])
+async def admin_groups_add(
+    name: str = Form(...),
+    description: str = Form(""),
+    strategy: str = Form("round_robin"),
+    member_provider: List[str] = Form(default=[]),
+    member_model: List[str] = Form(default=[]),
+) -> RedirectResponse:
+    members = normalize_group_members(member_provider, member_model)
+    save_group(name, description, strategy, members)
+    return RedirectResponse(url=f"/admin/groups?message=Created+group:+{quote(name.strip())}", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/groups/{group_name}/save", dependencies=[Depends(verify_admin)])
+async def admin_groups_save(
+    group_name: str,
+    name: str = Form(...),
+    description: str = Form(""),
+    strategy: str = Form("round_robin"),
+    member_provider: List[str] = Form(default=[]),
+    member_model: List[str] = Form(default=[]),
+) -> RedirectResponse:
+    members = normalize_group_members(member_provider, member_model)
+    save_group(name, description, strategy, members, original_name=group_name)
+    return RedirectResponse(url=f"/admin/groups?message=Saved+group:+{quote(name.strip())}", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/groups/{group_name}/delete", dependencies=[Depends(verify_admin)])
+async def admin_groups_delete(group_name: str) -> RedirectResponse:
+    delete_group(group_name)
+    return RedirectResponse(url=f"/admin/groups?message=Deleted+group:+{quote(group_name)}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/admin/providers", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])

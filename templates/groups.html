@@ -1,0 +1,150 @@
+{% extends "layout.html" %}
+{% block content %}
+{% set provider_json = providers | tojson %}
+<div class="grid gap-6 xl:grid-cols-[1fr_380px]">
+  <section class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+    <div class="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+      <div>
+        <h2 class="text-xl font-semibold text-slate-900">Model Groups</h2>
+        <p class="mt-1 text-sm text-slate-500">Create aliases/pools like <code class="rounded bg-slate-100 px-1.5 py-0.5">gpt-5.5</code> and <code class="rounded bg-slate-100 px-1.5 py-0.5">groq-fast</code> without editing YAML manually.</p>
+      </div>
+      <a href="/admin/config" class="inline-flex items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-100">Advanced YAML</a>
+    </div>
+    {% if message %}
+    <div class="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
+      {{ message }}
+    </div>
+    {% endif %}
+    <div class="mt-6 space-y-5">
+      {% for group in groups %}
+      <article class="rounded-3xl border border-slate-200 bg-slate-50 p-5 shadow-sm">
+        <form action="/admin/groups/{{ group.name | urlencode }}/save" method="post" class="space-y-4">
+          <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div class="grid flex-1 gap-3 md:grid-cols-[220px_1fr_180px]">
+              <div>
+                <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Group / public model</label>
+                <input name="name" required value="{{ group.name }}" class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
+              </div>
+              <div>
+                <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Description</label>
+                <input name="description" value="{{ group.description }}" class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
+              </div>
+              <div>
+                <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">Strategy</label>
+                <select name="strategy" class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
+                  <option value="round_robin" {% if group.strategy == 'round_robin' %}selected{% endif %}>round_robin</option>
+                  <option value="fallback" {% if group.strategy == 'fallback' %}selected{% endif %}>fallback</option>
+                </select>
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <button type="submit" class="rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Save</button>
+            </div>
+          </div>
+          <div>
+            <div class="mb-2 flex items-center justify-between gap-3">
+              <h3 class="text-sm font-semibold text-slate-700">Members</h3>
+              <button type="button" onclick="addMemberRow('members-{{ loop.index0 }}')" class="rounded-xl bg-sky-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-sky-700">+ Add member</button>
+            </div>
+            <div id="members-{{ loop.index0 }}" class="space-y-2">
+              {% for member in group.members %}
+              <div class="grid gap-2 rounded-2xl border border-slate-200 bg-white p-3 md:grid-cols-[1fr_1fr_auto]">
+                <select name="member_provider" onchange="refreshModelOptions(this)" data-selected="{{ member.provider }}" class="member-provider rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></select>
+                <select name="member_model" data-selected="{{ member.model }}" class="member-model rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></select>
+                <button type="button" onclick="removeMemberRow(this)" class="rounded-xl bg-rose-100 px-3 py-2 text-sm font-semibold text-rose-700 transition hover:bg-rose-200">Remove</button>
+              </div>
+              {% endfor %}
+            </div>
+          </div>
+        </form>
+        <form action="/admin/groups/{{ group.name | urlencode }}/delete" method="post" class="mt-3" onsubmit="return confirm('Delete group {{ group.name | e }}? This removes the public model alias.');">
+          <button type="submit" class="rounded-2xl border border-rose-200 bg-white px-4 py-2 text-sm font-semibold text-rose-700 transition hover:bg-rose-50">Delete group</button>
+        </form>
+      </article>
+      {% else %}
+      <div class="rounded-3xl border border-dashed border-slate-300 bg-slate-50 p-8 text-center text-slate-500">No groups yet. Create one on the right.</div>
+      {% endfor %}
+    </div>
+  </section>
+  <section class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+    <div>
+      <h3 class="text-lg font-semibold text-slate-900">Add Group</h3>
+      <p class="mt-2 text-sm text-slate-500">A group is the public model name clients call. Add one or more provider/model members.</p>
+    </div>
+    <form action="/admin/groups" method="post" class="mt-6 space-y-4">
+      <div>
+        <label class="mb-2 block text-sm font-medium text-slate-700">Group name</label>
+        <input name="name" required placeholder="groq-fast" class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
+      </div>
+      <div>
+        <label class="mb-2 block text-sm font-medium text-slate-700">Description</label>
+        <textarea name="description" rows="3" placeholder="Groq fallback/fast model" class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></textarea>
+      </div>
+      <div>
+        <label class="mb-2 block text-sm font-medium text-slate-700">Strategy</label>
+        <select name="strategy" class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
+          <option value="round_robin">round_robin</option>
+          <option value="fallback">fallback</option>
+        </select>
+      </div>
+      <div>
+        <div class="mb-2 flex items-center justify-between gap-3">
+          <label class="block text-sm font-medium text-slate-700">Members</label>
+          <button type="button" onclick="addMemberRow('new-members')" class="rounded-xl bg-sky-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-sky-700">+ Add</button>
+        </div>
+        <div id="new-members" class="space-y-2"></div>
+      </div>
+      <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Create group</button>
+    </form>
+  </section>
+</div>
+<script>
+  const providers = {{ provider_json }};
+
+  function removeMemberRow(button) {
+    button.closest('div').remove();
+  }
+
+  function providerOptions(selected) {
+    return providers.map((provider) => `<option value="${escapeHtml(provider.name)}" ${provider.name === selected ? 'selected' : ''}>${escapeHtml(provider.name)}</option>`).join('');
+  }
+
+  function modelOptions(providerName, selected) {
+    const provider = providers.find((item) => item.name === providerName) || providers[0] || {models: []};
+    return (provider.models || []).map((model) => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+  }
+
+  function refreshModelOptions(providerSelect) {
+    const row = providerSelect.closest('div');
+    const modelSelect = row.querySelector('.member-model');
+    const selected = modelSelect.dataset.selected || modelSelect.value;
+    modelSelect.innerHTML = modelOptions(providerSelect.value, selected);
+    modelSelect.dataset.selected = '';
+  }
+
+  function addMemberRow(containerId, providerName = '', modelName = '') {
+    const container = document.getElementById(containerId);
+    const selectedProvider = providerName || (providers[0] ? providers[0].name : '');
+    const wrapper = document.createElement('div');
+    wrapper.className = 'grid gap-2 rounded-2xl border border-slate-200 bg-white p-3 md:grid-cols-[1fr_1fr_auto]';
+    wrapper.innerHTML = `
+      <select name="member_provider" onchange="refreshModelOptions(this)" class="member-provider rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">${providerOptions(selectedProvider)}</select>
+      <select name="member_model" class="member-model rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">${modelOptions(selectedProvider, modelName)}</select>
+      <button type="button" onclick="removeMemberRow(this)" class="rounded-xl bg-rose-100 px-3 py-2 text-sm font-semibold text-rose-700 transition hover:bg-rose-200">Remove</button>
+    `;
+    container.appendChild(wrapper);
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>'"]/g, (char) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[char]));
+  }
+
+  document.querySelectorAll('.member-provider').forEach((providerSelect) => {
+    providerSelect.innerHTML = providerOptions(providerSelect.dataset.selected || providerSelect.value);
+    refreshModelOptions(providerSelect);
+  });
+  if (document.getElementById('new-members')) {
+    addMemberRow('new-members');
+  }
+</script>
+{% endblock %}

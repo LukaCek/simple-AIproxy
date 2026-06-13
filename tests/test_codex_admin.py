@@ -143,3 +143,96 @@ def test_admin_logs_page_renders_clickable_modal_payload(tmp_path, monkeypatch):
     assert "log-1" in response.text
     assert "api_key\"" not in response.text
     assert "api_key_hash" in response.text
+
+
+def test_admin_groups_page_renders_editor(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: groq
+  url: https://api.groq.com/openai/v1
+  models:
+  - llama-3.1-8b-instant
+groups:
+  groq-fast:
+    description: Groq fallback/fast model
+    strategy: fallback
+    members:
+    - provider: groq
+      model: llama-3.1-8b-instant
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/groups", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert response.status_code == 200
+    assert "Model Groups" in response.text
+    assert "groq-fast" in response.text
+    assert "llama-3.1-8b-instant" in response.text
+    assert "/admin/groups/groq-fast/save" in response.text
+    assert "addMemberRow" in response.text
+
+
+def test_admin_groups_form_creates_and_saves_group(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: groq
+  url: https://api.groq.com/openai/v1
+  models:
+  - llama-3.1-8b-instant
+  - llama-3.3-70b-versatile
+groups: {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        created = client.post(
+            "/admin/groups",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={
+                "name": "groq-fast",
+                "description": "Groq fallback/fast model",
+                "strategy": "fallback",
+                "member_provider": ["groq"],
+                "member_model": ["llama-3.1-8b-instant"],
+            },
+            follow_redirects=False,
+        )
+        saved = client.post(
+            "/admin/groups/groq-fast/save",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={
+                "name": "groq-fast",
+                "description": "Updated",
+                "strategy": "round_robin",
+                "member_provider": ["groq", "groq"],
+                "member_model": ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"],
+            },
+            follow_redirects=False,
+        )
+
+    assert created.status_code == 303
+    assert saved.status_code == 303
+    assert main.config_data["groups"]["groq-fast"] == {
+        "description": "Updated",
+        "strategy": "round_robin",
+        "members": [
+            {"provider": "groq", "model": "llama-3.1-8b-instant"},
+            {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+        ],
+    }
+    assert "groq-fast" in config_path.read_text(encoding="utf-8")

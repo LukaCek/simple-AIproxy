@@ -76,6 +76,44 @@ def test_admin_providers_page_renders_codex_import_form(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert "Codex OAuth pool" in response.text
     assert "/admin/providers/codex-token" in response.text
+    assert "data-test-provider=\"ollama-provider-form\"" in response.text
+    assert "data-test-provider=\"openai-provider-form\"" in response.text
+    assert "/admin/providers/test" in response.text
+
+
+async def fake_provider_test(**kwargs):
+    return {
+        "success": True,
+        "provider": kwargs["name"],
+        "model": "llama-3.1-8b-instant",
+        "status_code": 200,
+        "response": "OK",
+    }
+
+
+def test_admin_provider_test_endpoint_tests_without_saving(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    monkeypatch.setattr(main, "test_provider_candidate", fake_provider_test)
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/admin/providers/test",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={
+                "name": "groq-test",
+                "base_url": "https://api.groq.com/openai/v1",
+                "api_key": "test-key",
+                "models": "llama-3.1-8b-instant",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "OK"
+    assert main.config_data["providers"] == []
 
 
 def test_admin_codex_token_form_adds_profile(tmp_path, monkeypatch):

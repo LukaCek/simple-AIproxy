@@ -993,6 +993,47 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str) 
         return {"success": False, "provider": provider_name, "status_code": 500, "response": str(exc)}
 
 
+async def test_provider_candidate(name: str, base_url: str, api_key: str, models_text: str, prompt: str = "Reply with OK.") -> Dict[str, Any]:
+    """Test an unsaved OpenAI-compatible provider candidate from the admin form."""
+    clean_name = name.strip() or "candidate-provider"
+    clean_base_url = base_url.strip().rstrip("/")
+    if not clean_base_url:
+        return {"success": False, "provider": clean_name, "status_code": 400, "response": "Base URL is required"}
+    models = parse_models_text(models_text)
+    if not models:
+        models = await discover_models(clean_base_url, api_key.strip())
+    if not models:
+        return {"success": False, "provider": clean_name, "status_code": 400, "response": "No model configured or discovered for this provider"}
+    model_name = models[0]
+    provider = {
+        "name": clean_name,
+        "url": clean_base_url,
+        "api_key": api_key.strip(),
+        "models": models,
+        "api_mode": "openai_chat_completions",
+    }
+    payload = {"model": model_name, "messages": [{"role": "user", "content": prompt or "Reply with OK."}], "stream": False}
+    headers = build_provider_headers(provider)
+    try:
+        target_url = resolve_endpoint_url(provider)
+        async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=30.0) as response:
+            body = await response.aread()
+            text = body.decode("utf-8", errors="replace")
+            preview = text[:4000]
+            if response.status_code == 200:
+                try:
+                    parsed = json.loads(text)
+                    output = json.dumps(parsed, indent=2, ensure_ascii=False)[:4000]
+                except json.JSONDecodeError:
+                    output = preview
+                return {"success": True, "provider": clean_name, "model": model_name, "status_code": response.status_code, "response": output}
+            return {"success": False, "provider": clean_name, "model": model_name, "status_code": response.status_code, "response": preview}
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
+        return {"success": False, "provider": clean_name, "model": model_name, "status_code": 502, "response": str(exc)}
+    except Exception as exc:
+        return {"success": False, "provider": clean_name, "model": model_name, "status_code": 500, "response": str(exc)}
+
+
 def resolve_endpoint_url(endpoint: Dict[str, Any]) -> str:
     raw_url = str(endpoint.get("url", "") or "").strip()
     if not raw_url:
@@ -1701,6 +1742,18 @@ async def admin_provider_oauth_callback(name: str, request: Request, code: Optio
         provider["api_key"] = token_data.get("access_token")
         save_config(config_data)
     return RedirectResponse(url="/admin/providers?message=OAuth+login+completed")
+
+
+@app.post("/admin/providers/test", dependencies=[Depends(verify_admin)])
+async def admin_providers_test(
+    name: str = Form(""),
+    base_url: str = Form(...),
+    api_key: str = Form(""),
+    models: str = Form(""),
+    prompt: str = Form("Reply with OK."),
+) -> JSONResponse:
+    result = await test_provider_candidate(name=name, base_url=base_url, api_key=api_key, models_text=models, prompt=prompt)
+    return JSONResponse(result, status_code=200 if result.get("success") else 400)
 
 
 @app.post("/admin/providers", dependencies=[Depends(verify_admin)])

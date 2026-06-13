@@ -18,7 +18,7 @@
         <h3 class="text-sm font-semibold text-emerald-950">Ollama local/provider models</h3>
         <p class="mt-1 text-sm text-emerald-800">Add an Ollama OpenAI-compatible endpoint. Use a URL reachable from this Docker container, e.g. <code>http://host.docker.internal:11434/v1</code> or a public/VPN host.</p>
       </div>
-      <form action="/admin/providers/ollama" method="post" class="mt-4 grid gap-3 lg:grid-cols-2">
+      <form id="ollama-provider-form" action="/admin/providers/ollama" method="post" class="mt-4 grid gap-3 lg:grid-cols-2">
         <div>
           <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-emerald-900" for="ollama_name">Provider name</label>
           <input id="ollama_name" name="name" required class="w-full rounded-2xl border border-emerald-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-200" placeholder="ollama-local" />
@@ -35,9 +35,13 @@
           <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-emerald-900" for="ollama_description">Description</label>
           <input id="ollama_description" name="description" class="w-full rounded-2xl border border-emerald-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-200" placeholder="Local Ollama server" />
         </div>
-        <div class="lg:col-span-2">
+        <div class="flex flex-wrap gap-2 lg:col-span-2">
           <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-emerald-700 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-800">Add Ollama provider</button>
+          <button type="button" data-test-provider="ollama-provider-form" data-test-result="ollama-test-result" class="inline-flex items-center justify-center rounded-2xl border border-emerald-300 bg-white px-4 py-3 text-sm font-semibold text-emerald-800 transition hover:bg-emerald-100">Test provider</button>
         </div>
+        <div id="ollama-test-result" class="hidden lg:col-span-2 rounded-2xl border p-4 text-sm"></div>
+        <input type="hidden" name="api_key" value="" />
+        <input type="hidden" name="prompt" value="Reply with OK." />
       </form>
     </div>
     <div class="mt-4 rounded-2xl border border-sky-100 bg-sky-50 p-4">
@@ -126,7 +130,7 @@
       <h3 class="text-lg font-semibold text-slate-900">Add New Provider</h3>
       <p class="mt-2 text-sm text-slate-500">Define a provider with one or more model names.</p>
     </div>
-    <form action="/admin/providers" method="post" class="mt-6 space-y-4">
+    <form id="openai-provider-form" action="/admin/providers" method="post" class="mt-6 space-y-4">
       <div>
         <label class="mb-2 block text-sm font-medium text-slate-700" for="name">Name</label>
         <input id="name" name="name" required class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Unique provider name" />
@@ -148,11 +152,63 @@
         <label class="mb-2 block text-sm font-medium text-slate-700" for="description">Comment / Description</label>
         <textarea id="description" name="description" rows="4" class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Optional note about this provider"></textarea>
       </div>
-      <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Add Provider</button>
+      <div class="flex flex-wrap gap-2">
+        <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Add Provider</button>
+        <button type="button" data-test-provider="openai-provider-form" data-test-result="openai-test-result" class="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100">Test provider</button>
+      </div>
+      <input type="hidden" name="prompt" value="Reply with OK." />
+      <div id="openai-test-result" class="hidden rounded-2xl border p-4 text-sm"></div>
     </form>
   </section>
 </div>
 <script>
+  function renderProviderTestResult(target, data, ok) {
+    const model = data.model ? ` / model: ${data.model}` : '';
+    const status = data.status_code ? `HTTP ${data.status_code}` : 'No status';
+    const response = data.response ? String(data.response) : '';
+    target.className = `rounded-2xl border p-4 text-sm ${ok ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-rose-200 bg-rose-50 text-rose-900'}`;
+    target.innerHTML = `
+      <div class="font-semibold">${ok ? 'Provider test succeeded' : 'Provider test failed'} — ${status}${model}</div>
+      <pre class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl bg-white/70 p-3 text-xs"></pre>
+    `;
+    target.querySelector('pre').textContent = response;
+  }
+
+  async function testProviderForm(formId, resultId, button) {
+    const form = document.getElementById(formId);
+    const target = document.getElementById(resultId);
+    if (!form || !target) return;
+    target.className = 'rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700';
+    target.textContent = 'Testing provider...';
+    button.disabled = true;
+    const previousText = button.textContent;
+    button.textContent = 'Testing...';
+    try {
+      const response = await fetch('/admin/providers/test', {
+        method: 'POST',
+        credentials: 'same-origin',
+        body: new FormData(form),
+        headers: {'Accept': 'application/json'},
+      });
+      let data;
+      try {
+        data = await response.json();
+      } catch (error) {
+        data = {status_code: response.status, response: await response.text()};
+      }
+      renderProviderTestResult(target, data, response.ok && data.success);
+    } catch (error) {
+      renderProviderTestResult(target, {response: String(error)}, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
+    }
+  }
+
+  document.querySelectorAll('[data-test-provider]').forEach((button) => {
+    button.addEventListener('click', () => testProviderForm(button.dataset.testProvider, button.dataset.testResult, button));
+  });
+
   async function deleteProvider(name) {
     if (!confirm(`Delete provider '${name}'? This cannot be undone.`)) {
       return;

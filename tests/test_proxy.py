@@ -175,3 +175,24 @@ def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch
 
     assert fake.requests[0]["url"] == "https://chatgpt.com/backend-api/codex/responses"
     assert fake.requests[0]["json"]["input"] == [{"role": "user", "content": "hi"}]
+    assert fake.requests[0]["json"]["store"] is False
+
+
+def test_responses_adapter_accepts_top_level_and_system_instructions():
+    converted = main.chat_to_responses_payload(
+        {
+            "model": "gpt-5.5",
+            "instructions": "Top level instruction.",
+            "messages": [
+                {"role": "system", "content": "System instruction."},
+                {"role": "user", "content": "hi"},
+            ],
+            "store": False,
+            "max_tokens": 10,
+        },
+        "gpt-5.5",
+    )
+    assert converted["instructions"] == "Top level instruction.\nSystem instruction."
+    assert converted["input"] == [{"role": "user", "content": "hi"}]
+    assert converted["store"] is False
+    assert converted["max_output_tokens"] == 10

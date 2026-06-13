@@ -1145,6 +1145,8 @@ def chat_to_responses_payload(payload: Dict[str, Any], model: str) -> Dict[str, 
     messages = payload.get("messages", [])
     input_messages = []
     instructions: Optional[str] = None
+    if payload.get("instructions"):
+        instructions = str(payload.get("instructions"))
     for message in messages if isinstance(messages, list) else []:
         if not isinstance(message, dict):
             continue
@@ -1157,6 +1159,9 @@ def chat_to_responses_payload(payload: Dict[str, Any], model: str) -> Dict[str, 
     converted: Dict[str, Any] = {"model": model, "input": input_messages or str(payload.get("prompt", ""))}
     if instructions:
         converted["instructions"] = instructions
+    # Codex/ChatGPT Responses requires explicit non-storage. Default to false so
+    # OpenAI-compatible callers do not need to know about the Responses API quirk.
+    converted["store"] = bool(payload.get("store")) if payload.get("store") is not None else False
     if payload.get("temperature") is not None:
         converted["temperature"] = payload.get("temperature")
     if payload.get("max_tokens") is not None:

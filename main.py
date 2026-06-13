@@ -1098,9 +1098,15 @@ def resolve_responses_url(endpoint: Dict[str, Any]) -> str:
 def extract_response_text_from_sse(body: bytes | str) -> str:
     text_body = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
     texts: List[str] = []
+    current_event = ""
     for line in text_body.splitlines():
         line = line.strip()
+        if line.startswith("event:"):
+            current_event = line[6:].strip()
+            continue
         if not line.startswith("data:"):
+            if not line:
+                current_event = ""
             continue
         data_text = line[5:].strip()
         if not data_text or data_text == "[DONE]":
@@ -1110,20 +1116,26 @@ def extract_response_text_from_sse(body: bytes | str) -> str:
         except Exception:
             continue
         if isinstance(data, dict):
-            value = data.get("delta")
-            if not isinstance(value, str):
-                value = data.get("text")
-            if not isinstance(value, str):
-                value = data.get("output_text")
-            if isinstance(value, str):
-                texts.append(value)
-                continue
+            event_type = str(data.get("type") or current_event or "")
+            # Responses streams often send both incremental delta events and final
+            # completed/snapshot events. Only append top-level text fields for
+            # delta events; otherwise the final event duplicates the whole answer.
+            is_delta_event = "delta" in event_type
+            if is_delta_event:
+                value = data.get("delta")
+                if not isinstance(value, str):
+                    value = data.get("text")
+                if not isinstance(value, str):
+                    value = data.get("output_text")
+                if isinstance(value, str):
+                    texts.append(value)
+                    continue
             if isinstance(data.get("choices"), list):
                 for choice in data["choices"]:
                     delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
                     if isinstance(delta, dict) and isinstance(delta.get("content"), str):
                         texts.append(delta["content"])
-            if isinstance(data.get("content"), list):
+            elif not event_type and isinstance(data.get("content"), list):
                 for content in data["content"]:
                     if isinstance(content, dict) and isinstance(content.get("text"), str):
                         texts.append(content["text"])

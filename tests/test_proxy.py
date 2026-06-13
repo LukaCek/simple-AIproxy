@@ -181,7 +181,7 @@ def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch
 
 
 def test_extract_response_text_from_responses_sse_prefers_delta_once():
-    body = b'''event: response.output_text.delta\ndata: {"delta":"hel","text":"hel"}\n\nevent: response.output_text.delta\ndata: {"delta":"lo","text":"lo"}\n\ndata: [DONE]\n\n'''
+    body = b'''event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hel","text":"hel"}\n\nevent: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"lo","text":"lo"}\n\nevent: response.completed\ndata: {"type":"response.completed","output_text":"hello"}\n\ndata: [DONE]\n\n'''
     assert main.extract_response_text_from_sse(body) == "hello"
 
 

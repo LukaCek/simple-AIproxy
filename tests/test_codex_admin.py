@@ -236,3 +236,77 @@ groups: {}
         ],
     }
     assert "groq-fast" in config_path.read_text(encoding="utf-8")
+
+
+def test_admin_ollama_form_adds_provider(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/admin/providers/ollama",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={
+                "name": "ollama-local",
+                "base_url": "http://host.docker.internal:11434/v1",
+                "models": "llama3.2\nqwen2.5-coder:7b",
+                "description": "Local Ollama",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    provider = main.find_provider("ollama-local")
+    assert provider is not None
+    assert provider["url"] == "http://host.docker.internal:11434/v1"
+    assert provider["api_key"] == ""
+    assert provider["models"] == ["llama3.2", "qwen2.5-coder:7b"]
+    assert provider["api_mode"] == "openai_chat_completions"
+
+
+def test_admin_groups_form_saves_nested_group_member(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: groq
+  url: https://api.groq.com/openai/v1
+  models:
+  - llama-3.1-8b-instant
+groups:
+  groq-fast:
+    description: Groq fallback/fast model
+    strategy: fallback
+    members:
+    - provider: groq
+      model: llama-3.1-8b-instant
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        created = client.post(
+            "/admin/groups",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={
+                "name": "smart-gpt",
+                "description": "Nested fallback",
+                "strategy": "fallback",
+                "member_type": ["group"],
+                "member_provider": ["groq"],
+                "member_model": ["llama-3.1-8b-instant"],
+                "member_group": ["groq-fast"],
+            },
+            follow_redirects=False,
+        )
+
+    assert created.status_code == 303
+    assert main.config_data["groups"]["smart-gpt"]["members"] == [{"group": "groq-fast"}]
+    assert "group: groq-fast" in config_path.read_text(encoding="utf-8")

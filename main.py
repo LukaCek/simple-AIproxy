@@ -145,6 +145,7 @@ async def discover_models(base_url: str, api_key: str) -> List[str]:
         root = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
         candidates.append(root.rstrip("/") + "/v1/models")
         candidates.append(root.rstrip("/") + "/models")
+        candidates.append(root.rstrip("/") + "/api/tags")
     except Exception:
         pass
 
@@ -595,20 +596,56 @@ def get_groups() -> List[Dict[str, Any]]:
     return groups_list
 
 
-def normalize_group_members(member_providers: List[str], member_models: List[str]) -> List[Dict[str, str]]:
+def normalize_group_members(
+    member_providers: List[str],
+    member_models: List[str],
+    member_types: Optional[List[str]] = None,
+    member_groups: Optional[List[str]] = None,
+) -> List[Dict[str, str]]:
     members: List[Dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for provider_name, model_name in zip(member_providers, member_models):
-        clean_provider = provider_name.strip()
-        clean_model = model_name.strip()
-        if not clean_provider or not clean_model:
+    seen: set[tuple[str, str, str]] = set()
+    max_len = max(len(member_providers), len(member_models), len(member_types or []), len(member_groups or []))
+    for index in range(max_len):
+        member_type = (member_types[index] if member_types and index < len(member_types) else "provider").strip() or "provider"
+        if member_type == "group":
+            group_name = (member_groups[index] if member_groups and index < len(member_groups) else "").strip()
+            if not group_name:
+                continue
+            key = ("group", group_name, "")
+            if key in seen:
+                continue
+            seen.add(key)
+            members.append({"group": group_name})
             continue
-        key = (clean_provider, clean_model)
+        provider_name = (member_providers[index] if index < len(member_providers) else "").strip()
+        model_name = (member_models[index] if index < len(member_models) else "").strip()
+        if not provider_name or not model_name:
+            continue
+        key = ("provider", provider_name, model_name)
         if key in seen:
             continue
         seen.add(key)
-        members.append({"provider": clean_provider, "model": clean_model})
+        members.append({"provider": provider_name, "model": model_name})
     return members
+
+
+def group_has_cycle(candidate_name: str, members: List[Dict[str, str]], groups: Dict[str, Any], seen: Optional[set[str]] = None) -> bool:
+    seen = seen or set()
+    for member in members:
+        nested_name = member.get("group")
+        if not nested_name:
+            continue
+        if nested_name == candidate_name:
+            return True
+        if nested_name in seen:
+            continue
+        seen.add(nested_name)
+        nested_group = groups.get(nested_name)
+        if isinstance(nested_group, dict):
+            nested_members = nested_group.get("members", [])
+            if isinstance(nested_members, list) and group_has_cycle(candidate_name, nested_members, groups, seen):
+                return True
+    return False
 
 
 def save_group(group_name: str, description: str, strategy: str, members: List[Dict[str, str]], original_name: Optional[str] = None) -> None:
@@ -628,14 +665,21 @@ def save_group(group_name: str, description: str, strategy: str, members: List[D
             data["groups"] = groups
         provider_map = {provider.get("name"): provider for provider in data.get("providers", []) if isinstance(provider, dict)}
         for member in members:
-            provider_name = member["provider"]
-            model_name = member["model"]
+            nested_group = member.get("group")
+            if nested_group:
+                if nested_group not in groups or not isinstance(groups.get(nested_group), dict):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Group '{nested_group}' does not exist")
+                continue
+            provider_name = member.get("provider", "")
+            model_name = member.get("model", "")
             provider = provider_map.get(provider_name)
             if provider is None:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider '{provider_name}' does not exist")
             models = [str(model) for model in provider.get("models", []) if model is not None]
             if model_name not in models:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_name}' is not configured on provider '{provider_name}'")
+        if group_has_cycle(clean_name, members, groups):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Group '{clean_name}' cannot contain itself, directly or through another group")
         if original_name and original_name != clean_name:
             if clean_name in groups:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Group '{clean_name}' already exists")
@@ -706,6 +750,10 @@ async def test_group_prompt(group_name: str, prompt: str) -> Dict[str, Any]:
         "status_code": 502,
         "response": last_error or "All provider endpoints failed",
     }
+
+
+def parse_models_text(models_text: str) -> List[str]:
+    return [part.strip() for part in models_text.replace(",", "\n").splitlines() if part.strip()]
 
 
 def add_provider(name: str, base_url: str, api_key: str, description: str, models: List[str], extra: Optional[Dict[str, Any]] = None) -> None:
@@ -821,7 +869,29 @@ def delete_provider(name: str) -> None:
         save_config(data)
 
 
-def resolve_group(group_name: str) -> List[Dict[str, Any]]:
+def provider_to_endpoint(provider: Dict[str, Any], model_name: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "name": provider.get("name", ""),
+        "url": provider.get("url", ""),
+        "api_key": provider.get("api_key", ""),
+        "description": provider.get("description", ""),
+        "oauth": provider.get("oauth", False),
+        "api_mode": provider.get("api_mode", "openai_chat_completions"),
+        "access_token": provider.get("access_token", ""),
+        "refresh_token": provider.get("refresh_token", ""),
+        "token_url": provider.get("token_url", ""),
+        "client_id": provider.get("client_id", ""),
+        "client_secret": provider.get("client_secret", ""),
+        "expires_at": provider.get("expires_at", ""),
+        "model": model_name or (provider.get("models", [None])[0] if provider.get("models") else None),
+    }
+
+
+def resolve_group(group_name: str, seen: Optional[set[str]] = None) -> List[Dict[str, Any]]:
+    seen = seen or set()
+    if group_name in seen:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Group nesting cycle detected at '{group_name}'")
+    seen.add(group_name)
     with config_lock:
         groups = config_data.get("groups", {})
         group = groups.get(group_name)
@@ -837,6 +907,10 @@ def resolve_group(group_name: str) -> List[Dict[str, Any]]:
         for member in members:
             if not isinstance(member, dict):
                 continue
+            nested_group = member.get("group")
+            if nested_group:
+                endpoints.extend(resolve_group(str(nested_group), set(seen)))
+                continue
             provider_name = member.get("provider")
             model_name = member.get("model")
             if not provider_name:
@@ -844,25 +918,10 @@ def resolve_group(group_name: str) -> List[Dict[str, Any]]:
             provider = provider_map.get(provider_name)
             if not provider:
                 continue
-            endpoint = {
-                "name": provider_name,
-                "url": provider.get("url", ""),
-                "api_key": provider.get("api_key", ""),
-                "description": provider.get("description", ""),
-                "oauth": provider.get("oauth", False),
-                "api_mode": provider.get("api_mode", "openai_chat_completions"),
-                "access_token": provider.get("access_token", ""),
-                "refresh_token": provider.get("refresh_token", ""),
-                "token_url": provider.get("token_url", ""),
-                "client_id": provider.get("client_id", ""),
-                "client_secret": provider.get("client_secret", ""),
-                "expires_at": provider.get("expires_at", ""),
-                "model": model_name or (provider.get("models", [None])[0] if provider.get("models") else None),
-            }
-            endpoints.append(endpoint)
+            endpoints.append(provider_to_endpoint(provider, str(model_name) if model_name else None))
     if not endpoints:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"No endpoints configured for group '{group_name}'")
-    return endpoints
+    return route_endpoints(group_name, endpoints)
 
 
 def resolve_requested_model(model_name: str) -> List[Dict[str, Any]]:
@@ -904,7 +963,7 @@ def resolve_requested_model(model_name: str) -> List[Dict[str, Any]]:
             )
     if not endpoints:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' not configured")
-    return endpoints
+    return route_endpoints(model_name, endpoints)
 
 
 async def test_provider_model(provider_name: str, model_name: str, prompt: str) -> Dict[str, Any]:
@@ -1327,7 +1386,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     requested_model = str(payload.get("model") or "")
     if not requested_model:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing model in request payload")
-    endpoints = route_endpoints(requested_model, resolve_requested_model(requested_model))
+    endpoints = resolve_requested_model(requested_model)
     api_key_value = api_key_record["key"]
     api_key_name = api_key_record["name"] if "name" in api_key_record.keys() else None
     prompt_text = extract_prompt(payload)
@@ -1487,8 +1546,10 @@ async def admin_groups_add(
     strategy: str = Form("round_robin"),
     member_provider: List[str] = Form(default=[]),
     member_model: List[str] = Form(default=[]),
+    member_type: List[str] = Form(default=[]),
+    member_group: List[str] = Form(default=[]),
 ) -> RedirectResponse:
-    members = normalize_group_members(member_provider, member_model)
+    members = normalize_group_members(member_provider, member_model, member_type, member_group)
     save_group(name, description, strategy, members)
     return RedirectResponse(url=f"/admin/groups?message=Created+group:+{quote(name.strip())}", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1501,8 +1562,10 @@ async def admin_groups_save(
     strategy: str = Form("round_robin"),
     member_provider: List[str] = Form(default=[]),
     member_model: List[str] = Form(default=[]),
+    member_type: List[str] = Form(default=[]),
+    member_group: List[str] = Form(default=[]),
 ) -> RedirectResponse:
-    members = normalize_group_members(member_provider, member_model)
+    members = normalize_group_members(member_provider, member_model, member_type, member_group)
     save_group(name, description, strategy, members, original_name=group_name)
     return RedirectResponse(url=f"/admin/groups?message=Saved+group:+{quote(name.strip())}", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1646,12 +1709,36 @@ async def admin_providers_add(
     base_url: str = Form(...),
     api_key: str = Form(""),
     description: str = Form(""),
+    models: str = Form(""),
 ) -> RedirectResponse:
-    discovered = await discover_models(base_url.strip(), api_key.strip())
+    discovered = parse_models_text(models)
+    if not discovered:
+        discovered = await discover_models(base_url.strip(), api_key.strip())
     if not discovered:
         discovered = [name.strip()]
     add_provider(name=name.strip(), base_url=base_url.strip(), api_key=api_key.strip(), description=description.strip(), models=discovered)
     return RedirectResponse(url="/admin/providers", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/providers/ollama", dependencies=[Depends(verify_admin)])
+async def admin_providers_add_ollama(
+    name: str = Form(...),
+    base_url: str = Form("http://localhost:11434/v1"),
+    models: str = Form(...),
+    description: str = Form(""),
+) -> RedirectResponse:
+    model_list = parse_models_text(models)
+    if not model_list:
+        model_list = await discover_models(base_url.strip(), "")
+    add_provider(
+        name=name.strip(),
+        base_url=base_url.strip().rstrip("/") or "http://localhost:11434/v1",
+        api_key="",
+        description=description.strip() or "Ollama OpenAI-compatible local provider",
+        models=model_list,
+        extra={"api_mode": "openai_chat_completions"},
+    )
+    return RedirectResponse(url=f"/admin/providers?message=Added+Ollama+provider:+{quote(name.strip())}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.delete("/admin/providers/{name}", dependencies=[Depends(verify_admin)])

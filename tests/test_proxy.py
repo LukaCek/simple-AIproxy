@@ -208,3 +208,61 @@ def test_responses_adapter_accepts_top_level_and_system_instructions():
     assert converted["input"] == [{"role": "user", "content": "hi"}]
     assert converted["store"] is False
     assert "max_output_tokens" not in converted
+
+
+def test_nested_group_fallback_can_reference_round_robin_group():
+    main.route_counters.clear()
+    main.config_data = {
+        "providers": [
+            {"name": "codex-a", "url": "http://codex-a.local/v1", "models": ["gpt-5.5"]},
+            {"name": "codex-b", "url": "http://codex-b.local/v1", "models": ["gpt-5.5"]},
+            {"name": "groq", "url": "http://groq.local/v1", "models": ["llama-3.1-8b-instant"]},
+        ],
+        "groups": {
+            "codex-pool": {
+                "strategy": "round_robin",
+                "members": [
+                    {"provider": "codex-a", "model": "gpt-5.5"},
+                    {"provider": "codex-b", "model": "gpt-5.5"},
+                ],
+            },
+            "groq-fast": {
+                "strategy": "fallback",
+                "members": [{"provider": "groq", "model": "llama-3.1-8b-instant"}],
+            },
+            "gpt-5.5": {
+                "strategy": "fallback",
+                "members": [{"group": "codex-pool"}, {"group": "groq-fast"}],
+            },
+        },
+    }
+
+    first = main.resolve_requested_model("gpt-5.5")
+    second = main.resolve_requested_model("gpt-5.5")
+
+    assert [(endpoint["name"], endpoint["model"]) for endpoint in first] == [
+        ("codex-a", "gpt-5.5"),
+        ("codex-b", "gpt-5.5"),
+        ("groq", "llama-3.1-8b-instant"),
+    ]
+    assert [(endpoint["name"], endpoint["model"]) for endpoint in second] == [
+        ("codex-b", "gpt-5.5"),
+        ("codex-a", "gpt-5.5"),
+        ("groq", "llama-3.1-8b-instant"),
+    ]
+
+
+def test_group_cycle_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "CONFIG_PATH", tmp_path / "config.yml")
+    main.config_data = {
+        "providers": [{"name": "p", "url": "http://p.local/v1", "models": ["m"]}],
+        "groups": {"a": {"members": [{"group": "b"}]}, "b": {"members": [{"provider": "p", "model": "m"}]}},
+    }
+
+    try:
+        main.save_group("b", "", "fallback", [{"group": "a"}], original_name="b")
+    except main.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "cannot contain itself" in exc.detail
+    else:
+        raise AssertionError("Expected cycle rejection")

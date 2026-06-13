@@ -1,12 +1,13 @@
 {% extends "layout.html" %}
 {% block content %}
 {% set provider_json = providers | tojson %}
-<div class="grid gap-6 xl:grid-cols-[1fr_380px]">
+{% set group_json = groups | tojson %}
+<div class="grid gap-6 xl:grid-cols-[1fr_400px]">
   <section class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
     <div class="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
       <div>
         <h2 class="text-xl font-semibold text-slate-900">Model Groups</h2>
-        <p class="mt-1 text-sm text-slate-500">Create aliases/pools like <code class="rounded bg-slate-100 px-1.5 py-0.5">gpt-5.5</code> and <code class="rounded bg-slate-100 px-1.5 py-0.5">groq-fast</code> without editing YAML manually.</p>
+        <p class="mt-1 text-sm text-slate-500">Create routing chains: a group can contain provider models or another group. Use a fallback group to try a round-robin Codex pool first, then Groq/Ollama.</p>
       </div>
       <a href="/admin/config" class="inline-flex items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-100">Advanced YAML</a>
     </div>
@@ -15,6 +16,9 @@
       {{ message }}
     </div>
     {% endif %}
+    <div class="mt-4 rounded-2xl border border-amber-100 bg-amber-50 p-4 text-sm text-amber-950">
+      <strong>Primer:</strong> naredi <code>codex-pool</code> z <code>round_robin</code> in dvema Codex memberjema, potem naredi <code>gpt-5.5</code> z <code>fallback</code>, kjer je prvi member group <code>codex-pool</code>, drugi pa <code>groq-fast</code> ali Ollama group.
+    </div>
     <div class="mt-6 space-y-5">
       {% for group in groups %}
       <article class="rounded-3xl border border-slate-200 bg-slate-50 p-5 shadow-sm">
@@ -44,13 +48,15 @@
           <div>
             <div class="mb-2 flex items-center justify-between gap-3">
               <h3 class="text-sm font-semibold text-slate-700">Members</h3>
-              <button type="button" onclick="addMemberRow('members-{{ loop.index0 }}')" class="rounded-xl bg-sky-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-sky-700">+ Add member</button>
+              <button type="button" onclick="addMemberRow('members-{{ loop.index0 }}', 'provider', '', '', '', '{{ group.name | e }}')" class="rounded-xl bg-sky-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-sky-700">+ Add member</button>
             </div>
             <div id="members-{{ loop.index0 }}" class="space-y-2">
               {% for member in group.members %}
-              <div class="grid gap-2 rounded-2xl border border-slate-200 bg-white p-3 md:grid-cols-[1fr_1fr_auto]">
-                <select name="member_provider" onchange="refreshModelOptions(this)" data-selected="{{ member.provider }}" class="member-provider rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></select>
-                <select name="member_model" data-selected="{{ member.model }}" class="member-model rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></select>
+              <div class="member-row grid gap-2 rounded-2xl border border-slate-200 bg-white p-3 md:grid-cols-[150px_1fr_1fr_auto]" data-current-group="{{ group.name }}">
+                <select name="member_type" onchange="refreshMemberRow(this.closest('.member-row'))" data-selected="{% if member.group %}group{% else %}provider{% endif %}" class="member-type rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></select>
+                <select name="member_provider" onchange="refreshModelOptions(this)" data-selected="{{ member.provider or '' }}" class="member-provider rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></select>
+                <select name="member_model" data-selected="{{ member.model or '' }}" class="member-model rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></select>
+                <select name="member_group" data-selected="{{ member.group or '' }}" class="member-group hidden rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></select>
                 <button type="button" onclick="removeMemberRow(this)" class="rounded-xl bg-rose-100 px-3 py-2 text-sm font-semibold text-rose-700 transition hover:bg-rose-200">Remove</button>
               </div>
               {% endfor %}
@@ -69,16 +75,16 @@
   <section class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
     <div>
       <h3 class="text-lg font-semibold text-slate-900">Add Group</h3>
-      <p class="mt-2 text-sm text-slate-500">A group is the public model name clients call. Add one or more provider/model members.</p>
+      <p class="mt-2 text-sm text-slate-500">A group is the public model name clients call. Members can be provider models or existing groups.</p>
     </div>
     <form action="/admin/groups" method="post" class="mt-6 space-y-4">
       <div>
         <label class="mb-2 block text-sm font-medium text-slate-700">Group name</label>
-        <input name="name" required placeholder="groq-fast" class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
+        <input name="name" required placeholder="gpt-5.5" class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
       </div>
       <div>
         <label class="mb-2 block text-sm font-medium text-slate-700">Description</label>
-        <textarea name="description" rows="3" placeholder="Groq fallback/fast model" class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></textarea>
+        <textarea name="description" rows="3" placeholder="Codex pool with fallback models" class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"></textarea>
       </div>
       <div>
         <label class="mb-2 block text-sm font-medium text-slate-700">Strategy</label>
@@ -100,9 +106,14 @@
 </div>
 <script>
   const providers = {{ provider_json }};
+  const groups = {{ group_json }};
 
   function removeMemberRow(button) {
-    button.closest('div').remove();
+    button.closest('.member-row').remove();
+  }
+
+  function typeOptions(selected) {
+    return ['provider', 'group'].map((type) => `<option value="${type}" ${type === selected ? 'selected' : ''}>${type === 'provider' ? 'Provider model' : 'Group alias'}</option>`).join('');
   }
 
   function providerOptions(selected) {
@@ -114,34 +125,70 @@
     return (provider.models || []).map((model) => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
   }
 
+  function groupOptions(selected, currentGroup = '') {
+    return groups
+      .filter((group) => group.name !== currentGroup)
+      .map((group) => `<option value="${escapeHtml(group.name)}" ${group.name === selected ? 'selected' : ''}>${escapeHtml(group.name)}</option>`)
+      .join('');
+  }
+
   function refreshModelOptions(providerSelect) {
-    const row = providerSelect.closest('div');
+    const row = providerSelect.closest('.member-row');
     const modelSelect = row.querySelector('.member-model');
     const selected = modelSelect.dataset.selected || modelSelect.value;
     modelSelect.innerHTML = modelOptions(providerSelect.value, selected);
     modelSelect.dataset.selected = '';
   }
 
-  function addMemberRow(containerId, providerName = '', modelName = '') {
+  function refreshMemberRow(row) {
+    const typeSelect = row.querySelector('.member-type');
+    const providerSelect = row.querySelector('.member-provider');
+    const modelSelect = row.querySelector('.member-model');
+    const groupSelect = row.querySelector('.member-group');
+    const type = typeSelect.value;
+    if (type === 'group') {
+      providerSelect.classList.add('hidden');
+      modelSelect.classList.add('hidden');
+      groupSelect.classList.remove('hidden');
+      groupSelect.innerHTML = groupOptions(groupSelect.dataset.selected || groupSelect.value, row.dataset.currentGroup || '');
+      groupSelect.dataset.selected = '';
+    } else {
+      providerSelect.classList.remove('hidden');
+      modelSelect.classList.remove('hidden');
+      groupSelect.classList.add('hidden');
+      refreshModelOptions(providerSelect);
+    }
+  }
+
+  function addMemberRow(containerId, type = 'provider', providerName = '', modelName = '', groupName = '', currentGroup = '') {
     const container = document.getElementById(containerId);
     const selectedProvider = providerName || (providers[0] ? providers[0].name : '');
     const wrapper = document.createElement('div');
-    wrapper.className = 'grid gap-2 rounded-2xl border border-slate-200 bg-white p-3 md:grid-cols-[1fr_1fr_auto]';
+    wrapper.className = 'member-row grid gap-2 rounded-2xl border border-slate-200 bg-white p-3 md:grid-cols-[150px_1fr_1fr_auto]';
+    wrapper.dataset.currentGroup = currentGroup;
     wrapper.innerHTML = `
+      <select name="member_type" onchange="refreshMemberRow(this.closest('.member-row'))" class="member-type rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">${typeOptions(type)}</select>
       <select name="member_provider" onchange="refreshModelOptions(this)" class="member-provider rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">${providerOptions(selectedProvider)}</select>
       <select name="member_model" class="member-model rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">${modelOptions(selectedProvider, modelName)}</select>
+      <select name="member_group" class="member-group hidden rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">${groupOptions(groupName, currentGroup)}</select>
       <button type="button" onclick="removeMemberRow(this)" class="rounded-xl bg-rose-100 px-3 py-2 text-sm font-semibold text-rose-700 transition hover:bg-rose-200">Remove</button>
     `;
     container.appendChild(wrapper);
+    refreshMemberRow(wrapper);
   }
 
   function escapeHtml(value) {
     return String(value).replace(/[&<>'"]/g, (char) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[char]));
   }
 
-  document.querySelectorAll('.member-provider').forEach((providerSelect) => {
+  document.querySelectorAll('.member-row').forEach((row) => {
+    const typeSelect = row.querySelector('.member-type');
+    const providerSelect = row.querySelector('.member-provider');
+    const groupSelect = row.querySelector('.member-group');
+    typeSelect.innerHTML = typeOptions(typeSelect.dataset.selected || 'provider');
     providerSelect.innerHTML = providerOptions(providerSelect.dataset.selected || providerSelect.value);
-    refreshModelOptions(providerSelect);
+    groupSelect.innerHTML = groupOptions(groupSelect.dataset.selected || groupSelect.value, row.dataset.currentGroup || '');
+    refreshMemberRow(row);
   });
   if (document.getElementById('new-members')) {
     addMemberRow('new-members');

@@ -1,57 +1,187 @@
 {% extends "layout.html" %}
 {% block content %}
-<section class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-  <div class="flex items-center justify-between">
+<section class="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+  <div class="flex flex-col gap-3 border-b border-slate-200 px-6 py-5 md:flex-row md:items-center md:justify-between">
     <div>
-      <h2 class="text-xl font-semibold text-slate-900">Request Logs</h2>
-      <p class="mt-1 text-sm text-slate-500">Recent proxy calls recorded from the SQLite database.</p>
+      <h2 class="text-xl font-semibold text-slate-950">Request Logs</h2>
+      <p class="mt-1 text-sm text-slate-500">Click a row to inspect the exact prompt, output, error and request metadata.</p>
+    </div>
+    <div class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-500">
+      {{ logs|length }} recent calls
     </div>
   </div>
-  <div class="mt-6 overflow-x-auto">
-    <table class="min-w-full divide-y divide-slate-200 text-left text-sm">
-      <thead class="bg-slate-50">
+
+  <div class="overflow-x-auto">
+    <table class="min-w-full border-separate border-spacing-0 text-left text-xs text-slate-600">
+      <thead class="sticky top-0 z-10 bg-white text-[11px] uppercase tracking-wide text-slate-500 shadow-[inset_0_-1px_0_#e2e8f0]">
         <tr>
-          <th class="px-4 py-3 font-semibold text-slate-700">Time</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">API Key</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">Requested model</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">Provider</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">Model</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">Status</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">First token</th>
-          <th class="px-4 py-3 font-semibold text-slate-700">Total</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Time</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Type</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Status</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Request ID</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Provider</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Model</th>
+          <th class="whitespace-nowrap px-4 py-3 text-right font-semibold">Duration</th>
+          <th class="whitespace-nowrap px-4 py-3 text-right font-semibold">TTFT</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Key Hash</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Key Name</th>
+          <th class="whitespace-nowrap px-4 py-3 font-semibold">Prompt</th>
         </tr>
       </thead>
-      <tbody class="divide-y divide-slate-200">
+      <tbody class="divide-y divide-slate-100 bg-white">
         {% for log in logs %}
-        <tr>
-          <td class="px-4 py-4 text-slate-700">{{ log.created_at }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.api_key_display }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.requested_model or log.group_name }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.provider_name }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.provider_model }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.status_code }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.first_response }}</td>
-          <td class="px-4 py-4 text-slate-700">{{ log.duration }}</td>
-        </tr>
-        <tr class="bg-slate-50/70">
-          <td colspan="8" class="px-4 py-3 text-xs text-slate-700">
-            <details>
-              <summary class="cursor-pointer font-semibold">Prompt / output / error</summary>
-              <div class="mt-3 grid gap-3 lg:grid-cols-3">
-                <div><div class="font-semibold text-slate-900">Prompt</div><pre class="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-2xl bg-white p-3">{{ log.prompt or '-' }}</pre></div>
-                <div><div class="font-semibold text-slate-900">Output</div><pre class="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-2xl bg-white p-3">{{ log.output or '-' }}</pre></div>
-                <div><div class="font-semibold text-slate-900">Error</div><pre class="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-2xl bg-white p-3">{{ log.error or '-' }}</pre></div>
-              </div>
-            </details>
+        <tr
+          class="group cursor-pointer transition hover:bg-sky-50/70 focus-within:bg-sky-50"
+          role="button"
+          tabindex="0"
+          data-log-id="{{ log.id }}"
+          onclick="openLogModal('{{ log.id }}')"
+          onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openLogModal('{{ log.id }}'); }"
+        >
+          <td class="whitespace-nowrap px-4 py-3 font-medium text-slate-700">{{ (log.created_at or log.started_at or '-')|replace('T', ' ') }}</td>
+          <td class="whitespace-nowrap px-4 py-3">
+            <span class="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-700">
+              ✦ {{ log.type }}
+            </span>
           </td>
+          <td class="whitespace-nowrap px-4 py-3">
+            {% if log.status_code and log.status_code >= 200 and log.status_code < 300 %}
+            <span class="inline-flex rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 ring-1 ring-emerald-200">Success</span>
+            {% else %}
+            <span class="inline-flex rounded-full bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-700 ring-1 ring-rose-200">Failure</span>
+            {% endif %}
+          </td>
+          <td class="whitespace-nowrap px-4 py-3 font-mono text-[11px] text-sky-700">{{ log.request_id }}</td>
+          <td class="whitespace-nowrap px-4 py-3 text-slate-700">{{ log.provider_name or '-' }}</td>
+          <td class="whitespace-nowrap px-4 py-3">
+            <span class="inline-flex max-w-48 items-center gap-1 truncate rounded-full bg-slate-100 px-2 py-1 font-medium text-slate-700" title="{{ log.provider_model or log.requested_model or '-' }}">
+              ⚙ {{ log.provider_model or log.requested_model or '-' }}
+            </span>
+          </td>
+          <td class="whitespace-nowrap px-4 py-3 text-right tabular-nums text-slate-700">{{ log.duration }}</td>
+          <td class="whitespace-nowrap px-4 py-3 text-right tabular-nums text-slate-700">{{ log.first_response }}</td>
+          <td class="whitespace-nowrap px-4 py-3 font-mono text-[11px] text-slate-500">{{ log.api_key_hash }}</td>
+          <td class="whitespace-nowrap px-4 py-3 text-slate-600">{{ log.api_key_name or '-' }}</td>
+          <td class="max-w-sm truncate px-4 py-3 text-slate-500" title="{{ log.prompt or '' }}">{{ log.prompt or '-' }}</td>
         </tr>
+        <script type="application/json" id="log-json-{{ log.id }}">{{ log.modal_payload|tojson }}</script>
         {% else %}
         <tr>
-          <td colspan="8" class="px-4 py-6 text-center text-slate-500">No logs yet.</td>
+          <td colspan="11" class="px-4 py-10 text-center text-slate-500">No logs yet.</td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </section>
+
+<div id="logModal" class="fixed inset-0 z-50 hidden items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm" onclick="if (event.target === this) closeLogModal()">
+  <div class="flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-3xl bg-white shadow-2xl ring-1 ring-slate-200">
+    <div class="flex items-start justify-between gap-4 border-b border-slate-200 px-6 py-4">
+      <div>
+        <div class="flex flex-wrap items-center gap-2">
+          <h3 id="modalTitle" class="text-lg font-semibold text-slate-950">Request details</h3>
+          <span id="modalStatus" class="rounded-full px-2.5 py-1 text-xs font-semibold"></span>
+        </div>
+        <p id="modalSubtitle" class="mt-1 text-sm text-slate-500"></p>
+      </div>
+      <button type="button" class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-50" onclick="closeLogModal()">Close ✕</button>
+    </div>
+
+    <div class="overflow-y-auto p-6">
+      <div id="modalMeta" class="grid gap-3 md:grid-cols-2 xl:grid-cols-4"></div>
+
+      <div class="mt-6 grid gap-4 lg:grid-cols-3">
+        <section class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+          <div class="mb-2 text-xs font-bold uppercase tracking-wide text-slate-500">Exact prompt</div>
+          <pre id="modalPrompt" class="max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs leading-relaxed text-slate-800 ring-1 ring-slate-200"></pre>
+        </section>
+        <section class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+          <div class="mb-2 text-xs font-bold uppercase tracking-wide text-slate-500">Output</div>
+          <pre id="modalOutput" class="max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs leading-relaxed text-slate-800 ring-1 ring-slate-200"></pre>
+        </section>
+        <section class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+          <div class="mb-2 text-xs font-bold uppercase tracking-wide text-slate-500">Error</div>
+          <pre id="modalError" class="max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs leading-relaxed text-rose-700 ring-1 ring-slate-200"></pre>
+        </section>
+      </div>
+
+      <details class="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+        <summary class="cursor-pointer text-sm font-semibold text-slate-700">Raw sanitized log JSON</summary>
+        <pre id="modalRaw" class="mt-3 max-h-80 overflow-auto whitespace-pre-wrap rounded-xl bg-slate-950 p-4 text-xs text-slate-100"></pre>
+      </details>
+    </div>
+  </div>
+</div>
+
+<script>
+  function readLogPayload(id) {
+    const node = document.getElementById(`log-json-${id}`);
+    if (!node) return null;
+    try { return JSON.parse(node.textContent); } catch (error) { console.error('Invalid log payload', error); return null; }
+  }
+
+  function valueOrDash(value) {
+    return value === null || value === undefined || value === '' ? '-' : String(value);
+  }
+
+  function shortTime(value) {
+    return valueOrDash(value).replace('T', ' ');
+  }
+
+  function metaCard(label, value) {
+    return `<div class="rounded-2xl border border-slate-200 bg-slate-50 p-3">
+      <div class="text-[11px] font-bold uppercase tracking-wide text-slate-500">${label}</div>
+      <div class="mt-1 break-words font-mono text-xs text-slate-800">${escapeHtml(valueOrDash(value))}</div>
+    </div>`;
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+  }
+
+  function openLogModal(id) {
+    const log = readLogPayload(id);
+    if (!log) return;
+    const ok = Number(log.status_code) >= 200 && Number(log.status_code) < 300;
+    document.getElementById('modalTitle').textContent = `${log.type || 'LLM'} · ${log.request_id || ('log-' + id)}`;
+    document.getElementById('modalSubtitle').textContent = `${shortTime(log.created_at || log.started_at)} · ${log.provider_name || '-'} → ${log.provider_model || log.requested_model || '-'}`;
+    const status = document.getElementById('modalStatus');
+    status.textContent = ok ? `Success ${log.status_code || ''}` : `Failure ${log.status_code || ''}`;
+    status.className = ok
+      ? 'rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-200'
+      : 'rounded-full bg-rose-50 px-2.5 py-1 text-xs font-semibold text-rose-700 ring-1 ring-rose-200';
+
+    const fields = [
+      ['Created', shortTime(log.created_at)],
+      ['Started', shortTime(log.started_at)],
+      ['First response', shortTime(log.first_response_at)],
+      ['Ended', shortTime(log.ended_at)],
+      ['Requested model', log.requested_model || log.group_name],
+      ['Provider', log.provider_name],
+      ['Provider model', log.provider_model],
+      ['API key', log.api_key_display],
+      ['Key hash', log.api_key_hash],
+      ['Key name', log.api_key_name],
+      ['TTFT', log.first_response],
+      ['Duration', log.duration],
+    ];
+    document.getElementById('modalMeta').innerHTML = fields.map(([label, value]) => metaCard(label, value)).join('');
+    document.getElementById('modalPrompt').textContent = valueOrDash(log.prompt);
+    document.getElementById('modalOutput').textContent = valueOrDash(log.output);
+    document.getElementById('modalError').textContent = valueOrDash(log.error);
+    document.getElementById('modalRaw').textContent = JSON.stringify(log, null, 2);
+    document.getElementById('logModal').classList.remove('hidden');
+    document.getElementById('logModal').classList.add('flex');
+  }
+
+  function closeLogModal() {
+    document.getElementById('logModal').classList.add('hidden');
+    document.getElementById('logModal').classList.remove('flex');
+  }
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeLogModal();
+  });
+</script>
 {% endblock %}

@@ -416,7 +416,7 @@ def list_logs(limit: int = 200) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT api_key, api_key_name, requested_model, group_name, provider_name, provider_model,
+            SELECT id, api_key, api_key_name, requested_model, group_name, provider_name, provider_model,
                    status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
                    prompt, output, error, created_at
             FROM Logs ORDER BY id DESC LIMIT ?
@@ -437,6 +437,10 @@ def list_logs(limit: int = 200) -> List[Dict[str, Any]]:
         row["first_response"] = f"{float(row['first_response_ms']) / 1000:.2f}s" if row.get("first_response_ms") is not None else "-"
         key = row.get("api_key") or ""
         row["api_key_display"] = f"{row.get('api_key_name') or '-'} ({key[:6]}…{key[-4:]})" if key else (row.get("api_key_name") or "-")
+        row["api_key_hash"] = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] if key else "-"
+        row["type"] = "LLM"
+        row["request_id"] = f"log-{row.get('id')}"
+        row["modal_payload"] = {k: v for k, v in row.items() if k not in {"api_key", "modal_payload"}}
     return rows
 
 

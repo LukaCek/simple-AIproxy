@@ -1,3 +1,4 @@
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -102,3 +103,43 @@ def test_admin_codex_token_form_adds_profile(tmp_path, monkeypatch):
     assert provider is not None
     assert provider["api_key"] == "ui-access"
     assert {"provider": "codex-ui", "model": "gpt-5.5"} in main.config_data["groups"]["gpt-5.5"]["members"]
+
+
+def test_admin_logs_page_renders_clickable_modal_payload(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.init_database()
+    with sqlite3.connect(main.DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO API_Keys (name, key, created_at) VALUES (?, ?, ?)",
+            ("test", "test-key", "now"),
+        )
+        conn.commit()
+    main.insert_log(
+        "test-key",
+        "test",
+        "gpt-5.5",
+        "gpt-5.5",
+        "codex-a",
+        "gpt-5.5",
+        200,
+        "2026-06-13T09:00:00",
+        "2026-06-13T09:00:01",
+        "2026-06-13T09:00:02",
+        1000.0,
+        2000.0,
+        '[{"role":"user","content":"hi"}]',
+        "ok",
+        None,
+    )
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/logs", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert response.status_code == 200
+    assert "Request ID" in response.text
+    assert "openLogModal" in response.text
+    assert "Exact prompt" in response.text
+    assert "Raw sanitized log JSON" in response.text
+    assert "log-1" in response.text
+    assert "api_key\"" not in response.text
+    assert "api_key_hash" in response.text

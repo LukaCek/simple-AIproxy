@@ -420,6 +420,8 @@ groups: {}
     assert 'name="image"' in response.text
     assert "User message" in response.text
     assert "Matching curl request" in response.text or "curlCommand" in response.text
+    assert "/admin/playground/run" in response.text
+    assert "/admin/playground/jobs/" in response.text
 
 
 def test_playground_post_accepts_image_and_shows_matching_curl(tmp_path, monkeypatch):
@@ -470,3 +472,53 @@ groups: {}
     assert "curl -sS" in response.text
     assert "image_url" in response.text
     assert "Authorization: Bearer" in response.text
+
+
+def test_playground_async_run_returns_job_and_status(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: vision-provider
+  url: https://vision.example/v1
+  api_key: secret
+  models:
+  - vision-model
+groups: {}
+""".strip() + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    async def fake_test_provider_model(provider_name, model_name, prompt, image_data_url=""):
+        return {
+            "success": True,
+            "provider": provider_name,
+            "status_code": 200,
+            "response": '{"choices":[{"message":{"content":"async ok"}}]}',
+            "assistant_text": "async ok",
+            "curl_command": main.build_curl_command("https://vision.example/v1/chat/completions", {"model": model_name, "messages": main.build_playground_messages(prompt, image_data_url)}, True),
+        }
+
+    monkeypatch.setattr(main, "test_provider_model", fake_test_provider_model)
+    with TestClient(main.app) as client:
+        started = client.post(
+            "/admin/playground/run",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={"provider": "vision-provider", "model": "vision-model", "prompt": "hello"},
+            files={"image": ("tiny.png", b"\x89PNG\r\n\x1a\n", "image/png")},
+        )
+        assert started.status_code == 200
+        payload = started.json()
+        assert payload["pending"] is True
+        assert payload["job_id"]
+        assert "curl -sS" in payload["curl_command"]
+        status_response = client.get(f"/admin/playground/jobs/{payload['job_id']}", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert status_response.status_code == 200
+    status_payload = status_response.json()
+    assert status_payload["status"] == "done"
+    assert status_payload["assistant_text"] == "async ok"
+    assert status_payload["image_filename"] == "tiny.png"

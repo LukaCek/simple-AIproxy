@@ -11,7 +11,7 @@
 
     <div class="mt-6 grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
       <div class="space-y-4">
-        <form action="/admin/playground" method="post" enctype="multipart/form-data" class="space-y-5 rounded-3xl border border-slate-200 bg-slate-50 p-4">
+        <form id="playgroundForm" action="/admin/playground" method="post" enctype="multipart/form-data" class="space-y-5 rounded-3xl border border-slate-200 bg-slate-50 p-4">
           <div class="grid gap-4 md:grid-cols-2">
             <div>
               <label class="mb-2 block text-sm font-medium text-slate-700" for="provider">Provider</label>
@@ -52,8 +52,10 @@
             </div>
           </div>
 
-          <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Send message</button>
+          <button id="playgroundSubmit" type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Send message</button>
         </form>
+
+        <div id="asyncPlaygroundResult" class="hidden space-y-4"></div>
 
         {% if result %}
         <div class="space-y-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -181,11 +183,79 @@
   }
 
   async function copyCurl() {
-    const el = document.getElementById('curlCommand');
+    const el = document.getElementById('curlCommand') || document.getElementById('asyncCurlCommand');
     if (!el) return;
     await navigator.clipboard.writeText(el.textContent);
   }
 
-  document.addEventListener('DOMContentLoaded', setSelectedModel);
+  function escapeHtml(value) {
+    return String(value || '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+  }
+
+  function renderPlaygroundState(data) {
+    const box = document.getElementById('asyncPlaygroundResult');
+    if (!box) return;
+    box.classList.remove('hidden');
+    const pending = data.pending || data.status === 'pending';
+    const failed = data.status === 'error' || data.success === false;
+    const assistant = data.assistant_text || data.result || (pending ? 'Waiting for provider response…' : '');
+    box.innerHTML = `
+      <div class="space-y-4 rounded-3xl border ${failed ? 'border-rose-200 bg-rose-50' : 'border-slate-200 bg-white'} p-4 shadow-sm">
+        <div class="flex flex-wrap items-center gap-3 text-xs text-slate-500">
+          <span class="rounded-full bg-slate-100 px-3 py-1">Provider: <strong class="text-slate-800">${escapeHtml(data.provider || '-')}</strong></span>
+          <span class="rounded-full bg-slate-100 px-3 py-1">Model: <strong class="text-slate-800">${escapeHtml(data.selected_model || '-')}</strong></span>
+          <span class="rounded-full bg-slate-100 px-3 py-1">Status: <strong class="text-slate-800">${escapeHtml(data.status_code || (pending ? 'pending' : '-'))}</strong></span>
+        </div>
+        <div class="space-y-3">
+          <div class="flex justify-end"><div class="max-w-[85%] rounded-3xl rounded-br-md bg-slate-900 px-4 py-3 text-sm text-white shadow-sm"><p class="whitespace-pre-wrap break-words">${escapeHtml(data.prompt || '')}</p>${data.image_filename ? `<p class="mt-2 text-xs text-slate-300">📎 ${escapeHtml(data.image_filename)}</p>` : ''}</div></div>
+          <div class="flex justify-start"><div class="max-w-[85%] rounded-3xl rounded-bl-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 shadow-sm"><p class="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Assistant</p><p class="whitespace-pre-wrap break-words">${pending ? '⏳ ' : ''}${escapeHtml(assistant)}</p></div></div>
+        </div>
+        ${data.result ? `<details class="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-900"><summary class="cursor-pointer font-medium">Raw response JSON/text</summary><pre class="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words text-xs">${escapeHtml(data.result)}</pre></details>` : ''}
+      </div>
+      ${data.curl_command ? `<div class="rounded-3xl border border-slate-200 bg-slate-950 p-4 text-sm text-slate-100 shadow-sm"><div class="mb-3 flex flex-wrap items-center justify-between gap-2"><div><h3 class="font-semibold">Matching curl request</h3><p class="text-xs text-slate-400">Same target URL and JSON body. Replace the redacted bearer token with the provider/API key before running it.</p></div><button type="button" onclick="copyCurl()" class="rounded-xl bg-white/10 px-3 py-2 text-xs font-semibold text-white hover:bg-white/20">Copy</button></div><pre id="asyncCurlCommand" class="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-xs leading-5">${escapeHtml(data.curl_command)}</pre></div>` : ''}
+    `;
+  }
+
+  async function pollPlaygroundJob(jobId) {
+    for (;;) {
+      const response = await fetch(`/admin/playground/jobs/${jobId}`, {headers: {'Accept': 'application/json'}});
+      const data = await response.json();
+      renderPlaygroundState(data);
+      if (data.status !== 'pending') break;
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+  }
+
+  function installAsyncPlaygroundForm() {
+    const form = document.getElementById('playgroundForm');
+    const button = document.getElementById('playgroundSubmit');
+    if (!form) return;
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Sending…';
+      }
+      try {
+        const response = await fetch('/admin/playground/run', {method: 'POST', body: new FormData(form), headers: {'Accept': 'application/json'}});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || data.error || JSON.stringify(data));
+        renderPlaygroundState(data);
+        await pollPlaygroundJob(data.job_id);
+      } catch (error) {
+        renderPlaygroundState({status: 'error', success: false, assistant_text: error.message, result: error.message});
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = 'Send message';
+        }
+      }
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    setSelectedModel();
+    installAsyncPlaygroundForm();
+  });
 </script>
 {% endblock %}

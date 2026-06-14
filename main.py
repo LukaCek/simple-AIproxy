@@ -34,6 +34,8 @@ watchdog_observer: Optional[Observer] = None
 oauth_state_store: Dict[str, Dict[str, Any]] = {}
 route_counters: Dict[str, int] = {}
 route_counters_lock = threading.Lock()
+playground_jobs: Dict[str, Dict[str, Any]] = {}
+playground_jobs_lock = threading.Lock()
 PROVIDER_TEST_TIMEOUT_SECONDS = 3600.0
 
 admin_security = HTTPBasic()
@@ -1015,6 +1017,62 @@ async def image_upload_to_data_url(image: Optional[UploadFile]) -> tuple[str, st
     return f"data:{content_type};base64,{encoded}", image.filename
 
 
+def build_playground_curl_for_provider(provider_name: str, model_name: str, prompt: str, image_data_url: str = "") -> str:
+    provider = find_provider(provider_name)
+    if provider is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{provider_name}' not found")
+    if not model_name or model_name not in provider.get("models", []):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_name}' is not configured for provider '{provider_name}'")
+    payload = {"model": model_name, "messages": build_playground_messages(prompt, image_data_url)}
+    target_url = resolve_endpoint_url(provider)
+    headers = build_provider_headers(provider)
+    return build_curl_command(target_url, payload, bool(headers.get("Authorization")))
+
+
+def set_playground_job(job_id: str, updates: Dict[str, Any]) -> None:
+    with playground_jobs_lock:
+        job = playground_jobs.setdefault(job_id, {})
+        job.update(updates)
+        job["updated_at"] = datetime.utcnow().isoformat()
+
+
+def get_playground_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with playground_jobs_lock:
+        job = playground_jobs.get(job_id)
+        return dict(job) if job else None
+
+
+def prune_playground_jobs(max_age_seconds: int = 3600) -> None:
+    cutoff = time.time() - max_age_seconds
+    with playground_jobs_lock:
+        for job_id, job in list(playground_jobs.items()):
+            if float(job.get("created_ts", 0)) < cutoff:
+                playground_jobs.pop(job_id, None)
+
+
+async def run_playground_job(job_id: str, provider: str, model: str, prompt: str, image_data_url: str) -> None:
+    try:
+        response = await test_provider_model(provider, model, prompt, image_data_url=image_data_url)
+        set_playground_job(job_id, {
+            "status": "done",
+            "success": bool(response.get("success")),
+            "result": response.get("response"),
+            "assistant_text": response.get("assistant_text") or response.get("response"),
+            "status_code": response.get("status_code"),
+            "provider": response.get("provider"),
+            "error": None if response.get("success") else response.get("response"),
+        })
+    except Exception as exc:
+        set_playground_job(job_id, {
+            "status": "error",
+            "success": False,
+            "result": str(exc),
+            "assistant_text": str(exc),
+            "status_code": 500,
+            "error": str(exc),
+        })
+
+
 async def test_provider_model(provider_name: str, model_name: str, prompt: str, image_data_url: str = "") -> Dict[str, Any]:
     provider = find_provider(provider_name)
     if provider is None:
@@ -1870,6 +1928,57 @@ def admin_playground(request: Request, result: Optional[str] = None, provider: O
             "error": error,
         },
     )
+
+
+@app.post("/admin/playground/run", dependencies=[Depends(verify_admin)])
+async def admin_playground_run_async(
+    background_tasks: BackgroundTasks,
+    provider: str = Form(...),
+    model: str = Form(...),
+    prompt: str = Form(...),
+    image: Optional[UploadFile] = File(None),
+) -> JSONResponse:
+    prune_playground_jobs()
+    image_data_url, image_filename = await image_upload_to_data_url(image)
+    curl_command = build_playground_curl_for_provider(provider, model, prompt, image_data_url=image_data_url)
+    job_id = uuid.uuid4().hex
+    with playground_jobs_lock:
+        playground_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "pending",
+            "success": None,
+            "provider": provider,
+            "selected_model": model,
+            "prompt": prompt,
+            "image_filename": image_filename,
+            "curl_command": curl_command,
+            "status_code": None,
+            "result": None,
+            "assistant_text": None,
+            "error": None,
+            "created_ts": time.time(),
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+    background_tasks.add_task(run_playground_job, job_id, provider, model, prompt, image_data_url)
+    return JSONResponse({
+        "ok": True,
+        "pending": True,
+        "job_id": job_id,
+        "provider": provider,
+        "selected_model": model,
+        "prompt": prompt,
+        "image_filename": image_filename,
+        "curl_command": curl_command,
+    })
+
+
+@app.get("/admin/playground/jobs/{job_id}", dependencies=[Depends(verify_admin)])
+async def admin_playground_job_status(job_id: str) -> JSONResponse:
+    job = get_playground_job(job_id)
+    if job is None:
+        return JSONResponse({"ok": False, "status": "missing", "error": "Playground job not found or expired"}, status_code=404)
+    return JSONResponse({"ok": True, **job})
 
 
 @app.post("/admin/playground", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])

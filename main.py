@@ -1075,17 +1075,57 @@ async def run_playground_job(job_id: str, provider: str, model: str, prompt: str
 
 async def test_provider_model(provider_name: str, model_name: str, prompt: str, image_data_url: str = "") -> Dict[str, Any]:
     provider = find_provider(provider_name)
-    if provider is None:
-        return {"success": False, "provider": provider_name, "status_code": 404, "response": f"Provider '{provider_name}' not found"}
-    if not model_name or model_name not in provider.get("models", []):
-        return {"success": False, "provider": provider_name, "status_code": 400, "response": f"Model '{model_name}' is not configured for provider '{provider_name}'"}
     payload = {"model": model_name, "messages": build_playground_messages(prompt, image_data_url)}
+    prompt_text = truncate_text(prompt + ("\n[image attached]" if image_data_url else ""))
+    started_monotonic = time.monotonic()
+    started_at = datetime.utcnow().isoformat()
+
+    def finish_log(status_code: int, provider_model: str, output: Optional[str] = None, error: Optional[str] = None, first_response_at: Optional[str] = None) -> None:
+        ended_at = datetime.utcnow().isoformat()
+        first_ms: Optional[float] = None
+        if first_response_at:
+            try:
+                first_ms = (datetime.fromisoformat(first_response_at) - datetime.fromisoformat(started_at)).total_seconds() * 1000
+            except Exception:
+                first_ms = None
+        total_ms = (time.monotonic() - started_monotonic) * 1000
+        try:
+            insert_log(
+                None,
+                "Admin Playground",
+                model_name,
+                "admin-playground",
+                provider_name,
+                provider_model,
+                status_code,
+                started_at,
+                first_response_at,
+                ended_at,
+                first_ms,
+                total_ms,
+                prompt_text,
+                output,
+                error,
+            )
+        except Exception:
+            # Playground logging must never break the admin test request itself.
+            pass
+
+    if provider is None:
+        message = f"Provider '{provider_name}' not found"
+        finish_log(404, model_name or "unknown", error=message)
+        return {"success": False, "provider": provider_name, "status_code": 404, "response": message, "assistant_text": message}
+    if not model_name or model_name not in provider.get("models", []):
+        message = f"Model '{model_name}' is not configured for provider '{provider_name}'"
+        finish_log(400, model_name or "unknown", error=message)
+        return {"success": False, "provider": provider_name, "status_code": 400, "response": message, "assistant_text": message}
     headers = build_provider_headers(provider)
     target_url = resolve_endpoint_url(provider)
     curl_command = build_curl_command(target_url, payload, bool(headers.get("Authorization")))
     try:
         async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=PROVIDER_TEST_TIMEOUT_SECONDS) as response:
             body = await response.aread()
+            first_response_at = datetime.utcnow().isoformat()
             text = body.decode("utf-8", errors="replace")
             if response.status_code == 200:
                 try:
@@ -1093,12 +1133,19 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
                     output = json.dumps(parsed, indent=2, ensure_ascii=False)
                 except json.JSONDecodeError:
                     output = text
-                return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output, "assistant_text": extract_chat_message_text(text), "curl_command": curl_command}
+                assistant_text = extract_chat_message_text(text)
+                finish_log(response.status_code, model_name, output=assistant_text or output, first_response_at=first_response_at)
+                return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output, "assistant_text": assistant_text, "curl_command": curl_command}
+            finish_log(response.status_code, model_name, error=text, first_response_at=first_response_at)
             return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": text, "assistant_text": text, "curl_command": curl_command}
     except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
-        return {"success": False, "provider": provider_name, "status_code": 502, "response": str(exc), "assistant_text": str(exc), "curl_command": curl_command}
+        message = str(exc)
+        finish_log(502, model_name, error=message)
+        return {"success": False, "provider": provider_name, "status_code": 502, "response": message, "assistant_text": message, "curl_command": curl_command}
     except Exception as exc:
-        return {"success": False, "provider": provider_name, "status_code": 500, "response": str(exc), "assistant_text": str(exc), "curl_command": curl_command}
+        message = str(exc)
+        finish_log(500, model_name, error=message)
+        return {"success": False, "provider": provider_name, "status_code": 500, "response": message, "assistant_text": message, "curl_command": curl_command}
 
 
 async def test_provider_candidate(name: str, base_url: str, api_key: str, models_text: str, prompt: str = "Reply with OK.") -> Dict[str, Any]:

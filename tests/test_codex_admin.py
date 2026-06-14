@@ -142,6 +142,9 @@ class FakeProviderTestClient:
         assert method == "POST"
         return FakeProviderTestStream(self, url, json=json, headers=headers, timeout=timeout)
 
+    async def aclose(self):
+        pass
+
 
 def test_provider_candidate_uses_one_hour_timeout_for_slow_ollama_load(monkeypatch):
     fake = FakeProviderTestClient()
@@ -522,3 +525,55 @@ groups: {}
     assert status_payload["status"] == "done"
     assert status_payload["assistant_text"] == "async ok"
     assert status_payload["image_filename"] == "tiny.png"
+
+
+def test_playground_async_provider_call_is_written_to_logs(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: logged-provider
+  url: https://logged.example/v1
+  api_key: secret
+  models:
+  - logged-model
+groups: {}
+""".strip() + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+    main.playground_jobs.clear()
+
+    fake = FakeProviderTestClient()
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        started = client.post(
+            "/admin/playground/run",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={"provider": "logged-provider", "model": "logged-model", "prompt": "log this playground call"},
+            files={"image": ("tiny.png", b"\x89PNG\r\n\x1a\n", "image/png")},
+        )
+        assert started.status_code == 200
+        job_id = started.json()["job_id"]
+        completed = client.get(f"/admin/playground/jobs/{job_id}", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "done"
+    with sqlite3.connect(main.DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT api_key_name, requested_model, group_name, provider_name, provider_model, status_code, prompt, output, error FROM Logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] == "Admin Playground"
+    assert row[1] == "logged-model"
+    assert row[2] == "admin-playground"
+    assert row[3] == "logged-provider"
+    assert row[4] == "logged-model"
+    assert row[5] == 200
+    assert "log this playground call" in row[6]
+    assert "[image attached]" in row[6]
+    assert "OK" in row[7]
+    assert row[8] is None

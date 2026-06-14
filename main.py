@@ -14,7 +14,7 @@ import httpx
 import json
 import secrets
 import yaml
-from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
@@ -967,16 +967,65 @@ def resolve_requested_model(model_name: str) -> List[Dict[str, Any]]:
     return route_endpoints(model_name, endpoints)
 
 
-async def test_provider_model(provider_name: str, model_name: str, prompt: str) -> Dict[str, Any]:
+def build_playground_messages(prompt: str, image_data_url: str = "") -> List[Dict[str, Any]]:
+    if image_data_url:
+        content: Any = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ]
+    else:
+        content = prompt
+    return [{"role": "user", "content": content}]
+
+
+def extract_chat_message_text(response_text: str) -> str:
+    try:
+        data = json.loads(response_text)
+    except Exception:
+        return response_text
+    text = extract_output_from_chat_payload(data)
+    return text if text else response_text
+
+
+def build_curl_command(target_url: str, payload: Dict[str, Any], has_auth: bool) -> str:
+    payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
+    lines = [
+        f"curl -sS {json.dumps(target_url)} \\",
+        "  -H 'Content-Type: application/json' \\",
+    ]
+    if has_auth:
+        lines.append("  -H 'Authorization: Bearer <provider-api-key>' \\")
+    lines.append("  -d @- <<'JSON'")
+    return "\n".join(lines) + "\n" + payload_text + "\nJSON"
+
+
+async def image_upload_to_data_url(image: Optional[UploadFile]) -> tuple[str, str]:
+    if image is None or not image.filename:
+        return "", ""
+    content_type = image.content_type or "application/octet-stream"
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Attached file must be an image")
+    data = await image.read()
+    if not data:
+        return "", ""
+    max_bytes = 8 * 1024 * 1024
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image is too large for playground upload (max 8 MiB)")
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{content_type};base64,{encoded}", image.filename
+
+
+async def test_provider_model(provider_name: str, model_name: str, prompt: str, image_data_url: str = "") -> Dict[str, Any]:
     provider = find_provider(provider_name)
     if provider is None:
         return {"success": False, "provider": provider_name, "status_code": 404, "response": f"Provider '{provider_name}' not found"}
     if not model_name or model_name not in provider.get("models", []):
         return {"success": False, "provider": provider_name, "status_code": 400, "response": f"Model '{model_name}' is not configured for provider '{provider_name}'"}
-    payload = {"model": model_name, "messages": [{"role": "user", "content": prompt}]}
+    payload = {"model": model_name, "messages": build_playground_messages(prompt, image_data_url)}
     headers = build_provider_headers(provider)
+    target_url = resolve_endpoint_url(provider)
+    curl_command = build_curl_command(target_url, payload, bool(headers.get("Authorization")))
     try:
-        target_url = resolve_endpoint_url(provider)
         async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=PROVIDER_TEST_TIMEOUT_SECONDS) as response:
             body = await response.aread()
             text = body.decode("utf-8", errors="replace")
@@ -986,12 +1035,12 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str) 
                     output = json.dumps(parsed, indent=2, ensure_ascii=False)
                 except json.JSONDecodeError:
                     output = text
-                return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output}
-            return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": text}
+                return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output, "assistant_text": extract_chat_message_text(text), "curl_command": curl_command}
+            return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": text, "assistant_text": text, "curl_command": curl_command}
     except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
-        return {"success": False, "provider": provider_name, "status_code": 502, "response": str(exc)}
+        return {"success": False, "provider": provider_name, "status_code": 502, "response": str(exc), "assistant_text": str(exc), "curl_command": curl_command}
     except Exception as exc:
-        return {"success": False, "provider": provider_name, "status_code": 500, "response": str(exc)}
+        return {"success": False, "provider": provider_name, "status_code": 500, "response": str(exc), "assistant_text": str(exc), "curl_command": curl_command}
 
 
 async def test_provider_candidate(name: str, base_url: str, api_key: str, models_text: str, prompt: str = "Reply with OK.") -> Dict[str, Any]:
@@ -1829,20 +1878,31 @@ async def admin_playground_run(
     provider: str = Form(...),
     model: str = Form(...),
     prompt: str = Form(...),
+    image: Optional[UploadFile] = File(None),
 ) -> Any:
-    response = await test_provider_model(provider, model, prompt)
+    try:
+        image_data_url, image_filename = await image_upload_to_data_url(image)
+        response = await test_provider_model(provider, model, prompt, image_data_url=image_data_url)
+        error = None if response.get("success") else response.get("response")
+    except HTTPException as exc:
+        response = {"success": False, "provider": provider, "status_code": exc.status_code, "response": str(exc.detail), "assistant_text": str(exc.detail), "curl_command": ""}
+        image_filename = image.filename if image and image.filename else ""
+        error = str(exc.detail)
     return templates.TemplateResponse(
         request=request,
         name="playground.html",
         context={
             "providers": get_providers(),
             "result": response.get("response"),
+            "assistant_text": response.get("assistant_text"),
+            "curl_command": response.get("curl_command"),
             "provider": response.get("provider"),
             "selected_model": model,
             "status_code": response.get("status_code"),
-            "error": None if response.get("success") else response.get("response"),
+            "error": error,
             "selected_provider": provider,
             "prompt": prompt,
+            "image_filename": image_filename,
         },
     )
 

@@ -392,3 +392,81 @@ groups:
     assert created.status_code == 303
     assert main.config_data["groups"]["smart-gpt"]["members"] == [{"group": "groq-fast"}]
     assert "group: groq-fast" in config_path.read_text(encoding="utf-8")
+
+
+def test_admin_playground_page_renders_chat_upload_and_curl_ui(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: vision-provider
+  url: https://vision.example/v1
+  api_key: secret
+  models:
+  - vision-model
+groups: {}
+""".strip() + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/playground", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert response.status_code == 200
+    assert 'enctype="multipart/form-data"' in response.text
+    assert 'name="image"' in response.text
+    assert "User message" in response.text
+    assert "Matching curl request" in response.text or "curlCommand" in response.text
+
+
+def test_playground_post_accepts_image_and_shows_matching_curl(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: vision-provider
+  url: https://vision.example/v1
+  api_key: secret
+  models:
+  - vision-model
+groups: {}
+""".strip() + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    async def fake_test_provider_model(provider_name, model_name, prompt, image_data_url=""):
+        assert provider_name == "vision-provider"
+        assert model_name == "vision-model"
+        assert prompt == "what is in this image?"
+        assert image_data_url.startswith("data:image/png;base64,")
+        payload = {"model": model_name, "messages": main.build_playground_messages(prompt, image_data_url)}
+        return {
+            "success": True,
+            "provider": provider_name,
+            "status_code": 200,
+            "response": '{"choices":[{"message":{"content":"A tiny PNG."}}]}',
+            "assistant_text": "A tiny PNG.",
+            "curl_command": main.build_curl_command("https://vision.example/v1/chat/completions", payload, True),
+        }
+
+    monkeypatch.setattr(main, "test_provider_model", fake_test_provider_model)
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/admin/playground",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={"provider": "vision-provider", "model": "vision-model", "prompt": "what is in this image?"},
+            files={"image": ("tiny.png", b"\x89PNG\r\n\x1a\n", "image/png")},
+        )
+
+    assert response.status_code == 200
+    assert "A tiny PNG." in response.text
+    assert "tiny.png" in response.text
+    assert "curl -sS" in response.text
+    assert "image_url" in response.text
+    assert "Authorization: Bearer" in response.text

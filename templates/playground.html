@@ -5,58 +5,108 @@
     <div class="flex items-center justify-between gap-4">
       <div>
         <h2 class="text-xl font-semibold text-slate-900">Playground</h2>
-        <p class="mt-1 text-sm text-slate-500">Select a provider and model, then test the prompt directly.</p>
+        <p class="mt-1 text-sm text-slate-500">Select a provider/model, send a chat-style request, optionally attach an image, and copy the matching curl.</p>
       </div>
     </div>
-    <div class="mt-6 grid gap-6 lg:grid-cols-[1fr_360px]">
+
+    <div class="mt-6 grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
       <div class="space-y-4">
-        <form action="/admin/playground" method="post" class="space-y-6">
-          <div>
-            <label class="mb-2 block text-sm font-medium text-slate-700" for="provider">Provider</label>
-            <select id="provider" name="provider" required onchange="updateModels()" class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
-              <option value="">Select a provider</option>
-              {% for provider in providers %}
-              <option value="{{ provider.name }}" {% if selected_provider == provider.name %}selected{% endif %}>{{ provider.name }}</option>
-              {% endfor %}
-            </select>
+        <form action="/admin/playground" method="post" enctype="multipart/form-data" class="space-y-5 rounded-3xl border border-slate-200 bg-slate-50 p-4">
+          <div class="grid gap-4 md:grid-cols-2">
+            <div>
+              <label class="mb-2 block text-sm font-medium text-slate-700" for="provider">Provider</label>
+              <select id="provider" name="provider" required onchange="updateModels()" class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
+                <option value="">Select a provider</option>
+                {% for provider in providers %}
+                <option value="{{ provider.name }}" {% if selected_provider == provider.name %}selected{% endif %}>{{ provider.name }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label class="mb-2 block text-sm font-medium text-slate-700" for="model">Model</label>
+              <select id="model" name="model" required class="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
+                <option value="">Select a model</option>
+              </select>
+            </div>
           </div>
-          <div>
-            <label class="mb-2 block text-sm font-medium text-slate-700" for="model">Model</label>
-            <select id="model" name="model" required class="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
-              <option value="">Select a model</option>
-            </select>
+
+          <div class="rounded-3xl border border-slate-200 bg-white p-4">
+            <div class="mb-3 flex items-center gap-2 text-sm font-semibold text-slate-900">
+              <span class="inline-flex h-8 w-8 items-center justify-center rounded-full bg-slate-900 text-white">U</span>
+              <span>User message</span>
+            </div>
+            <textarea id="prompt" name="prompt" rows="6" required class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Write the message you want to send to the selected model">{{ prompt or '' }}</textarea>
+            <div class="mt-4">
+              <label class="mb-2 block text-sm font-medium text-slate-700" for="image">Attach image (optional)</label>
+              <input id="image" name="image" type="file" accept="image/*" onchange="previewImage(event)" class="block w-full cursor-pointer rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-700 file:mr-4 file:rounded-xl file:border-0 file:bg-slate-900 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-white hover:bg-slate-100" />
+              <div id="imagePreview" class="mt-3 hidden items-center gap-3 rounded-2xl border border-slate-200 bg-white p-3 text-sm text-slate-700">
+                <img id="imagePreviewThumb" alt="Selected image preview" class="h-16 w-16 rounded-xl object-cover" />
+                <div>
+                  <p id="imagePreviewName" class="font-medium text-slate-900"></p>
+                  <p class="text-xs text-slate-500">The playground sends it as an OpenAI-style image_url data URL.</p>
+                </div>
+              </div>
+              {% if image_filename %}
+              <p class="mt-2 text-xs text-slate-500">Last submitted image: {{ image_filename }}</p>
+              {% endif %}
+            </div>
           </div>
-          <div>
-            <label class="mb-2 block text-sm font-medium text-slate-700" for="prompt">Prompt</label>
-            <textarea id="prompt" name="prompt" rows="8" required class="w-full rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" placeholder="Enter the text you want to send to the selected model">{{ prompt or '' }}</textarea>
-          </div>
-          <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Run Test</button>
+
+          <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Send message</button>
         </form>
+
         {% if result %}
-        <div class="rounded-3xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-900">
-          <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <p class="text-sm text-slate-500">Provider:</p>
-              <p class="font-medium text-slate-900">{{ provider or '-' }}</p>
+        <div class="space-y-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div class="flex flex-wrap items-center gap-3 text-xs text-slate-500">
+            <span class="rounded-full bg-slate-100 px-3 py-1">Provider: <strong class="text-slate-800">{{ provider or '-' }}</strong></span>
+            <span class="rounded-full bg-slate-100 px-3 py-1">Model: <strong class="text-slate-800">{{ selected_model or '-' }}</strong></span>
+            <span class="rounded-full bg-slate-100 px-3 py-1">Status: <strong class="text-slate-800">{{ status_code or '-' }}</strong></span>
+          </div>
+
+          <div class="space-y-3">
+            <div class="flex justify-end">
+              <div class="max-w-[85%] rounded-3xl rounded-br-md bg-slate-900 px-4 py-3 text-sm text-white shadow-sm">
+                <p class="whitespace-pre-wrap break-words">{{ prompt or '' }}</p>
+                {% if image_filename %}
+                <p class="mt-2 text-xs text-slate-300">📎 {{ image_filename }}</p>
+                {% endif %}
+              </div>
             </div>
-            <div>
-              <p class="text-sm text-slate-500">Model</p>
-              <p class="font-medium text-slate-900">{{ selected_model or '-' }}</p>
-            </div>
-            <div>
-              <p class="text-sm text-slate-500">Status</p>
-              <p class="font-medium text-slate-900">{{ status_code or '-' }}</p>
+            <div class="flex justify-start">
+              <div class="max-w-[85%] rounded-3xl rounded-bl-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900 shadow-sm">
+                <p class="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Assistant</p>
+                <p class="whitespace-pre-wrap break-words">{{ assistant_text or result }}</p>
+              </div>
             </div>
           </div>
-          <pre class="whitespace-pre-wrap break-words text-sm text-slate-900">{{ result }}</pre>
+
+          <details class="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-900">
+            <summary class="cursor-pointer font-medium">Raw response JSON/text</summary>
+            <pre class="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words text-xs">{{ result }}</pre>
+          </details>
         </div>
         {% endif %}
+
+        {% if curl_command %}
+        <div class="rounded-3xl border border-slate-200 bg-slate-950 p-4 text-sm text-slate-100 shadow-sm">
+          <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 class="font-semibold">Matching curl request</h3>
+              <p class="text-xs text-slate-400">Same target URL and JSON body. Replace the redacted bearer token with the provider/API key before running it.</p>
+            </div>
+            <button type="button" onclick="copyCurl()" class="rounded-xl bg-white/10 px-3 py-2 text-xs font-semibold text-white hover:bg-white/20">Copy</button>
+          </div>
+          <pre id="curlCommand" class="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-xs leading-5">{{ curl_command }}</pre>
+        </div>
+        {% endif %}
+
         {% if error and not result %}
         <div class="rounded-3xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900">
           {{ error }}
         </div>
         {% endif %}
       </div>
+
       <aside class="rounded-3xl border border-slate-200 bg-slate-50 p-6 shadow-sm">
         <h3 class="text-lg font-semibold text-slate-900">Configured Providers</h3>
         <p class="mt-2 text-sm text-slate-500">Select a provider to see its available models.</p>
@@ -64,7 +114,7 @@
           {% for provider in providers %}
           <div class="rounded-3xl border border-slate-200 bg-white p-4">
             <h4 class="font-semibold text-slate-900">{{ provider.name }}</h4>
-            <p class="mt-1 text-sm text-slate-500 break-all">{{ provider.url }}</p>
+            <p class="mt-1 break-all text-sm text-slate-500">{{ provider.url }}</p>
             <p class="mt-3 text-sm text-slate-700">Models: {{ provider.models | join(', ') }}</p>
           </div>
           {% else %}
@@ -75,6 +125,7 @@
     </div>
   </section>
 </div>
+
 <script>
   const providerModels = {
     {% for provider in providers %}
@@ -92,9 +143,7 @@
         const option = document.createElement('option');
         option.value = model;
         option.textContent = model;
-        if (selectedModel === model) {
-          option.selected = true;
-        }
+        if (selectedModel === model) option.selected = true;
         modelSelect.appendChild(option);
       });
     }
@@ -113,8 +162,30 @@
     });
   }
 
-  document.addEventListener('DOMContentLoaded', function() {
-    setSelectedModel();
-  });
+  function previewImage(event) {
+    const file = event.target.files && event.target.files[0];
+    const wrapper = document.getElementById('imagePreview');
+    const thumb = document.getElementById('imagePreviewThumb');
+    const name = document.getElementById('imagePreviewName');
+    if (!file) {
+      wrapper.classList.add('hidden');
+      wrapper.classList.remove('flex');
+      thumb.removeAttribute('src');
+      name.textContent = '';
+      return;
+    }
+    thumb.src = URL.createObjectURL(file);
+    name.textContent = file.name;
+    wrapper.classList.remove('hidden');
+    wrapper.classList.add('flex');
+  }
+
+  async function copyCurl() {
+    const el = document.getElementById('curlCommand');
+    if (!el) return;
+    await navigator.clipboard.writeText(el.textContent);
+  }
+
+  document.addEventListener('DOMContentLoaded', setSelectedModel);
 </script>
 {% endblock %}

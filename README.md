@@ -46,7 +46,10 @@ Routes:
 Create an API key in `/admin/keys`, then call the proxy as an OpenAI-compatible API:
 
 ```bash
-curl -X POST http://localhost:8000/v1/chat/completions -H "Authorization: Bearer ***" -H "Content-Type: application/json" -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"Say hello"}]}'
+curl -sS http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer API_KEY' \
+  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"Say hello"}]}'
 ```
 
 `model` is the **group name** from `config.yml`, not necessarily the upstream model ID. The proxy rewrites it to each selected provider member's `model`.

@@ -989,16 +989,20 @@ def extract_chat_message_text(response_text: str) -> str:
     return text if text else response_text
 
 
-def build_curl_command(target_url: str, payload: Dict[str, Any], has_auth: bool) -> str:
+def build_curl_command(target_url: str, payload: Dict[str, Any], has_auth: bool, bearer_placeholder: str = "API_KEY") -> str:
     payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
     lines = [
         f"curl -sS {json.dumps(target_url)} \\",
         "  -H 'Content-Type: application/json' \\",
     ]
     if has_auth:
-        lines.append("  -H 'Authorization: Bearer <provider-api-key>' \\")
+        lines.append(f"  -H 'Authorization: Bearer {bearer_placeholder}' \\")
     lines.append("  -d @- <<'JSON'")
     return "\n".join(lines) + "\n" + payload_text + "\nJSON"
+
+
+def build_aiproxy_chat_completions_url(request: Request) -> str:
+    return str(request.url_for("chat_completions"))
 
 
 async def image_upload_to_data_url(image: Optional[UploadFile]) -> tuple[str, str]:
@@ -1017,16 +1021,14 @@ async def image_upload_to_data_url(image: Optional[UploadFile]) -> tuple[str, st
     return f"data:{content_type};base64,{encoded}", image.filename
 
 
-def build_playground_curl_for_provider(provider_name: str, model_name: str, prompt: str, image_data_url: str = "") -> str:
+def build_playground_curl_for_provider(provider_name: str, model_name: str, prompt: str, image_data_url: str = "", proxy_url: str = "/v1/chat/completions") -> str:
     provider = find_provider(provider_name)
     if provider is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{provider_name}' not found")
     if not model_name or model_name not in provider.get("models", []):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_name}' is not configured for provider '{provider_name}'")
     payload = {"model": model_name, "messages": build_playground_messages(prompt, image_data_url)}
-    target_url = resolve_endpoint_url(provider)
-    headers = build_provider_headers(provider)
-    return build_curl_command(target_url, payload, bool(headers.get("Authorization")))
+    return build_curl_command(proxy_url, payload, True)
 
 
 def set_playground_job(job_id: str, updates: Dict[str, Any]) -> None:
@@ -1979,6 +1981,7 @@ def admin_playground(request: Request, result: Optional[str] = None, provider: O
 
 @app.post("/admin/playground/run", dependencies=[Depends(verify_admin)])
 async def admin_playground_run_async(
+    request: Request,
     background_tasks: BackgroundTasks,
     provider: str = Form(...),
     model: str = Form(...),
@@ -1987,7 +1990,13 @@ async def admin_playground_run_async(
 ) -> JSONResponse:
     prune_playground_jobs()
     image_data_url, image_filename = await image_upload_to_data_url(image)
-    curl_command = build_playground_curl_for_provider(provider, model, prompt, image_data_url=image_data_url)
+    curl_command = build_playground_curl_for_provider(
+        provider,
+        model,
+        prompt,
+        image_data_url=image_data_url,
+        proxy_url=build_aiproxy_chat_completions_url(request),
+    )
     job_id = uuid.uuid4().hex
     with playground_jobs_lock:
         playground_jobs[job_id] = {
@@ -2039,6 +2048,13 @@ async def admin_playground_run(
     try:
         image_data_url, image_filename = await image_upload_to_data_url(image)
         response = await test_provider_model(provider, model, prompt, image_data_url=image_data_url)
+        response["curl_command"] = build_playground_curl_for_provider(
+            provider,
+            model,
+            prompt,
+            image_data_url=image_data_url,
+            proxy_url=build_aiproxy_chat_completions_url(request),
+        )
         error = None if response.get("success") else response.get("response")
     except HTTPException as exc:
         response = {"success": False, "provider": provider, "status_code": exc.status_code, "response": str(exc.detail), "assistant_text": str(exc.detail), "curl_command": ""}

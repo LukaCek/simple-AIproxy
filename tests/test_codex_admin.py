@@ -474,7 +474,9 @@ groups: {}
     assert "tiny.png" in response.text
     assert "curl -sS" in response.text
     assert "image_url" in response.text
-    assert "Authorization: Bearer" in response.text
+    assert "http://testserver/v1/chat/completions" in response.text
+    assert "Authorization: Bearer API_KEY" in response.text
+    assert "https://vision.example/v1/chat/completions" not in response.text
 
 
 def test_playground_async_run_returns_job_and_status(tmp_path, monkeypatch):
@@ -518,6 +520,9 @@ groups: {}
         assert payload["pending"] is True
         assert payload["job_id"]
         assert "curl -sS" in payload["curl_command"]
+        assert "http://testserver/v1/chat/completions" in payload["curl_command"]
+        assert "Authorization: Bearer API_KEY" in payload["curl_command"]
+        assert "https://vision.example/v1/chat/completions" not in payload["curl_command"]
         status_response = client.get(f"/admin/playground/jobs/{payload['job_id']}", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
 
     assert status_response.status_code == 200

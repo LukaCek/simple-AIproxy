@@ -54,6 +54,15 @@ curl -sS http://localhost:8000/v1/chat/completions \
 
 `model` is the **group name** from `config.yml`, not necessarily the upstream model ID. The proxy rewrites it to each selected provider member's `model`.
 
+For slow local/Ollama models behind Cloudflare or another reverse proxy, use streaming so the edge connection receives chunks instead of waiting silently for the full completion:
+
+```bash
+curl -N -sS http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer API_KEY' \
+  -d '{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"Say hello"}]}'
+```
+
 ## Balanced Codex OAuth profiles
 
 `config.yml` contains an example with two Codex profiles:

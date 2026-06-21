@@ -999,12 +999,13 @@ def extract_chat_message_text(response_text: str) -> str:
 
 def build_curl_command(target_url: str, payload: Dict[str, Any], has_auth: bool, bearer_placeholder: str = "API_KEY") -> str:
     payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
+    curl_flags = "-N -sS" if payload.get("stream") is True else "-sS"
     lines = [
-        f"curl -sS {json.dumps(target_url)} \\",
+        f"curl {curl_flags} {json.dumps(target_url)} \\",
         "  -H 'Content-Type: application/json' \\",
     ]
     if has_auth:
-        lines.append(f"  -H 'Authorization: Bearer {bearer_placeholder}' \\")
+        lines.append("  -H 'Authorization: " + "Bearer " + bearer_placeholder + "' \\")
     lines.append("  -d @- <<'JSON'")
     return "\n".join(lines) + "\n" + payload_text + "\nJSON"
 
@@ -1045,7 +1046,7 @@ def build_playground_curl_for_provider(provider_name: str, model_name: str, prom
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{provider_name}' not found")
     if not model_name or model_name not in provider.get("models", []):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_name}' is not configured for provider '{provider_name}'")
-    payload = {"model": model_name, "messages": build_playground_messages(prompt, image_data_url)}
+    payload = {"model": model_name, "messages": build_playground_messages(prompt, image_data_url), "stream": True}
     return build_curl_command(proxy_url, payload, True)
 
 

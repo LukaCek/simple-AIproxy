@@ -537,7 +537,9 @@ groups: {}
     assert response.status_code == 200
     assert "A tiny PNG." in response.text
     assert "tiny.png" in response.text
-    assert "curl -sS" in response.text
+    assert "curl -N -sS" in response.text
+    assert "stream" in response.text
+    assert "true" in response.text
     assert "image_url" in response.text
     assert "http://testserver/v1/chat/completions" in response.text
     assert "Authorization: Bearer API_KEY" in response.text
@@ -584,7 +586,8 @@ groups: {}
         payload = started.json()
         assert payload["pending"] is True
         assert payload["job_id"]
-        assert "curl -sS" in payload["curl_command"]
+        assert "curl -N -sS" in payload["curl_command"]
+        assert '"stream": true' in payload["curl_command"]
         assert "http://testserver/v1/chat/completions" in payload["curl_command"]
         assert "Authorization: Bearer API_KEY" in payload["curl_command"]
         assert "https://vision.example/v1/chat/completions" not in payload["curl_command"]

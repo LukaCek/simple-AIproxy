@@ -427,6 +427,71 @@ groups: {}
     assert "/admin/playground/jobs/" in response.text
 
 
+def test_playground_curl_uses_forwarded_public_https_url(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: vision-provider
+  url: https://vision.example/v1
+  api_key: secret
+  models:
+  - vision-model
+groups: {}
+""".strip() + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    monkeypatch.delenv("AIPROXY_PUBLIC_BASE_URL", raising=False)
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/admin/playground/run",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            headers={"x-forwarded-proto": "https", "x-forwarded-host": "aiproxy.cekluka.com"},
+            data={"provider": "vision-provider", "model": "vision-model", "prompt": "hello"},
+        )
+
+    assert response.status_code == 200
+    curl_command = response.json()["curl_command"]
+    assert "https://aiproxy.cekluka.com/v1/chat/completions" in curl_command
+    assert "http://aiproxy.cekluka.com/v1/chat/completions" not in curl_command
+    assert "Authorization: Bearer API_KEY" in curl_command
+    assert "https://vision.example/v1/chat/completions" not in curl_command
+
+
+def test_playground_curl_can_use_configured_public_base_url(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: vision-provider
+  url: https://vision.example/v1
+  api_key: secret
+  models:
+  - vision-model
+groups: {}
+""".strip() + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    monkeypatch.setenv("AIPROXY_PUBLIC_BASE_URL", "https://aiproxy.cekluka.com/")
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/admin/playground/run",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={"provider": "vision-provider", "model": "vision-model", "prompt": "hello"},
+        )
+
+    assert response.status_code == 200
+    assert "https://aiproxy.cekluka.com/v1/chat/completions" in response.json()["curl_command"]
+
+
 def test_playground_post_accepts_image_and_shows_matching_curl(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yml"
     config_path.write_text(

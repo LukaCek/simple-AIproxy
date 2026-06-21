@@ -1002,7 +1002,17 @@ def build_curl_command(target_url: str, payload: Dict[str, Any], has_auth: bool,
 
 
 def build_aiproxy_chat_completions_url(request: Request) -> str:
-    return str(request.url_for("chat_completions"))
+    configured_base_url = os.getenv("AIPROXY_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if configured_base_url:
+        return f"{configured_base_url}/v1/chat/completions"
+
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    forwarded_host = request.headers.get("x-forwarded-host", "").split(",", 1)[0].strip()
+    forwarded_prefix = request.headers.get("x-forwarded-prefix", "").split(",", 1)[0].strip().rstrip("/")
+
+    scheme = forwarded_proto or request.url.scheme
+    host = forwarded_host or request.headers.get("host") or request.url.netloc
+    return f"{scheme}://{host}{forwarded_prefix}/v1/chat/completions"
 
 
 async def image_upload_to_data_url(image: Optional[UploadFile]) -> tuple[str, str]:

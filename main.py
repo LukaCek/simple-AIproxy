@@ -38,6 +38,8 @@ playground_jobs: Dict[str, Dict[str, Any]] = {}
 playground_jobs_lock = threading.Lock()
 PROVIDER_TEST_TIMEOUT_SECONDS = 3600.0
 UPSTREAM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AIPROXY_UPSTREAM_TIMEOUT_SECONDS", "3600"))
+MIN_COMPLETION_TOKENS = int(os.getenv("AIPROXY_MIN_COMPLETION_TOKENS", "512"))
+OLLAMA_DISABLE_THINKING = os.getenv("AIPROXY_OLLAMA_DISABLE_THINKING", "true").lower() not in {"0", "false", "no"}
 
 admin_security = HTTPBasic()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -373,6 +375,39 @@ def format_provider_exception(exc: Exception) -> str:
     if message:
         return f"{exc.__class__.__name__}: {message}"
     return exc.__class__.__name__
+
+
+def is_ollama_endpoint(endpoint: Dict[str, Any]) -> bool:
+    marker = " ".join(str(endpoint.get(key, "")) for key in ("name", "url", "api_mode", "type", "provider_type"))
+    return "ollama" in marker.lower()
+
+
+def clamp_completion_token_limit(payload: Dict[str, Any]) -> None:
+    if MIN_COMPLETION_TOKENS <= 0:
+        return
+    for field in ("max_tokens", "max_completion_tokens"):
+        value = payload.get(field)
+        if value is None:
+            continue
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < numeric < MIN_COMPLETION_TOKENS:
+            payload[field] = MIN_COMPLETION_TOKENS
+
+
+def prepare_provider_chat_payload(payload: Dict[str, Any], endpoint: Dict[str, Any], provider_model: str) -> Dict[str, Any]:
+    provider_payload = dict(payload)
+    provider_payload["model"] = provider_model
+    clamp_completion_token_limit(provider_payload)
+    # Ollama thinking/reasoning models can spend a small Home Assistant token
+    # budget entirely in `message.reasoning`, then return empty content with
+    # finish_reason=length. Disable thinking by default for OpenAI-compatible
+    # Ollama providers unless the client explicitly requested otherwise.
+    if OLLAMA_DISABLE_THINKING and is_ollama_endpoint(endpoint) and "think" not in provider_payload:
+        provider_payload["think"] = False
+    return provider_payload
 
 
 def extract_prompt(payload: Dict[str, Any]) -> str:
@@ -1626,8 +1661,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     for endpoint in endpoints:
         provider_name = str(endpoint.get("name", "unknown"))
         provider_model = str(endpoint.get("model") or "")
-        provider_payload = dict(payload)
-        provider_payload["model"] = provider_model
+        provider_payload = prepare_provider_chat_payload(payload, endpoint, provider_model)
         try:
             await ensure_provider_token(endpoint)
             api_mode = str(endpoint.get("api_mode", "openai_chat_completions"))

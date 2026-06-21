@@ -143,6 +143,32 @@ def test_direct_provider_model_is_routable_and_logged(tmp_path, monkeypatch):
     assert row["total_ms"] is not None
 
 
+def test_ollama_homeassistant_payload_gets_safe_token_budget_and_no_thinking(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = FakeChatClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {"name": "ollamaVOBLAK", "url": "http://ollama.local/v1", "api_key": "", "models": ["gemma4:26b"]},
+        ],
+        "groups": {},
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "gemma4:26b", "max_tokens": 150, "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 200
+    sent_payload = fake.requests[0].extensions["json_payload"]
+    assert sent_payload["model"] == "gemma4:26b"
+    assert sent_payload["max_tokens"] == main.MIN_COMPLETION_TOKENS
+    assert sent_payload["think"] is False
+
+
 def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch):
     setup_key_db(tmp_path, monkeypatch)
     fake = FakeResponsesClient()

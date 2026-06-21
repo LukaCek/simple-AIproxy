@@ -37,6 +37,7 @@ route_counters_lock = threading.Lock()
 playground_jobs: Dict[str, Dict[str, Any]] = {}
 playground_jobs_lock = threading.Lock()
 PROVIDER_TEST_TIMEOUT_SECONDS = 3600.0
+UPSTREAM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AIPROXY_UPSTREAM_TIMEOUT_SECONDS", "3600"))
 
 admin_security = HTTPBasic()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -314,7 +315,7 @@ async def startup() -> None:
     init_database()
     config_data = load_config()
     http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(30.0, connect=10.0),
+        timeout=httpx.Timeout(UPSTREAM_REQUEST_TIMEOUT_SECONDS, connect=10.0),
         limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
     )
     watchdog_observer = Observer()
@@ -365,6 +366,13 @@ def truncate_text(value: Any, limit: int = 12000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n… [truncated {len(text) - limit} chars]"
+
+
+def format_provider_exception(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message:
+        return f"{exc.__class__.__name__}: {message}"
+    return exc.__class__.__name__
 
 
 def extract_prompt(payload: Dict[str, Any]) -> str:
@@ -1555,7 +1563,7 @@ async def send_responses_adapter(endpoint: Dict[str, Any], payload: Dict[str, An
     model = str(endpoint.get("model") or payload.get("model") or "")
     converted = chat_to_responses_payload(payload, model)
     target_url = resolve_responses_url(endpoint)
-    return await http_client.post(target_url, json=converted, headers=build_provider_headers(endpoint), timeout=60.0)
+    return await http_client.post(target_url, json=converted, headers=build_provider_headers(endpoint), timeout=UPSTREAM_REQUEST_TIMEOUT_SECONDS)
 
 
 async def stream_provider_response(response: httpx.Response):
@@ -1688,8 +1696,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             ended_at, first_ms, total_ms = timing(first_response_at)
             insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
             return Response(content, status_code=response.status_code, media_type=content_type)
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
-            last_error = f"{provider_name} failed: {exc}"
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            last_error = f"{provider_name} failed: {format_provider_exception(exc)}"
             continue
         except Exception as exc:
             last_error = f"{provider_name} unexpected error: {exc}"

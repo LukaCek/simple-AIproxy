@@ -37,8 +37,15 @@ class FakeChatClient:
 class FakeResponsesClient(FakeChatClient):
     async def post(self, url, json=None, headers=None, timeout=None, data=None):
         self.hosts.append(httpx.URL(url).host)
-        self.requests.append({"url": url, "json": json, "headers": headers, "data": data})
+        self.requests.append({"url": url, "json": json, "headers": headers, "data": data, "timeout": timeout})
         return httpx.Response(200, json={"output_text": "responses ok"}, request=httpx.Request("POST", url))
+
+
+class TimeoutChatClient(FakeChatClient):
+    async def send(self, request, stream=False):
+        self.hosts.append(request.url.host)
+        self.requests.append(request)
+        raise httpx.ReadTimeout("", request=request)
 
 
 def setup_key_db(tmp_path: Path, monkeypatch):
@@ -178,6 +185,35 @@ def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch
     assert fake.requests[0]["json"]["instructions"] == "You are a helpful assistant."
     assert fake.requests[0]["json"]["store"] is False
     assert fake.requests[0]["json"]["stream"] is True
+    assert fake.requests[0]["timeout"] == main.UPSTREAM_REQUEST_TIMEOUT_SECONDS
+
+
+def test_provider_timeout_logs_exception_class(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = TimeoutChatClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    main.config_data = {
+        "providers": [{"name": "ollamaVOBLAK", "url": "http://ollama.local/v1", "api_key": "", "models": ["gemma4:26b"]}],
+        "groups": {},
+    }
+
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = {
+            "providers": [{"name": "ollamaVOBLAK", "url": "http://ollama.local/v1", "api_key": "", "models": ["gemma4:26b"]}],
+            "groups": {},
+        }
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "gemma4:26b", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 502
+    with sqlite3.connect(tmp_path / "app.db") as conn:
+        row = conn.execute("SELECT error, status_code FROM Logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row[1] == 502
+    assert row[0] == "ollamaVOBLAK failed: ReadTimeout"
 
 
 def test_extract_response_text_from_responses_sse_prefers_delta_once():

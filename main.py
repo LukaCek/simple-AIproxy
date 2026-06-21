@@ -38,8 +38,8 @@ playground_jobs: Dict[str, Dict[str, Any]] = {}
 playground_jobs_lock = threading.Lock()
 PROVIDER_TEST_TIMEOUT_SECONDS = 3600.0
 UPSTREAM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AIPROXY_UPSTREAM_TIMEOUT_SECONDS", "3600"))
-MIN_COMPLETION_TOKENS = int(os.getenv("AIPROXY_MIN_COMPLETION_TOKENS", "512"))
-OLLAMA_DISABLE_THINKING = os.getenv("AIPROXY_OLLAMA_DISABLE_THINKING", "true").lower() not in {"0", "false", "no"}
+MIN_COMPLETION_TOKENS = int(os.getenv("AIPROXY_MIN_COMPLETION_TOKENS", "1024"))
+OLLAMA_DISABLE_THINKING = os.getenv("AIPROXY_OLLAMA_DISABLE_THINKING", "false").lower() not in {"0", "false", "no"}
 
 admin_security = HTTPBasic()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -403,8 +403,9 @@ def prepare_provider_chat_payload(payload: Dict[str, Any], endpoint: Dict[str, A
     clamp_completion_token_limit(provider_payload)
     # Ollama thinking/reasoning models can spend a small Home Assistant token
     # budget entirely in `message.reasoning`, then return empty content with
-    # finish_reason=length. Disable thinking by default for OpenAI-compatible
-    # Ollama providers unless the client explicitly requested otherwise.
+    # finish_reason=length. Keep thinking enabled by default and solve the HA
+    # issue by raising tiny token limits; operators can still opt out with
+    # AIPROXY_OLLAMA_DISABLE_THINKING=true.
     if OLLAMA_DISABLE_THINKING and is_ollama_endpoint(endpoint) and "think" not in provider_payload:
         provider_payload["think"] = False
     return provider_payload

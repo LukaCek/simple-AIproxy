@@ -63,6 +63,29 @@ def test_admin_keys_page_renders_with_current_starlette_template_api(tmp_path, m
 
     assert response.status_code == 200
     assert "API Keys" in response.text
+    assert "Remove" in response.text or "No API keys created yet" in response.text
+
+
+def test_admin_api_key_remove_button_deletes_virtual_key(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = {"providers": [], "groups": {}}
+    main.init_database()
+    token = main.create_api_key("virtual-test-key")
+    key_id = main.list_api_keys()[0]["id"]
+
+    with TestClient(main.app) as client:
+        page = client.get("/admin/keys", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+        delete_response = client.post(f"/admin/keys/{key_id}/delete", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD), follow_redirects=False)
+
+    assert page.status_code == 200
+    assert "virtual-test-key" in page.text
+    assert f"/admin/keys/{key_id}/delete" in page.text
+    assert "Remove" in page.text
+    assert delete_response.status_code == 303
+    assert main.get_api_key_record(token) is None
 
 
 def test_admin_providers_page_renders_codex_import_form(tmp_path, monkeypatch):
@@ -80,7 +103,58 @@ def test_admin_providers_page_renders_codex_import_form(tmp_path, monkeypatch):
     assert "/admin/providers/codex-token" in response.text
     assert "data-test-provider=\"ollama-provider-form\"" in response.text
     assert "data-test-provider=\"openai-provider-form\"" in response.text
+    assert "id=\"test-all-providers\"" in response.text
     assert "/admin/providers/test" in response.text
+    assert "/admin/providers/test-all" in response.text
+
+
+async def fake_configured_provider_model_test(provider_name, model_name, prompt, image_data_url=""):
+    return {
+        "success": True,
+        "provider": provider_name,
+        "model": model_name,
+        "status_code": 200,
+        "response": "OK",
+        "assistant_text": "OK",
+    }
+
+
+def test_admin_providers_test_all_endpoint_checks_configured_providers(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: groq
+  url: https://api.groq.com/openai/v1
+  api_key: test-key
+  models: [llama-3.1-8b-instant]
+- name: codex-ui
+  url: https://chatgpt.com/backend-api/codex
+  api_key: access-token
+  access_token: access-token
+  refresh_token: refresh-token
+  models: [gpt-5.5]
+  api_mode: codex_responses
+  oauth: true
+groups: {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    monkeypatch.setattr(main, "test_provider_model", fake_configured_provider_model_test)
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.post("/admin/providers/test-all", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD), data={"prompt": "Reply with OK."})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["summary"] == {"total": 2, "passed": 2, "failed": 0}
+    assert [result["provider"] for result in body["results"]] == ["groq", "codex-ui"]
+    assert [result["model"] for result in body["results"]] == ["llama-3.1-8b-instant", "gpt-5.5"]
 
 
 def test_admin_providers_page_shows_codex_oauth_status_and_reauthenticate(tmp_path, monkeypatch):

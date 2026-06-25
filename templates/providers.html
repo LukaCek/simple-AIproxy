@@ -7,7 +7,9 @@
         <h2 class="text-xl font-semibold text-slate-900">Providers</h2>
         <p class="mt-1 text-sm text-slate-500">Manage configured provider endpoints and their supported model names.</p>
       </div>
+      <button type="button" id="test-all-providers" class="inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100">Test all providers</button>
     </div>
+    <div id="all-providers-test-result" class="mt-4 hidden rounded-2xl border p-4 text-sm"></div>
     {% if message %}
     <div class="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
       {{ message }}
@@ -174,9 +176,18 @@
   </section>
 </div>
 <script>
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
   function renderProviderTestResult(target, data, ok) {
-    const model = data.model ? ` / model: ${data.model}` : '';
-    const status = data.status_code ? `HTTP ${data.status_code}` : 'No status';
+    const model = data.model ? ` / model: ${escapeHtml(data.model)}` : '';
+    const status = data.status_code ? `HTTP ${escapeHtml(data.status_code)}` : 'No status';
     const response = data.response ? String(data.response) : '';
     target.className = `rounded-2xl border p-4 text-sm ${ok ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-rose-200 bg-rose-50 text-rose-900'}`;
     target.innerHTML = `
@@ -217,9 +228,71 @@
     }
   }
 
+  function renderAllProvidersTestResult(target, data, ok) {
+    const summary = data.summary || {total: 0, passed: 0, failed: 0};
+    const results = data.results || [];
+    target.className = `mt-4 rounded-2xl border p-4 text-sm ${ok ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-amber-200 bg-amber-50 text-amber-950'}`;
+    const rows = results.map((result) => {
+      const status = result.status_code ? `HTTP ${escapeHtml(result.status_code)}` : 'No status';
+      const model = result.model ? ` · ${escapeHtml(result.model)}` : '';
+      const response = result.assistant_text || result.response || '';
+      return `
+        <div class="rounded-xl bg-white/70 p-3">
+          <div class="font-semibold">${result.success ? '✅' : '❌'} ${escapeHtml(result.provider || 'unknown')}${model} — ${status}</div>
+          <pre class="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-xs"></pre>
+        </div>
+      `;
+    }).join('');
+    target.innerHTML = `
+      <div class="font-semibold">Provider health: ${summary.passed}/${summary.total} passed, ${summary.failed} failed</div>
+      <div class="mt-3 grid gap-3">${rows || '<div>No providers configured.</div>'}</div>
+    `;
+    target.querySelectorAll('pre').forEach((pre, index) => {
+      const result = results[index] || {};
+      pre.textContent = String(result.assistant_text || result.response || '').slice(0, 4000);
+    });
+  }
+
+  async function testAllProviders(button) {
+    const target = document.getElementById('all-providers-test-result');
+    if (!target) return;
+    target.className = 'mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700';
+    target.textContent = 'Testing all providers...';
+    button.disabled = true;
+    const previousText = button.textContent;
+    button.textContent = 'Testing all...';
+    try {
+      const body = new FormData();
+      body.append('prompt', 'Reply with OK.');
+      const response = await fetch('/admin/providers/test-all', {
+        method: 'POST',
+        credentials: 'same-origin',
+        body,
+        headers: {'Accept': 'application/json'},
+      });
+      let data;
+      try {
+        data = await response.json();
+      } catch (error) {
+        data = {summary: {total: 0, passed: 0, failed: 1}, results: [{success: false, provider: 'request', status_code: response.status, response: await response.text()}]};
+      }
+      renderAllProvidersTestResult(target, data, response.ok && data.success);
+    } catch (error) {
+      renderAllProvidersTestResult(target, {summary: {total: 1, passed: 0, failed: 1}, results: [{success: false, provider: 'request', response: String(error)}]}, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
+    }
+  }
+
   document.querySelectorAll('[data-test-provider]').forEach((button) => {
     button.addEventListener('click', () => testProviderForm(button.dataset.testProvider, button.dataset.testResult, button));
   });
+
+  const testAllButton = document.getElementById('test-all-providers');
+  if (testAllButton) {
+    testAllButton.addEventListener('click', () => testAllProviders(testAllButton));
+  }
 
   async function deleteProvider(name) {
     if (!confirm(`Delete provider '${name}'? This cannot be undone.`)) {

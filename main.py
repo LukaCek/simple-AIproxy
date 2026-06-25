@@ -1,4 +1,5 @@
 import os
+import asyncio
 import base64
 import hashlib
 import sqlite3
@@ -357,7 +358,7 @@ async def validate_api_key(request: Request) -> sqlite3.Row:
 def list_api_keys() -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT name, key, created_at FROM API_Keys ORDER BY created_at DESC")
+        cursor.execute("SELECT id, name, key, created_at FROM API_Keys ORDER BY created_at DESC")
         return [dict(row) for row in cursor.fetchall()]
 
 
@@ -547,6 +548,15 @@ def create_api_key(name: str) -> str:
         cursor.execute("INSERT INTO API_Keys (name, key, created_at) VALUES (?, ?, ?)", (name.strip(), token, datetime.utcnow().isoformat()))
         conn.commit()
     return token
+
+
+def delete_api_key(key_id: int) -> None:
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM API_Keys WHERE id = ?", (key_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"API key '{key_id}' not found")
+        conn.commit()
 
 
 def oauth_provider_connected(provider: Dict[str, Any]) -> bool:
@@ -1333,6 +1343,45 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
         return {"success": False, "provider": provider_name, "status_code": 500, "response": message, "assistant_text": message, "curl_command": curl_command}
 
 
+async def test_all_provider_models(prompt: str = "Reply with OK.") -> Dict[str, Any]:
+    """Run a tiny playground-style health check against every configured provider.
+
+    Each provider is tested with its first configured model so the admin can
+    quickly see which providers are usable without opening Playground one by one.
+    Tests run concurrently and use the same adapter path as Admin Playground,
+    including Codex Responses/OAuth handling and normal request logging.
+    """
+    coroutines = []
+    results: List[Dict[str, Any]] = []
+    for provider in get_providers():
+        provider_name = str(provider.get("name") or "")
+        models = provider.get("models") or []
+        model_name = str(models[0]) if models else ""
+        if not provider_name or not model_name:
+            results.append({
+                "success": False,
+                "provider": provider_name or "unknown",
+                "model": model_name,
+                "status_code": 400,
+                "response": "Provider has no configured model to test.",
+            })
+            continue
+        coroutines.append(test_provider_model(provider_name, model_name, prompt))
+
+    if not results and not coroutines:
+        return {"success": False, "summary": {"total": 0, "passed": 0, "failed": 0}, "results": []}
+
+    raw_results = await asyncio.gather(*coroutines, return_exceptions=True) if coroutines else []
+    for result in raw_results:
+        if isinstance(result, BaseException):
+            results.append({"success": False, "provider": "unknown", "status_code": 500, "response": str(result)})
+        else:
+            results.append(result)
+    passed = sum(1 for result in results if result.get("success"))
+    summary = {"total": len(results), "passed": passed, "failed": len(results) - passed}
+    return {"success": summary["failed"] == 0, "summary": summary, "results": results}
+
+
 async def test_provider_candidate(name: str, base_url: str, api_key: str, models_text: str, prompt: str = "Reply with OK.") -> Dict[str, Any]:
     """Test an unsaved OpenAI-compatible provider candidate from the admin form."""
     clean_name = name.strip() or "candidate-provider"
@@ -1973,6 +2022,12 @@ async def admin_keys_new(name: str = Form(...)) -> RedirectResponse:
     return RedirectResponse(url="/admin/keys", status_code=status.HTTP_303_SEE_OTHER)
 
 
+@app.post("/admin/keys/{key_id}/delete", dependencies=[Depends(verify_admin)])
+async def admin_keys_delete(key_id: int) -> RedirectResponse:
+    delete_api_key(key_id)
+    return RedirectResponse(url="/admin/keys", status_code=status.HTTP_303_SEE_OTHER)
+
+
 @app.get("/admin/logs", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_logs(request: Request) -> Any:
     return templates.TemplateResponse(request=request, name="logs.html", context={"logs": list_logs()})
@@ -2191,6 +2246,12 @@ async def admin_providers_test(
 ) -> JSONResponse:
     result = await test_provider_candidate(name=name, base_url=base_url, api_key=api_key, models_text=models, prompt=prompt)
     return JSONResponse(result, status_code=200 if result.get("success") else 400)
+
+
+@app.post("/admin/providers/test-all", dependencies=[Depends(verify_admin)])
+async def admin_providers_test_all(prompt: str = Form("Reply with OK.")) -> JSONResponse:
+    result = await test_all_provider_models(prompt=prompt)
+    return JSONResponse(result, status_code=200 if result.get("success") else 207)
 
 
 @app.post("/admin/providers", dependencies=[Depends(verify_admin)])

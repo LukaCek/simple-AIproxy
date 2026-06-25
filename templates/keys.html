@@ -15,6 +15,7 @@
             <th class="px-4 py-3 font-semibold text-slate-700">Name</th>
             <th class="px-4 py-3 font-semibold text-slate-700">API Key</th>
             <th class="px-4 py-3 font-semibold text-slate-700">Created</th>
+            <th class="px-4 py-3 font-semibold text-slate-700">Actions</th>
           </tr>
         </thead>
         <tbody class="divide-y divide-slate-200">
@@ -23,10 +24,15 @@
             <td class="px-4 py-4 text-slate-700">{{ key.name }}</td>
             <td class="px-4 py-4 break-all text-slate-900">{{ key.key }}</td>
             <td class="px-4 py-4 text-slate-500">{{ key.created_at }}</td>
+            <td class="px-4 py-4">
+              <form action="/admin/keys/{{ key.id }}/delete" method="post" class="inline" onsubmit="return confirm('Remove API key {{ key.name | e }}? This cannot be undone.');">
+                <button type="submit" class="rounded-2xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-rose-700">Remove</button>
+              </form>
+            </td>
           </tr>
           {% else %}
           <tr>
-            <td colspan="3" class="px-4 py-6 text-center text-slate-500">No API keys created yet.</td>
+            <td colspan="4" class="px-4 py-6 text-center text-slate-500">No API keys created yet.</td>
           </tr>
           {% endfor %}
         </tbody>

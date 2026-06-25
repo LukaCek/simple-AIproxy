@@ -83,6 +83,42 @@ def test_admin_providers_page_renders_codex_import_form(tmp_path, monkeypatch):
     assert "/admin/providers/test" in response.text
 
 
+def test_admin_providers_page_shows_codex_oauth_status_and_reauthenticate(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: codex-connected
+  url: https://chatgpt.com/backend-api/codex
+  models: [gpt-5.5]
+  api_mode: codex_responses
+  oauth: true
+  access_token: access-token
+  refresh_token: refresh-token
+- name: codex-disconnected
+  url: https://chatgpt.com/backend-api/codex
+  models: [gpt-5.5]
+  api_mode: codex_responses
+  oauth: true
+groups: {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/providers", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert response.status_code == 200
+    assert "Connected" in response.text
+    assert "Paste tokens in config" not in response.text
+    assert "Reauthenticate" in response.text
+    assert 'name="replace_existing" value="true"' in response.text
+
+
 async def fake_provider_test(**kwargs):
     return {
         "success": True,

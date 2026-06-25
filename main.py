@@ -549,12 +549,32 @@ def create_api_key(name: str) -> str:
     return token
 
 
+def oauth_provider_connected(provider: Dict[str, Any]) -> bool:
+    """Return whether an OAuth provider has usable server-side credentials.
+
+    A provider counts as connected when it has a non-expired access token/api_key,
+    or when it has a refresh token that can mint a new access token on demand.
+    """
+    access_token = str(provider.get("access_token") or provider.get("api_key") or "").strip()
+    refresh_token = str(provider.get("refresh_token") or "").strip()
+    if refresh_token:
+        return True
+    if not access_token:
+        return False
+    expires_at = parse_expires_at(provider.get("expires_at"))
+    if expires_at is not None and expires_at <= time.time():
+        return False
+    return True
+
+
 def get_providers() -> List[Dict[str, Any]]:
     providers_list: List[Dict[str, Any]] = []
     with config_lock:
         for provider in config_data.get("providers", []):
             if not isinstance(provider, dict):
                 continue
+            oauth_connected = oauth_provider_connected(provider) if provider.get("oauth") else False
+            api_mode = provider.get("api_mode", "openai_chat_completions")
             providers_list.append(
                 {
                     "name": provider.get("name", ""),
@@ -563,11 +583,14 @@ def get_providers() -> List[Dict[str, Any]]:
                     "description": provider.get("description", ""),
                     "models": provider.get("models", []),
                     "oauth": bool(provider.get("oauth")),
+                    "oauth_connected": oauth_connected,
+                    "oauth_needs_reauth": bool(provider.get("oauth")) and not oauth_connected,
                     "authorize_url": provider.get("authorize_url", ""),
                     "token_url": provider.get("token_url", ""),
                     "redirect_uri": provider.get("redirect_uri", ""),
                     "access_token": provider.get("access_token", ""),
-                    "api_mode": provider.get("api_mode", "openai_chat_completions"),
+                    "api_mode": api_mode,
+                    "is_codex_oauth": bool(provider.get("oauth")) and api_mode == "codex_responses",
                     "expires_at": provider.get("expires_at", ""),
                 }
             )
@@ -858,31 +881,55 @@ def ensure_group_member(group_name: str, provider_name: str, model_name: str, de
         save_config(data)
 
 
-def add_codex_profile(name: str, access_token: str = "", refresh_token: str = "", description: str = "") -> None:
+def upsert_codex_profile(name: str, access_token: str = "", refresh_token: str = "", description: str = "") -> None:
     base_provider = get_default_codex_provider()
     clean_name = name.strip()
     if not clean_name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Codex profile name is required")
-    add_provider(
-        name=clean_name,
-        base_url=base_provider["url"],
-        api_key=access_token.strip(),
-        description=description.strip() or base_provider["description"],
-        models=base_provider["models"],
-        extra={
-            "api_mode": base_provider["api_mode"],
-            "oauth": base_provider["oauth"],
-            "client_id": base_provider["client_id"],
-            "client_secret": base_provider["client_secret"],
-            "authorize_url": base_provider["authorize_url"],
-            "token_url": base_provider["token_url"],
-            "redirect_uri": base_provider["redirect_uri"],
-            "scopes": base_provider["scopes"],
-            "access_token": access_token.strip(),
-            "refresh_token": refresh_token.strip(),
-            "expires_at": "",
-        },
-    )
+    clean_access_token = access_token.strip()
+    clean_refresh_token = refresh_token.strip()
+    clean_description = description.strip() or base_provider["description"]
+    existing = find_provider(clean_name)
+    if existing is None:
+        add_provider(
+            name=clean_name,
+            base_url=base_provider["url"],
+            api_key=clean_access_token,
+            description=clean_description,
+            models=base_provider["models"],
+            extra={
+                "api_mode": base_provider["api_mode"],
+                "oauth": base_provider["oauth"],
+                "client_id": base_provider["client_id"],
+                "client_secret": base_provider["client_secret"],
+                "authorize_url": base_provider["authorize_url"],
+                "token_url": base_provider["token_url"],
+                "redirect_uri": base_provider["redirect_uri"],
+                "scopes": base_provider["scopes"],
+                "access_token": clean_access_token,
+                "refresh_token": clean_refresh_token,
+                "expires_at": "",
+            },
+        )
+    else:
+        with config_lock:
+            existing["url"] = existing.get("url") or base_provider["url"]
+            existing["description"] = clean_description
+            existing["models"] = base_provider["models"]
+            existing["api_mode"] = base_provider["api_mode"]
+            existing["oauth"] = base_provider["oauth"]
+            existing["client_id"] = existing.get("client_id") or base_provider["client_id"]
+            existing["client_secret"] = existing.get("client_secret") or base_provider["client_secret"]
+            existing["authorize_url"] = existing.get("authorize_url") or base_provider["authorize_url"]
+            existing["token_url"] = existing.get("token_url") or base_provider["token_url"]
+            existing["redirect_uri"] = existing.get("redirect_uri") or base_provider["redirect_uri"]
+            existing["scopes"] = existing.get("scopes") or base_provider["scopes"]
+            existing["access_token"] = clean_access_token
+            existing["api_key"] = clean_access_token
+            if clean_refresh_token:
+                existing["refresh_token"] = clean_refresh_token
+            existing["expires_at"] = ""
+            save_config(config_data)
     ensure_group_member(
         "gpt-5.5",
         clean_name,
@@ -890,6 +937,12 @@ def add_codex_profile(name: str, access_token: str = "", refresh_token: str = ""
         description="Balanced Codex pool for Hermes/OpenAI-compatible clients",
         strategy="round_robin",
     )
+
+
+def add_codex_profile(name: str, access_token: str = "", refresh_token: str = "", description: str = "") -> None:
+    if find_provider(name.strip()) is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider '{name.strip()}' already exists")
+    upsert_codex_profile(name=name, access_token=access_token, refresh_token=refresh_token, description=description)
 
 
 def delete_provider(name: str) -> None:
@@ -1843,11 +1896,16 @@ def admin_providers(request: Request, message: Optional[str] = None) -> Any:
 
 
 @app.post("/admin/providers/codex-device/start", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
-async def admin_providers_codex_device_start(request: Request, name: str = Form(...), description: str = Form("")) -> Any:
+async def admin_providers_codex_device_start(
+    request: Request,
+    name: str = Form(...),
+    description: str = Form(""),
+    replace_existing: bool = Form(False),
+) -> Any:
     clean_name = name.strip()
     if not clean_name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Codex profile name is required")
-    if find_provider(clean_name) is not None:
+    if find_provider(clean_name) is not None and not replace_existing:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Provider '{clean_name}' already exists")
     client_id = get_default_codex_provider()["client_id"]
     device = await request_codex_device_code(client_id)
@@ -1862,6 +1920,7 @@ async def admin_providers_codex_device_start(request: Request, name: str = Form(
         "device_auth_id": device["device_auth_id"],
         "user_code": device["user_code"],
         "interval": device["interval"],
+        "replace_existing": replace_existing,
     }
     return templates.TemplateResponse(
         request=request,
@@ -1893,14 +1952,15 @@ async def admin_providers_codex_device_status(login_id: str) -> JSONResponse:
     if not authorization_code or not code_verifier:
         raise HTTPException(status_code=502, detail=f"Codex device auth response missing authorization_code/code_verifier: {code_resp}")
     tokens = await exchange_codex_device_code(state_data["client_id"], authorization_code, code_verifier)
-    add_codex_profile(
+    upsert_codex_profile(
         name=state_data["provider"],
         access_token=tokens.get("access_token", ""),
         refresh_token=tokens.get("refresh_token", ""),
         description=state_data.get("description", ""),
     )
     oauth_state_store.pop(login_id, None)
-    return JSONResponse({"status": "complete", "message": f"Codex profile '{state_data['provider']}' logged in and added to gpt-5.5."})
+    action = "re-authenticated" if state_data.get("replace_existing") else "logged in and added"
+    return JSONResponse({"status": "complete", "message": f"Codex profile '{state_data['provider']}' {action} for gpt-5.5."})
 
 
 @app.post("/admin/providers/codex-token", response_class=RedirectResponse, dependencies=[Depends(verify_admin)])

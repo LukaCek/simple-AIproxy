@@ -741,6 +741,86 @@ groups: {}
     assert "/admin/playground/jobs/" in response.text
 
 
+def test_admin_playground_page_lists_groups_as_test_targets(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: vision-provider
+  url: https://vision.example/v1
+  api_key: secret
+  models:
+  - vision-model
+groups:
+  smart-group:
+    strategy: fallback
+    members:
+    - provider: vision-provider
+      model: vision-model
+""".strip() + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/playground", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert response.status_code == 200
+    assert "Provider or group" in response.text
+    assert 'value="provider:vision-provider"' in response.text
+    assert 'value="group:smart-group"' in response.text
+    assert "Group: smart-group" in response.text
+    assert '"group:smart-group": ["smart-group"]' in response.text
+
+
+def test_playground_group_async_run_uses_group_alias_and_routes_to_member(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: vision-provider
+  url: https://vision.example/v1
+  api_key: secret
+  models:
+  - vision-model
+groups:
+  smart-group:
+    strategy: fallback
+    members:
+    - provider: vision-provider
+      model: vision-model
+""".strip() + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+    main.playground_jobs.clear()
+    fake = FakeProviderTestClient()
+
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        started = client.post(
+            "/admin/playground/run",
+            auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD),
+            data={"provider": "group:smart-group", "model": "smart-group", "prompt": "hello group"},
+        )
+        assert started.status_code == 200
+        payload = started.json()
+        completed = client.get(f"/admin/playground/jobs/{payload['job_id']}", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert '"model": "smart-group"' in payload["curl_command"]
+    assert completed.status_code == 200
+    completed_payload = completed.json()
+    assert completed_payload["status"] == "done"
+    assert completed_payload["provider"] == "vision-provider"
+    assert completed_payload["target_type"] == "group"
+    assert fake.calls[0]["json"]["model"] == "vision-model"
+    assert fake.calls[0]["json"]["messages"][0]["content"] == "hello group"
+
+
 def test_playground_curl_uses_forwarded_public_https_url(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yml"
     config_path.write_text(

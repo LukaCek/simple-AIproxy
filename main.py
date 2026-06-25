@@ -1173,13 +1173,37 @@ async def image_upload_to_data_url(image: Optional[UploadFile]) -> tuple[str, st
     return f"data:{content_type};base64,{encoded}", image.filename
 
 
-def build_playground_curl_for_provider(provider_name: str, model_name: str, prompt: str, image_data_url: str = "", proxy_url: str = "/v1/chat/completions") -> str:
-    provider = find_provider(provider_name)
-    if provider is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{provider_name}' not found")
-    if not model_name or model_name not in provider.get("models", []):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_name}' is not configured for provider '{provider_name}'")
-    payload = {"model": model_name, "messages": build_playground_messages(prompt, image_data_url), "stream": True}
+def parse_playground_target(target: str) -> tuple[str, str]:
+    if ":" in target:
+        target_type, target_name = target.split(":", 1)
+        target_type = target_type.strip()
+        target_name = target_name.strip()
+        if target_type in {"provider", "group"} and target_name:
+            return target_type, target_name
+    return "provider", target.strip()
+
+
+def playground_target_value(target_type: str, target_name: str) -> str:
+    return f"{target_type}:{target_name}"
+
+
+def build_playground_curl_for_target(target: str, model_name: str, prompt: str, image_data_url: str = "", proxy_url: str = "/v1/chat/completions") -> str:
+    target_type, target_name = parse_playground_target(target)
+    if target_type == "group":
+        groups = {group["name"]: group for group in get_groups()}
+        if target_name not in groups:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model group '{target_name}' not found")
+        if model_name != target_name:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Group playground model must be '{target_name}'")
+        payload_model = target_name
+    else:
+        provider = find_provider(target_name)
+        if provider is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{target_name}' not found")
+        if not model_name or model_name not in provider.get("models", []):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_name}' is not configured for provider '{target_name}'")
+        payload_model = model_name
+    payload = {"model": payload_model, "messages": build_playground_messages(prompt, image_data_url), "stream": True}
     return build_curl_command(proxy_url, payload, True)
 
 
@@ -1204,9 +1228,9 @@ def prune_playground_jobs(max_age_seconds: int = 3600) -> None:
                 playground_jobs.pop(job_id, None)
 
 
-async def run_playground_job(job_id: str, provider: str, model: str, prompt: str, image_data_url: str) -> None:
+async def run_playground_job(job_id: str, target: str, model: str, prompt: str, image_data_url: str) -> None:
     try:
-        response = await test_provider_model(provider, model, prompt, image_data_url=image_data_url)
+        response = await test_playground_target(target, model, prompt, image_data_url=image_data_url)
         set_playground_job(job_id, {
             "status": "done",
             "success": bool(response.get("success")),
@@ -1214,6 +1238,8 @@ async def run_playground_job(job_id: str, provider: str, model: str, prompt: str
             "assistant_text": response.get("assistant_text") or response.get("response"),
             "status_code": response.get("status_code"),
             "provider": response.get("provider"),
+            "target": target,
+            "target_type": response.get("target_type"),
             "error": None if response.get("success") else response.get("response"),
         })
     except Exception as exc:
@@ -1223,8 +1249,16 @@ async def run_playground_job(job_id: str, provider: str, model: str, prompt: str
             "result": str(exc),
             "assistant_text": str(exc),
             "status_code": 500,
+            "target": target,
             "error": str(exc),
         })
+
+
+async def test_playground_target(target: str, model_name: str, prompt: str, image_data_url: str = "") -> Dict[str, Any]:
+    target_type, target_name = parse_playground_target(target)
+    if target_type == "group":
+        return await test_group_model(target_name, model_name, prompt, image_data_url=image_data_url)
+    return await test_provider_model(target_name, model_name, prompt, image_data_url=image_data_url)
 
 
 async def test_provider_model(provider_name: str, model_name: str, prompt: str, image_data_url: str = "") -> Dict[str, Any]:
@@ -1341,6 +1375,109 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
         message = str(exc)
         finish_log(500, model_name, error=message)
         return {"success": False, "provider": provider_name, "status_code": 500, "response": message, "assistant_text": message, "curl_command": curl_command}
+
+
+async def test_group_model(group_name: str, model_name: str, prompt: str, image_data_url: str = "") -> Dict[str, Any]:
+    if model_name != group_name:
+        message = f"Group playground model must be '{group_name}'"
+        return {"success": False, "provider": f"group:{group_name}", "target_type": "group", "status_code": 400, "response": message, "assistant_text": message}
+    payload = {"model": group_name, "messages": build_playground_messages(prompt, image_data_url)}
+    prompt_text = truncate_text(prompt + ("\n[image attached]" if image_data_url else ""))
+    started_monotonic = time.monotonic()
+    started_at = datetime.utcnow().isoformat()
+    try:
+        endpoints = resolve_group(group_name)
+    except HTTPException as exc:
+        message = str(exc.detail)
+        insert_log(None, "Admin Playground", group_name, group_name, f"group:{group_name}", group_name, int(exc.status_code or 500), started_at, None, datetime.utcnow().isoformat(), None, (time.monotonic() - started_monotonic) * 1000, prompt_text, None, message)
+        return {"success": False, "provider": f"group:{group_name}", "target_type": "group", "status_code": int(exc.status_code or 500), "response": message, "assistant_text": message}
+
+    last_error = ""
+    for endpoint in endpoints:
+        provider_name = str(endpoint.get("name") or "unknown")
+        provider_model = str(endpoint.get("model") or group_name)
+        endpoint_payload = dict(payload)
+        endpoint_payload["model"] = provider_model
+        api_mode = str(endpoint.get("api_mode", "openai_chat_completions"))
+        first_response_at: Optional[str] = None
+
+        def finish_log(status_code_value: int, output: Optional[str] = None, error: Optional[str] = None) -> None:
+            ended_at = datetime.utcnow().isoformat()
+            first_ms: Optional[float] = None
+            if first_response_at:
+                try:
+                    first_ms = (datetime.fromisoformat(first_response_at) - datetime.fromisoformat(started_at)).total_seconds() * 1000
+                except Exception:
+                    first_ms = None
+            total_ms = (time.monotonic() - started_monotonic) * 1000
+            try:
+                insert_log(None, "Admin Playground", group_name, group_name, provider_name, provider_model, status_code_value, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output, error)
+            except Exception:
+                pass
+
+        try:
+            await ensure_provider_token(endpoint)
+            if api_mode in {"openai_responses", "codex_responses"}:
+                response = await send_responses_adapter(endpoint, endpoint_payload)
+                first_response_at = datetime.utcnow().isoformat()
+                text = response.content.decode("utf-8", errors="replace")
+                content_type = response.headers.get("content-type", "")
+                if api_mode == "codex_responses" and response_indicates_token_expired(response.status_code, text):
+                    error_text = codex_reauth_message(provider_name)
+                    mark_provider_reauth_required(provider_name, error_text)
+                    finish_log(response.status_code, error=error_text)
+                    last_error = error_text
+                    continue
+                if response.status_code == 200 and not looks_like_html_response(text, content_type):
+                    try:
+                        parsed = response.json()
+                        output = json.dumps(parsed, indent=2, ensure_ascii=False)
+                        assistant_text = extract_response_text(parsed)
+                    except Exception:
+                        assistant_text = extract_response_text_from_sse(text) or text
+                        output = text
+                    finish_log(response.status_code, output=assistant_text or output)
+                    return {"success": True, "provider": provider_name, "target_type": "group", "status_code": response.status_code, "response": output, "assistant_text": assistant_text}
+                error_text = provider_html_error(api_mode, text) if looks_like_html_response(text, content_type) else text
+                finish_log(response.status_code, error=error_text)
+                if response.status_code == 429 or 500 <= response.status_code < 600:
+                    last_error = f"{provider_name} returned {response.status_code}: {error_text}"
+                    continue
+                return {"success": False, "provider": provider_name, "target_type": "group", "status_code": response.status_code, "response": error_text, "assistant_text": error_text}
+
+            if http_client is None:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="HTTP client is not initialized")
+            target_url = resolve_endpoint_url(endpoint)
+            headers = build_provider_headers(endpoint)
+            async with http_client.stream("POST", target_url, json=endpoint_payload, headers=headers, timeout=PROVIDER_TEST_TIMEOUT_SECONDS) as response:
+                body = await response.aread()
+                first_response_at = datetime.utcnow().isoformat()
+                text = body.decode("utf-8", errors="replace")
+                content_type = response.headers.get("content-type", "")
+                if response.status_code == 200 and not looks_like_html_response(text, content_type):
+                    try:
+                        parsed = json.loads(text)
+                        output = json.dumps(parsed, indent=2, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        output = text
+                    assistant_text = extract_chat_message_text(text)
+                    finish_log(response.status_code, output=assistant_text or output)
+                    return {"success": True, "provider": provider_name, "target_type": "group", "status_code": response.status_code, "response": output, "assistant_text": assistant_text}
+                error_text = provider_html_error(api_mode, text) if looks_like_html_response(text, content_type) else text
+                finish_log(response.status_code, error=error_text)
+                if response.status_code == 429 or 500 <= response.status_code < 600:
+                    last_error = f"{provider_name} returned {response.status_code}: {error_text}"
+                    continue
+                return {"success": False, "provider": provider_name, "target_type": "group", "status_code": response.status_code, "response": error_text, "assistant_text": error_text}
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
+            last_error = f"{provider_name} failed: {format_provider_exception(exc)}"
+            finish_log(502, error=last_error)
+            continue
+        except Exception as exc:
+            last_error = f"{provider_name} unexpected error: {exc}"
+            finish_log(500, error=last_error)
+            continue
+    return {"success": False, "provider": f"group:{group_name}", "target_type": "group", "status_code": 502, "response": last_error or "All group endpoints failed", "assistant_text": last_error or "All group endpoints failed"}
 
 
 async def test_all_provider_models(prompt: str = "Reply with OK.") -> Dict[str, Any]:
@@ -2311,6 +2448,7 @@ def admin_playground(request: Request, result: Optional[str] = None, provider: O
         name="playground.html",
         context={
             "providers": get_providers(),
+            "groups": get_groups(),
             "result": result,
             "provider": provider,
             "selected_provider": provider,
@@ -2331,7 +2469,7 @@ async def admin_playground_run_async(
 ) -> JSONResponse:
     prune_playground_jobs()
     image_data_url, image_filename = await image_upload_to_data_url(image)
-    curl_command = build_playground_curl_for_provider(
+    curl_command = build_playground_curl_for_target(
         provider,
         model,
         prompt,
@@ -2388,8 +2526,8 @@ async def admin_playground_run(
 ) -> Any:
     try:
         image_data_url, image_filename = await image_upload_to_data_url(image)
-        response = await test_provider_model(provider, model, prompt, image_data_url=image_data_url)
-        response["curl_command"] = build_playground_curl_for_provider(
+        response = await test_playground_target(provider, model, prompt, image_data_url=image_data_url)
+        response["curl_command"] = build_playground_curl_for_target(
             provider,
             model,
             prompt,
@@ -2406,6 +2544,7 @@ async def admin_playground_run(
         name="playground.html",
         context={
             "providers": get_providers(),
+            "groups": get_groups(),
             "result": response.get("response"),
             "assistant_text": response.get("assistant_text"),
             "curl_command": response.get("curl_command"),

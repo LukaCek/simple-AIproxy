@@ -199,6 +199,86 @@ def test_provider_candidate_uses_one_hour_timeout_for_slow_ollama_load(monkeypat
     assert fake.calls[0]["timeout"] == 3600.0
 
 
+class FakeResponsesClient:
+    def __init__(self, response):
+        self.response = response
+        self.posts = []
+
+    async def post(self, url, json=None, headers=None, timeout=None, data=None):
+        self.posts.append({"url": url, "json": json, "headers": headers, "timeout": timeout, "data": data})
+        return self.response
+
+    async def aclose(self):
+        pass
+
+
+def test_playground_codex_provider_uses_responses_adapter_not_chat_completions(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: codex-ui
+  url: https://chatgpt.com/backend-api/codex
+  api_key: access-token
+  access_token: access-token
+  refresh_token: refresh-token
+  models: [gpt-5.5]
+  api_mode: codex_responses
+  oauth: true
+  token_url: https://auth.openai.com/oauth/token
+  client_id: codex-client
+groups: {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+    fake = FakeResponsesClient(httpx.Response(200, json={"output_text": "OK"}, request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")))
+    monkeypatch.setattr(main, "http_client", fake)
+
+    result = asyncio.run(main.test_provider_model("codex-ui", "gpt-5.5", "Reply OK"))
+
+    assert result["success"] is True
+    assert result["assistant_text"] == "OK"
+    assert fake.posts[0]["url"] == "https://chatgpt.com/backend-api/codex/responses"
+    assert fake.posts[0]["json"]["store"] is False
+    assert fake.posts[0]["json"]["stream"] is True
+
+
+def test_playground_codex_html_login_page_is_not_reported_as_success(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: codex-ui
+  url: https://chatgpt.com/backend-api/codex
+  api_key: stale-token
+  access_token: stale-token
+  models: [gpt-5.5]
+  api_mode: codex_responses
+  oauth: true
+groups: {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+    html = "<html><head><meta http-equiv='refresh' content='360'></head><body>OpenAI login</body></html>"
+    fake = FakeResponsesClient(httpx.Response(200, content=html.encode(), headers={"content-type": "text/html"}, request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")))
+    monkeypatch.setattr(main, "http_client", fake)
+
+    result = asyncio.run(main.test_provider_model("codex-ui", "gpt-5.5", "Reply OK"))
+
+    assert result["success"] is False
+    assert result["status_code"] == 200
+    assert "Reauthenticate" in result["response"]
+    assert "<html" not in result["response"]
+
+
 def test_admin_codex_token_form_adds_profile(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yml"
     config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")

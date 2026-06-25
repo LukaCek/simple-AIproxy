@@ -1229,15 +1229,41 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
         message = f"Model '{model_name}' is not configured for provider '{provider_name}'"
         finish_log(400, model_name or "unknown", error=message)
         return {"success": False, "provider": provider_name, "status_code": 400, "response": message, "assistant_text": message}
-    headers = build_provider_headers(provider)
-    target_url = resolve_endpoint_url(provider)
+    endpoint = provider_to_endpoint(provider, model_name)
+    api_mode = str(endpoint.get("api_mode", "openai_chat_completions"))
+    if api_mode in {"openai_responses", "codex_responses"}:
+        target_url = resolve_responses_url(endpoint)
+    else:
+        target_url = resolve_endpoint_url(endpoint)
+    headers = build_provider_headers(endpoint)
     curl_command = build_curl_command(target_url, payload, bool(headers.get("Authorization")))
     try:
+        await ensure_provider_token(endpoint)
+        if api_mode in {"openai_responses", "codex_responses"}:
+            response = await send_responses_adapter(endpoint, payload)
+            first_response_at = datetime.utcnow().isoformat()
+            text = response.content.decode("utf-8", errors="replace")
+            content_type = response.headers.get("content-type", "")
+            if response.status_code == 200 and not looks_like_html_response(text, content_type):
+                try:
+                    parsed = response.json()
+                    output = json.dumps(parsed, indent=2, ensure_ascii=False)
+                    assistant_text = extract_response_text(parsed)
+                except Exception:
+                    assistant_text = extract_response_text_from_sse(text) or text
+                    output = text
+                finish_log(response.status_code, model_name, output=assistant_text or output, first_response_at=first_response_at)
+                return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output, "assistant_text": assistant_text, "curl_command": curl_command}
+            error_text = codex_html_auth_error() if api_mode == "codex_responses" and looks_like_html_response(text, content_type) else text
+            finish_log(response.status_code, model_name, error=error_text, first_response_at=first_response_at)
+            return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": error_text, "assistant_text": error_text, "curl_command": curl_command}
+
         async with http_client.stream("POST", target_url, json=payload, headers=headers, timeout=PROVIDER_TEST_TIMEOUT_SECONDS) as response:
             body = await response.aread()
             first_response_at = datetime.utcnow().isoformat()
             text = body.decode("utf-8", errors="replace")
-            if response.status_code == 200:
+            content_type = response.headers.get("content-type", "")
+            if response.status_code == 200 and not looks_like_html_response(text, content_type):
                 try:
                     parsed = json.loads(text)
                     output = json.dumps(parsed, indent=2, ensure_ascii=False)
@@ -1246,8 +1272,9 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
                 assistant_text = extract_chat_message_text(text)
                 finish_log(response.status_code, model_name, output=assistant_text or output, first_response_at=first_response_at)
                 return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output, "assistant_text": assistant_text, "curl_command": curl_command}
-            finish_log(response.status_code, model_name, error=text, first_response_at=first_response_at)
-            return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": text, "assistant_text": text, "curl_command": curl_command}
+            error_text = "Provider returned HTML instead of an OpenAI-compatible JSON response." if looks_like_html_response(text, content_type) else text
+            finish_log(response.status_code, model_name, error=error_text, first_response_at=first_response_at)
+            return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": error_text, "assistant_text": error_text, "curl_command": curl_command}
     except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
         message = str(exc)
         finish_log(502, model_name, error=message)
@@ -1599,6 +1626,16 @@ def extract_response_text(data: Any) -> str:
         if isinstance(msg, dict) and msg.get("content"):
             return str(msg["content"])
     return json.dumps(data, ensure_ascii=False)
+
+
+def looks_like_html_response(text: str, content_type: str = "") -> bool:
+    lower_type = (content_type or "").lower()
+    stripped = (text or "").lstrip().lower()
+    return "text/html" in lower_type or stripped.startswith("<html") or stripped.startswith("<!doctype html")
+
+
+def codex_html_auth_error() -> str:
+    return "Codex OAuth returned an HTML login/refresh page instead of JSON/SSE. Click Reauthenticate for this provider on /admin/providers, then try again."
 
 
 def chat_completion_from_text(model: str, text: str) -> Dict[str, Any]:

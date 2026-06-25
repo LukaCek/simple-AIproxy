@@ -312,6 +312,97 @@ groups: {}
     assert "<html" not in result["response"]
 
 
+def test_playground_codex_token_expired_marks_provider_for_reauth(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: codex-ui
+  url: https://chatgpt.com/backend-api/codex
+  api_key: expired-token
+  access_token: expired-token
+  refresh_token: stale-refresh
+  models: [gpt-5.5]
+  api_mode: codex_responses
+  oauth: true
+groups: {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+    body = {"error": {"message": "Provided authentication token is expired. Please try signing in again.", "code": "token_expired"}, "status": 401}
+    fake = FakeResponsesClient(httpx.Response(401, json=body, request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")))
+    monkeypatch.setattr(main, "http_client", fake)
+
+    result = asyncio.run(main.test_provider_model("codex-ui", "gpt-5.5", "Reply OK"))
+
+    assert result["success"] is False
+    assert result["status_code"] == 401
+    assert "Reauthenticate" in result["response"]
+    assert "token_expired" not in result["response"]
+    provider = main.find_provider("codex-ui")
+    assert provider["oauth_reauth_required"] is True
+    assert main.oauth_provider_connected(provider) is False
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/providers", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+    assert response.status_code == 200
+    assert "Reauthenticate" in response.text
+    assert "Connected" not in response.text
+
+
+def test_admin_providers_page_uses_latest_token_expired_log_for_reauth(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: codex-ui
+  url: https://chatgpt.com/backend-api/codex
+  api_key: expired-token
+  access_token: expired-token
+  refresh_token: refresh-token
+  models: [gpt-5.5]
+  api_mode: codex_responses
+  oauth: true
+groups: {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+    main.init_database()
+    main.insert_log(
+        None,
+        "Admin Playground",
+        "gpt-5.5",
+        "admin-playground",
+        "codex-ui",
+        "gpt-5.5",
+        401,
+        "2026-06-25T09:15:19",
+        "2026-06-25T09:15:19",
+        "2026-06-25T09:15:19",
+        80.0,
+        80.0,
+        "hi",
+        "",
+        '{"error":{"message":"Provided authentication token is expired. Please try signing in again.","code":"token_expired"},"status":401}',
+    )
+
+    with TestClient(main.app) as client:
+        response = client.get("/admin/providers", auth=(main.ADMIN_USERNAME, main.ADMIN_PASSWORD))
+
+    assert response.status_code == 200
+    assert "Reauthenticate" in response.text
+    assert "Connected" not in response.text
+    assert "Codex OAuth token" in response.text
+
+
 def test_admin_codex_token_form_adds_profile(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yml"
     config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")

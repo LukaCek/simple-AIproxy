@@ -50,6 +50,15 @@ class FakeCloudflareResponsesClient(FakeChatClient):
         html = "<html><body><script>window._cf_chl_opt={};</script><span>Enable JavaScript and cookies to continue</span></body></html>"
         return httpx.Response(200, content=html.encode(), headers={"content-type": "text/html; charset=utf-8"}, request=httpx.Request("POST", url))
 
+
+
+class FakeExpiredTokenResponsesClient(FakeChatClient):
+    async def post(self, url, json=None, headers=None, timeout=None, data=None):
+        self.hosts.append(httpx.URL(url).host)
+        self.requests.append({"url": url, "json": json, "headers": headers, "data": data, "timeout": timeout})
+        body = {"error": {"message": "Provided authentication token is expired. Please try signing in again.", "code": "token_expired"}, "status": 401}
+        return httpx.Response(401, json=body, request=httpx.Request("POST", url))
+
 class TimeoutChatClient(FakeChatClient):
     async def send(self, request, stream=False):
         self.hosts.append(request.url.host)
@@ -258,6 +267,50 @@ def test_codex_responses_html_challenge_is_not_returned_as_success(tmp_path, mon
     assert row["status_code"] == 502
     assert "Cloudflare" in row["error"]
     assert "<html" not in row["error"].lower()
+
+
+def test_codex_responses_token_expired_marks_provider_for_reauth(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "CONFIG_PATH", tmp_path / "config.yml")
+    fake = FakeExpiredTokenResponsesClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    main.route_counters.clear()
+    desired_config = {
+        "providers": [
+            {
+                "name": "codex-a",
+                "url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "expired-token",
+                "access_token": "expired-token",
+                "refresh_token": "refresh-token",
+                "models": ["gpt-5.5"],
+                "api_mode": "codex_responses",
+                "oauth": True,
+            }
+        ],
+        "groups": {},
+    }
+    main.config_data = desired_config
+    main.save_config(desired_config)
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 502
+    assert "Reauthenticate" in response.json()["detail"]
+    assert "token_expired" not in response.text
+    provider = main.find_provider("codex-a")
+    assert provider["oauth_reauth_required"] is True
+    assert main.oauth_provider_connected(provider) is False
+    with sqlite3.connect(tmp_path / "app.db") as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT status_code, error FROM Logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status_code"] == 502
+    assert "Reauthenticate" in row["error"]
 
 
 def test_provider_timeout_logs_exception_class(tmp_path, monkeypatch):

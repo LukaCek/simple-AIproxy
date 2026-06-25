@@ -115,6 +115,9 @@
                 <input type="hidden" name="replace_existing" value="true" />
                 <button type="submit" class="inline-flex rounded-2xl bg-amber-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-700">Reauthenticate</button>
               </form>
+              {% if provider.oauth_error %}
+              <div class="mt-2 max-w-xs text-xs font-medium text-amber-800">{{ provider.oauth_error }}</div>
+              {% endif %}
               {% elif provider.oauth and provider.authorize_url %}
               <a href="/admin/providers/{{ provider.name | e }}/oauth/login" class="mr-2 inline-flex rounded-2xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-700">Login OAuth</a>
               {% elif provider.oauth %}

@@ -552,9 +552,11 @@ def create_api_key(name: str) -> str:
 def oauth_provider_connected(provider: Dict[str, Any]) -> bool:
     """Return whether an OAuth provider has usable server-side credentials.
 
-    A provider counts as connected when it has a non-expired access token/api_key,
-    or when it has a refresh token that can mint a new access token on demand.
+    A provider counts as connected only when it has credentials and has not been
+    marked reauth-required by a failed refresh/upstream token_expired response.
     """
+    if provider.get("oauth_reauth_required"):
+        return False
     access_token = str(provider.get("access_token") or provider.get("api_key") or "").strip()
     refresh_token = str(provider.get("refresh_token") or "").strip()
     if refresh_token:
@@ -567,6 +569,24 @@ def oauth_provider_connected(provider: Dict[str, Any]) -> bool:
     return True
 
 
+
+def latest_provider_token_expired_error(provider_name: str) -> str:
+    try:
+        with get_db_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT status_code, error FROM Logs WHERE provider_name = ? ORDER BY id DESC LIMIT 1",
+                (provider_name,),
+            ).fetchone()
+    except Exception:
+        return ""
+    if row is None:
+        return ""
+    error_text = str(row["error"] or "")
+    if response_indicates_token_expired(int(row["status_code"] or 0), error_text):
+        return codex_reauth_message(provider_name)
+    return ""
+
 def get_providers() -> List[Dict[str, Any]]:
     providers_list: List[Dict[str, Any]] = []
     with config_lock:
@@ -575,6 +595,12 @@ def get_providers() -> List[Dict[str, Any]]:
                 continue
             oauth_connected = oauth_provider_connected(provider) if provider.get("oauth") else False
             api_mode = provider.get("api_mode", "openai_chat_completions")
+            oauth_error = str(provider.get("oauth_error") or "")
+            if provider.get("oauth") and api_mode == "codex_responses":
+                latest_expired_error = latest_provider_token_expired_error(str(provider.get("name", "")))
+                if latest_expired_error:
+                    oauth_connected = False
+                    oauth_error = latest_expired_error
             providers_list.append(
                 {
                     "name": provider.get("name", ""),
@@ -585,6 +611,8 @@ def get_providers() -> List[Dict[str, Any]]:
                     "oauth": bool(provider.get("oauth")),
                     "oauth_connected": oauth_connected,
                     "oauth_needs_reauth": bool(provider.get("oauth")) and not oauth_connected,
+                    "oauth_reauth_required": bool(provider.get("oauth_reauth_required")) or bool(oauth_error),
+                    "oauth_error": oauth_error,
                     "authorize_url": provider.get("authorize_url", ""),
                     "token_url": provider.get("token_url", ""),
                     "redirect_uri": provider.get("redirect_uri", ""),
@@ -909,6 +937,8 @@ def upsert_codex_profile(name: str, access_token: str = "", refresh_token: str =
                 "access_token": clean_access_token,
                 "refresh_token": clean_refresh_token,
                 "expires_at": "",
+                "oauth_reauth_required": False,
+                "oauth_error": "",
             },
         )
     else:
@@ -929,6 +959,8 @@ def upsert_codex_profile(name: str, access_token: str = "", refresh_token: str =
             if clean_refresh_token:
                 existing["refresh_token"] = clean_refresh_token
             existing["expires_at"] = ""
+            existing.pop("oauth_reauth_required", None)
+            existing.pop("oauth_error", None)
             save_config(config_data)
     ensure_group_member(
         "gpt-5.5",
@@ -983,6 +1015,8 @@ def provider_to_endpoint(provider: Dict[str, Any], model_name: Optional[str] = N
         "client_id": provider.get("client_id", ""),
         "client_secret": provider.get("client_secret", ""),
         "expires_at": provider.get("expires_at", ""),
+        "oauth_reauth_required": provider.get("oauth_reauth_required", False),
+        "oauth_error": provider.get("oauth_error", ""),
         "model": model_name or (provider.get("models", [None])[0] if provider.get("models") else None),
     }
 
@@ -1244,6 +1278,11 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
             first_response_at = datetime.utcnow().isoformat()
             text = response.content.decode("utf-8", errors="replace")
             content_type = response.headers.get("content-type", "")
+            if api_mode == "codex_responses" and response_indicates_token_expired(response.status_code, text):
+                error_text = codex_reauth_message(provider_name)
+                mark_provider_reauth_required(provider_name, error_text)
+                finish_log(response.status_code, model_name, error=error_text, first_response_at=first_response_at)
+                return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": error_text, "assistant_text": error_text, "curl_command": curl_command}
             if response.status_code == 200 and not looks_like_html_response(text, content_type):
                 try:
                     parsed = response.json()
@@ -1263,6 +1302,11 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
             first_response_at = datetime.utcnow().isoformat()
             text = body.decode("utf-8", errors="replace")
             content_type = response.headers.get("content-type", "")
+            if api_mode == "codex_responses" and response_indicates_token_expired(response.status_code, text):
+                error_text = codex_reauth_message(provider_name)
+                mark_provider_reauth_required(provider_name, error_text)
+                finish_log(response.status_code, model_name, error=error_text, first_response_at=first_response_at)
+                return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": error_text, "assistant_text": error_text, "curl_command": curl_command}
             if response.status_code == 200 and not looks_like_html_response(text, content_type):
                 try:
                     parsed = json.loads(text)
@@ -1275,6 +1319,10 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
             error_text = provider_html_error(api_mode, text) if looks_like_html_response(text, content_type) else text
             finish_log(response.status_code, model_name, error=error_text, first_response_at=first_response_at)
             return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": error_text, "assistant_text": error_text, "curl_command": curl_command}
+    except HTTPException as exc:
+        message = str(exc.detail)
+        finish_log(int(exc.status_code or 500), model_name, error=message)
+        return {"success": False, "provider": provider_name, "status_code": int(exc.status_code or 500), "response": message, "assistant_text": message, "curl_command": curl_command}
     except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
         message = str(exc)
         finish_log(502, model_name, error=message)
@@ -1494,6 +1542,35 @@ def provider_token_expiring(provider: Dict[str, Any], skew_seconds: int = 60) ->
     return expires_at is not None and expires_at <= time.time() + skew_seconds
 
 
+def mark_provider_reauth_required(provider_name: str, reason: str) -> None:
+    with config_lock:
+        live_provider = find_provider(provider_name)
+        if live_provider is None:
+            return
+        live_provider["oauth_reauth_required"] = True
+        live_provider["oauth_error"] = truncate_text(reason, 500)
+        save_config(config_data)
+
+
+def clear_provider_reauth_required(provider_name: str) -> None:
+    with config_lock:
+        live_provider = find_provider(provider_name)
+        if live_provider is None:
+            return
+        live_provider.pop("oauth_reauth_required", None)
+        live_provider.pop("oauth_error", None)
+        save_config(config_data)
+
+
+def response_indicates_token_expired(status_code: int, text: str) -> bool:
+    lower = (text or "").lower()
+    return status_code == 401 and ("token_expired" in lower or "authentication token is expired" in lower or "signing in again" in lower)
+
+
+def codex_reauth_message(provider_name: str) -> str:
+    return f"Codex OAuth token for provider '{provider_name}' is expired. Click Reauthenticate for this provider on /admin/providers, finish device login, then try again."
+
+
 async def refresh_provider_token(provider_name: str, provider: Dict[str, Any]) -> None:
     refresh_token = provider.get("refresh_token")
     token_url = provider.get("token_url")
@@ -1505,7 +1582,11 @@ async def refresh_provider_token(provider_name: str, provider: Dict[str, Any]) -
         data["client_secret"] = provider.get("client_secret")
     response = await http_client.post(str(token_url), data=data, headers={"Accept": "application/json"}, timeout=30.0)
     if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Token refresh failed for {provider_name}: {response.text}")
+        reason = f"Token refresh failed for {provider_name}: {response.text}"
+        mark_provider_reauth_required(provider_name, reason)
+        provider["oauth_reauth_required"] = True
+        provider["oauth_error"] = reason
+        raise HTTPException(status_code=502, detail=reason)
     token_data = response.json()
     access_token = token_data.get("access_token") or token_data.get("token")
     if not access_token:
@@ -1525,6 +1606,10 @@ async def refresh_provider_token(provider_name: str, provider: Dict[str, Any]) -
             expires_at = datetime.utcnow() + timedelta(seconds=float(token_data["expires_in"]))
             live_provider["expires_at"] = expires_at.isoformat()
             provider["expires_at"] = live_provider["expires_at"]
+        live_provider.pop("oauth_reauth_required", None)
+        live_provider.pop("oauth_error", None)
+        provider.pop("oauth_reauth_required", None)
+        provider.pop("oauth_error", None)
         save_config(config_data)
 
 
@@ -1777,6 +1862,13 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                 first_response_at = datetime.utcnow().isoformat()
                 content_type = response.headers.get("content-type", "")
                 raw_text = content.decode("utf-8", errors="replace")
+                if api_mode == "codex_responses" and response_indicates_token_expired(response.status_code, raw_text):
+                    error_msg = codex_reauth_message(provider_name)
+                    mark_provider_reauth_required(provider_name, error_msg)
+                    ended_at, first_ms, total_ms = timing(first_response_at)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                    last_error = error_msg
+                    continue
                 if looks_like_html_response(raw_text, content_type):
                     error_msg = provider_html_error(api_mode, raw_text)
                     ended_at, first_ms, total_ms = timing(first_response_at)
@@ -1832,6 +1924,13 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                 await response.aclose()
                 first_response_at = datetime.utcnow().isoformat()
                 raw_text = content.decode("utf-8", errors="replace")
+                if api_mode == "codex_responses" and response_indicates_token_expired(response.status_code, raw_text):
+                    error_msg = codex_reauth_message(provider_name)
+                    mark_provider_reauth_required(provider_name, error_msg)
+                    ended_at, first_ms, total_ms = timing(first_response_at)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                    last_error = error_msg
+                    continue
                 if looks_like_html_response(raw_text, content_type):
                     error_msg = provider_html_error(api_mode, raw_text)
                     ended_at, first_ms, total_ms = timing(first_response_at)

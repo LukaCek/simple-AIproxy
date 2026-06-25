@@ -279,6 +279,39 @@ groups: {}
     assert "<html" not in result["response"]
 
 
+def test_playground_codex_cloudflare_challenge_is_not_reported_as_success(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        """
+providers:
+- name: codex-ui
+  url: https://chatgpt.com/backend-api/codex
+  api_key: stale-token
+  access_token: stale-token
+  models: [gpt-5.5]
+  api_mode: codex_responses
+  oauth: true
+groups: {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "app.db")
+    main.config_data = main.load_config()
+    html = "<html><body><script>window._cf_chl_opt={};</script>Enable JavaScript and cookies to continue</body></html>"
+    fake = FakeResponsesClient(httpx.Response(200, content=html.encode(), headers={"content-type": "text/html"}, request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")))
+    monkeypatch.setattr(main, "http_client", fake)
+
+    result = asyncio.run(main.test_provider_model("codex-ui", "gpt-5.5", "Reply OK"))
+
+    assert result["success"] is False
+    assert result["status_code"] == 200
+    assert "Cloudflare" in result["response"]
+    assert "Reauthenticate" in result["response"]
+    assert "<html" not in result["response"]
+
+
 def test_admin_codex_token_form_adds_profile(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yml"
     config_path.write_text("providers: []\ngroups: {}\n", encoding="utf-8")

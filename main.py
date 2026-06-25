@@ -1254,7 +1254,7 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
                     output = text
                 finish_log(response.status_code, model_name, output=assistant_text or output, first_response_at=first_response_at)
                 return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output, "assistant_text": assistant_text, "curl_command": curl_command}
-            error_text = codex_html_auth_error() if api_mode == "codex_responses" and looks_like_html_response(text, content_type) else text
+            error_text = provider_html_error(api_mode, text) if looks_like_html_response(text, content_type) else text
             finish_log(response.status_code, model_name, error=error_text, first_response_at=first_response_at)
             return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": error_text, "assistant_text": error_text, "curl_command": curl_command}
 
@@ -1272,7 +1272,7 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
                 assistant_text = extract_chat_message_text(text)
                 finish_log(response.status_code, model_name, output=assistant_text or output, first_response_at=first_response_at)
                 return {"success": True, "provider": provider_name, "status_code": response.status_code, "response": output, "assistant_text": assistant_text, "curl_command": curl_command}
-            error_text = "Provider returned HTML instead of an OpenAI-compatible JSON response." if looks_like_html_response(text, content_type) else text
+            error_text = provider_html_error(api_mode, text) if looks_like_html_response(text, content_type) else text
             finish_log(response.status_code, model_name, error=error_text, first_response_at=first_response_at)
             return {"success": False, "provider": provider_name, "status_code": response.status_code, "response": error_text, "assistant_text": error_text, "curl_command": curl_command}
     except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
@@ -1634,8 +1634,23 @@ def looks_like_html_response(text: str, content_type: str = "") -> bool:
     return "text/html" in lower_type or stripped.startswith("<html") or stripped.startswith("<!doctype html")
 
 
-def codex_html_auth_error() -> str:
+def looks_like_cloudflare_challenge(text: str) -> bool:
+    lower = (text or "").lower()
+    return "_cf_chl_opt" in lower or "challenge-platform" in lower or "enable javascript and cookies to continue" in lower
+
+
+def codex_html_auth_error(text: str = "") -> str:
+    if looks_like_cloudflare_challenge(text):
+        return "Codex OAuth request was blocked by a ChatGPT/Cloudflare browser challenge instead of returning JSON/SSE. Reauthenticate this provider on /admin/providers; if it still happens, ChatGPT is blocking server-side Codex requests from this deployment/IP."
     return "Codex OAuth returned an HTML login/refresh page instead of JSON/SSE. Click Reauthenticate for this provider on /admin/providers, then try again."
+
+
+def provider_html_error(api_mode: str, text: str = "") -> str:
+    if api_mode == "codex_responses":
+        return codex_html_auth_error(text)
+    if looks_like_cloudflare_challenge(text):
+        return "Provider returned a Cloudflare/browser challenge HTML page instead of an OpenAI-compatible JSON response."
+    return "Provider returned HTML instead of an OpenAI-compatible JSON response."
 
 
 def chat_completion_from_text(model: str, text: str) -> Dict[str, Any]:
@@ -1760,17 +1775,25 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                 response = await send_responses_adapter(endpoint, provider_payload)
                 content = response.content
                 first_response_at = datetime.utcnow().isoformat()
+                content_type = response.headers.get("content-type", "")
+                raw_text = content.decode("utf-8", errors="replace")
+                if looks_like_html_response(raw_text, content_type):
+                    error_msg = provider_html_error(api_mode, raw_text)
+                    ended_at, first_ms, total_ms = timing(first_response_at)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                    last_error = f"{provider_name} returned HTML challenge: {error_msg}"
+                    continue
                 if response.status_code == 200:
                     try:
                         text = extract_response_text(response.json())
                     except Exception:
-                        text = extract_response_text_from_sse(content) or content.decode("utf-8", errors="replace")
+                        text = extract_response_text_from_sse(content) or raw_text
                     ended_at, first_ms, total_ms = timing(first_response_at)
                     insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, text, None)
                     if payload.get("stream"):
                         return StreamingResponse(sse_chat_chunks(provider_model, text), status_code=200, media_type="text/event-stream")
                     return Response(json.dumps(chat_completion_from_text(provider_model, text), ensure_ascii=False), status_code=200, media_type="application/json")
-                error_msg = content.decode("utf-8", errors="replace")
+                error_msg = raw_text
                 if response.status_code in fallback_statuses:
                     last_error = f"{provider_name} returned {response.status_code}: {error_msg}"
                     continue
@@ -1808,6 +1831,13 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                 content = await response.aread()
                 await response.aclose()
                 first_response_at = datetime.utcnow().isoformat()
+                raw_text = content.decode("utf-8", errors="replace")
+                if looks_like_html_response(raw_text, content_type):
+                    error_msg = provider_html_error(api_mode, raw_text)
+                    ended_at, first_ms, total_ms = timing(first_response_at)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                    last_error = f"{provider_name} returned HTML challenge: {error_msg}"
+                    continue
                 ended_at, first_ms, total_ms = timing(first_response_at)
                 output_text = extract_output_from_body(content, content_type)
                 insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, None)

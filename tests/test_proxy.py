@@ -41,6 +41,15 @@ class FakeResponsesClient(FakeChatClient):
         return httpx.Response(200, json={"output_text": "responses ok"}, request=httpx.Request("POST", url))
 
 
+
+
+class FakeCloudflareResponsesClient(FakeChatClient):
+    async def post(self, url, json=None, headers=None, timeout=None, data=None):
+        self.hosts.append(httpx.URL(url).host)
+        self.requests.append({"url": url, "json": json, "headers": headers, "data": data, "timeout": timeout})
+        html = "<html><body><script>window._cf_chl_opt={};</script><span>Enable JavaScript and cookies to continue</span></body></html>"
+        return httpx.Response(200, content=html.encode(), headers={"content-type": "text/html; charset=utf-8"}, request=httpx.Request("POST", url))
+
 class TimeoutChatClient(FakeChatClient):
     async def send(self, request, stream=False):
         self.hosts.append(request.url.host)
@@ -212,6 +221,43 @@ def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch
     assert fake.requests[0]["json"]["store"] is False
     assert fake.requests[0]["json"]["stream"] is True
     assert fake.requests[0]["timeout"] == main.UPSTREAM_REQUEST_TIMEOUT_SECONDS
+
+
+def test_codex_responses_html_challenge_is_not_returned_as_success(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = FakeCloudflareResponsesClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    main.route_counters.clear()
+    desired_config = {
+        "providers": [
+            {
+                "name": "codex-a",
+                "url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "token",
+                "models": ["gpt-5.5"],
+                "api_mode": "codex_responses",
+            }
+        ],
+        "groups": {},
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 502
+    assert "Cloudflare" in response.json()["detail"]
+    assert "<html" not in response.text.lower()
+    with sqlite3.connect(tmp_path / "app.db") as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT status_code, error FROM Logs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status_code"] == 502
+    assert "Cloudflare" in row["error"]
+    assert "<html" not in row["error"].lower()
 
 
 def test_provider_timeout_logs_exception_class(tmp_path, monkeypatch):

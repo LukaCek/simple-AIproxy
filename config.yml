@@ -36,6 +36,34 @@ providers:
     api_key: ""
     api_mode: openai_chat_completions
 
+model_profiles:
+  slowbrain-70b:
+    type: llamacpp_rpc
+    worker_type: llamacpp_rpc_worker
+    endpoint: http://llama-main:8080/v1
+    health_url: http://llama-main:8080/health
+    model: llama-3.3-70b-q2
+    timeout_seconds: 21600
+    max_parallel_jobs: 1
+    max_attempts: 2
+    retry_delay_seconds: 60
+
+  # Sidecar worker profiles enqueue durable jobs but require an external worker
+  # process to lease and complete them.
+  slowbrain-airllm:
+    type: airllm_offload
+    worker_type: airllm_offload_worker
+    command: python -m workers.airllm_sidecar --model /models/llama-70b --job-id {job_id}
+    timeout_seconds: 21600
+    max_parallel_jobs: 1
+
+  slowbrain-accelerate:
+    type: accelerate_offload
+    worker_type: accelerate_offload_worker
+    command: accelerate launch workers/accelerate_sidecar.py --model /models/llama-70b --job-id {job_id}
+    timeout_seconds: 21600
+    max_parallel_jobs: 1
+
 groups:
   gpt-5.5:
     description: Balanced Codex profile pool

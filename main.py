@@ -22,6 +22,8 @@ from fastapi.templating import Jinja2Templates
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+import background_jobs
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yml"
 DB_PATH = BASE_DIR / "app.db"
@@ -66,6 +68,7 @@ def get_db_connection() -> sqlite3.Connection:
 
 def init_database() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    background_jobs.init_job_schema(DB_PATH)
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -291,6 +294,23 @@ def normalize_config_schema(data: Dict[str, Any]) -> Dict[str, Any]:
                     })
                 group["members"] = members
                 group.pop("endpoints", None)
+    profiles = data.get("model_profiles", {})
+    if profiles is None:
+        data["model_profiles"] = {}
+    elif isinstance(profiles, list):
+        data["model_profiles"] = {str(item.get("name")): item for item in profiles if isinstance(item, dict) and item.get("name")}
+    elif not isinstance(profiles, dict):
+        data["model_profiles"] = {}
+    for profile_name, profile in list(data.get("model_profiles", {}).items()):
+        if not isinstance(profile, dict):
+            data["model_profiles"].pop(profile_name, None)
+            continue
+        profile.setdefault("type", "llamacpp_rpc")
+        profile.setdefault("worker_type", f"{profile.get('type')}_worker" if not str(profile.get("type", "")).endswith("_worker") else profile.get("type"))
+        profile.setdefault("timeout_seconds", 21600)
+        profile.setdefault("max_parallel_jobs", 1)
+        profile.setdefault("max_attempts", 1)
+        profile.setdefault("retry_delay_seconds", 60)
     return data
 
 
@@ -1984,6 +2004,102 @@ async def stream_provider_response(response: httpx.Response):
         if chunk:
             yield chunk
 
+
+def get_model_profiles() -> Dict[str, Dict[str, Any]]:
+    with config_lock:
+        profiles = config_data.get("model_profiles", {})
+        if isinstance(profiles, dict):
+            return {str(name): dict(profile) for name, profile in profiles.items() if isinstance(profile, dict)}
+    return {}
+
+
+def get_model_profile(name: str) -> Optional[Dict[str, Any]]:
+    return get_model_profiles().get(name)
+
+
+def public_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": job["id"],
+        "object": "background.job",
+        "model_profile": job["model_profile"],
+        "worker_type": job["worker_type"],
+        "status": job["status"],
+        "attempt_count": job["attempt_count"],
+        "max_attempts": job["max_attempts"],
+        "lease_expires_at": job.get("lease_expires_at"),
+        "worker_id": job.get("worker_id"),
+        "last_error": job.get("last_error"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def create_background_chat_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    model_profile_name = str(payload.get("model") or "").strip()
+    profile = get_model_profile(model_profile_name)
+    if profile is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Background model profile '{model_profile_name}' not found")
+    worker_type = str(profile.get("worker_type") or "")
+    max_attempts = int(profile.get("max_attempts") or 1)
+    job_payload = dict(payload)
+    job_payload.pop("background", None)
+    params = {key: value for key, value in job_payload.items() if key not in {"messages"}}
+    try:
+        return background_jobs.create_job(
+            DB_PATH,
+            model_profile=model_profile_name,
+            worker_type=worker_type,
+            request_payload=job_payload,
+            params=params,
+            max_attempts=max_attempts,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+async def execute_background_job_once(worker_id: str = "manual-worker") -> Optional[Dict[str, Any]]:
+    """Lease and run one queued job. Intended for tests/CLI/sidecar hooks, not auto-started."""
+    job = background_jobs.lease_next_job(DB_PATH, worker_id=worker_id)
+    if not job:
+        return None
+    profile = get_model_profile(str(job["model_profile"])) or {}
+    worker_type = str(job.get("worker_type") or "")
+    if worker_type != "llamacpp_rpc_worker":
+        return background_jobs.fail_or_retry_job(DB_PATH, job["id"], worker_id, f"Worker type '{worker_type}' requires an external sidecar implementation", int(profile.get("retry_delay_seconds") or 60))
+    endpoint = str(profile.get("endpoint") or "").rstrip("/")
+    if not endpoint:
+        return background_jobs.fail_or_retry_job(DB_PATH, job["id"], worker_id, "Missing endpoint for llamacpp_rpc worker", int(profile.get("retry_delay_seconds") or 60))
+    request_payload = dict(job.get("request_payload") or {})
+    if profile.get("model"):
+        request_payload["model"] = profile.get("model")
+    target_url = resolve_endpoint_url({"url": endpoint, "model": request_payload.get("model")})
+    timeout_seconds = float(profile.get("timeout_seconds") or 21600)
+    try:
+        if http_client is None:
+            raise RuntimeError("HTTP client is not initialized")
+        background_jobs.heartbeat_job(DB_PATH, job["id"], worker_id, lease_seconds=int(timeout_seconds) + 60)
+        if request_payload.get("stream"):
+            async with http_client.stream("POST", target_url, json=request_payload, timeout=timeout_seconds) as response:
+                response.raise_for_status()
+                captured = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        text = chunk.decode("utf-8", errors="replace")
+                        background_jobs.append_partial_output(DB_PATH, job["id"], text)
+                        captured.extend(chunk)
+                final_text = extract_output_from_body(bytes(captured), response.headers.get("content-type", "application/json")) or bytes(captured).decode("utf-8", errors="replace")
+                return background_jobs.complete_job(DB_PATH, job["id"], worker_id, final_text)
+        response = await http_client.post(target_url, json=request_payload, timeout=timeout_seconds)
+        content = response.content
+        if response.status_code >= 400:
+            return background_jobs.fail_or_retry_job(DB_PATH, job["id"], worker_id, content.decode("utf-8", errors="replace"), int(profile.get("retry_delay_seconds") or 60))
+        final_text = extract_output_from_body(content, response.headers.get("content-type", "application/json")) or content.decode("utf-8", errors="replace")
+        return background_jobs.complete_job(DB_PATH, job["id"], worker_id, final_text)
+    except Exception as exc:
+        return background_jobs.fail_or_retry_job(DB_PATH, job["id"], worker_id, f"{exc.__class__.__name__}: {exc}", int(profile.get("retry_delay_seconds") or 60))
+
+
 @app.get("/")
 async def health_check():
     return {"status": "ok", "message": "Proxy deluje!"}
@@ -2005,13 +2121,109 @@ async def list_openai_models(api_key_record: sqlite3.Row = Depends(validate_api_
             for group_name in groups:
                 if group_name not in model_ids:
                     model_ids.append(str(group_name))
+        profiles = config_data.get("model_profiles", {})
+        if isinstance(profiles, dict):
+            for profile_name in profiles:
+                if profile_name not in model_ids:
+                    model_ids.append(str(profile_name))
     return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "simple-aiproxy"} for model_id in model_ids]}
+
+
+@app.post("/jobs")
+async def create_job_endpoint(payload: Dict[str, Any], api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    job = create_background_chat_job(payload)
+    return public_job(job)
+
+
+@app.get("/jobs/stats")
+async def get_jobs_stats(api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    return background_jobs.job_stats(DB_PATH)
+
+
+@app.get("/jobs/{job_id}")
+async def get_job_endpoint(job_id: str, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    job = background_jobs.get_job(DB_PATH, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return public_job(job)
+
+
+@app.get("/jobs/{job_id}/logs")
+async def get_job_logs(job_id: str, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    job = background_jobs.get_job(DB_PATH, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return {"id": job_id, "status": job["status"], "partial_output": job.get("partial_output") or "", "last_error": job.get("last_error")}
+
+
+@app.get("/jobs/{job_id}/result")
+async def get_job_result(job_id: str, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    job = background_jobs.get_job(DB_PATH, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job["status"] != "succeeded":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Job is {job['status']}")
+    return {"id": job_id, "object": "background.job.result", "status": job["status"], "output": job.get("final_output")}
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job_endpoint(job_id: str, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    job = background_jobs.cancel_job(DB_PATH, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return public_job(job)
+
+
+@app.get("/workers")
+async def list_workers(api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    profiles = get_model_profiles()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "model_profile": name,
+                "worker_type": profile.get("worker_type"),
+                "health_url": profile.get("health_url"),
+                "timeout_seconds": profile.get("timeout_seconds"),
+                "max_parallel_jobs": profile.get("max_parallel_jobs", 1),
+            }
+            for name, profile in profiles.items()
+        ],
+    }
+
+
+@app.get("/models")
+async def list_proxy_models(api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Dict[str, Any]:
+    del api_key_record
+    return {"groups": list((config_data.get("groups") or {}).keys()), "model_profiles": get_model_profiles()}
+
+
+@app.get("/metrics")
+async def metrics(api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Response:
+    del api_key_record
+    stats = background_jobs.job_stats(DB_PATH)["statuses"]
+    lines = [f'aiproxy_background_jobs{{status="{status_name}"}} {count}' for status_name, count in sorted(stats.items())]
+    return Response("\n".join(lines) + "\n", media_type="text/plain")
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, background_tasks: BackgroundTasks, api_key_record: sqlite3.Row = Depends(validate_api_key)) -> Response:
     del background_tasks
     payload = await request.json()
+    if payload.get("background") is True:
+        job = create_background_chat_job(payload)
+        return JSONResponse({
+            "id": job["id"],
+            "object": "background.chat.completion",
+            "status": job["status"],
+        })
     requested_model = str(payload.get("model") or "")
     if not requested_model:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing model in request payload")

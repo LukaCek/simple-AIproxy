@@ -10,6 +10,7 @@ A lightweight FastAPI-based LLM API gateway with an OpenAI-compatible facade:
 - OpenAI-compatible provider forwarding, including Ollama
 - minimal Responses/Codex adapter for OpenAI Codex OAuth profiles
 - request logging and a simple Jinja2/Tailwind admin GUI
+- durable background jobs for slow-brain inference
 
 ## Why this version exists
 
@@ -125,6 +126,111 @@ providers:
 ```
 
 A bare host is normalized to `/v1/chat/completions`.
+
+## Slow-brain background inference
+
+The proxy can enqueue long-running inference jobs without holding the client HTTP
+connection open. Jobs are durable in SQLite (`BackgroundJobs`) and the schema is
+kept simple so it can be mapped to Postgres later. Existing synchronous
+`/v1/chat/completions` behavior is unchanged unless the request includes
+`"background": true`.
+
+### Model profile config
+
+Background models live under `model_profiles`, separate from provider `groups`:
+
+```yaml
+model_profiles:
+  slowbrain-70b:
+    type: llamacpp_rpc
+    worker_type: llamacpp_rpc_worker
+    endpoint: http://llama-main:8080/v1
+    health_url: http://llama-main:8080/health
+    model: llama-3.3-70b-q2
+    timeout_seconds: 21600
+    max_parallel_jobs: 1
+    max_attempts: 2
+    retry_delay_seconds: 60
+```
+
+Supported worker types are:
+
+- `llamacpp_rpc_worker` — practical OpenAI-compatible HTTP worker hook for
+  llama.cpp server endpoints.
+- `airllm_offload_worker` — sidecar/command profile stub; the external worker
+  leases jobs and writes partial/final output.
+- `accelerate_offload_worker` — sidecar/command profile stub for HF Accelerate
+  disk/CPU offload workers.
+- `small_prep_worker` — lightweight preparation worker stub.
+
+### API
+
+All endpoints use the same bearer API-key auth as the OpenAI-compatible API.
+
+```bash
+curl -sS http://localhost:8000/jobs \
+  -H 'Authorization: Bearer ***' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"slowbrain-70b","messages":[{"role":"user","content":"Think deeply"}]}'
+
+curl -sS http://localhost:8000/v1/chat/completions \
+  -H 'Authorization: Bearer ***' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"slowbrain-70b","background":true,"messages":[{"role":"user","content":"Think deeply"}]}'
+```
+
+The async chat extension returns immediately:
+
+```json
+{"id":"job_...","object":"background.chat.completion","status":"queued"}
+```
+
+Status/result endpoints:
+
+- `GET /jobs/{id}`
+- `GET /jobs/{id}/logs` — partial output and last error
+- `GET /jobs/{id}/result` — final output once succeeded
+- `POST /jobs/{id}/cancel`
+- `GET /jobs/stats`
+- `GET /workers`
+- `GET /models`
+- `GET /metrics`
+
+### Deployment pattern
+
+Run the existing proxy container as usual. Run slow-brain inference separately:
+
+1. `llama.cpp` RPC/main server on the GPU box:
+   ```bash
+   llama-server -m /models/llama-3.3-70b-q2.gguf --host 0.0.0.0 --port 8080
+   ```
+2. Connect the proxy and worker hosts over Tailscale or WireGuard; configure
+   `endpoint`/`health_url` to the private name/IP.
+3. For x86 disk-offload sidecars, define profiles such as:
+   ```yaml
+   slowbrain-airllm:
+     type: airllm_offload
+     worker_type: airllm_offload_worker
+     command: python -m workers.airllm_sidecar --model /models/llama-70b --job-id {job_id}
+   slowbrain-accelerate:
+     type: accelerate_offload
+     worker_type: accelerate_offload_worker
+     command: accelerate launch workers/accelerate_sidecar.py --model /models/llama-70b --job-id {job_id}
+   ```
+4. Burn-in checklist: verify `/workers`, check `health_url`, enqueue a tiny job,
+   watch `/jobs/{id}/logs`, confirm `/jobs/{id}/result`, then run a full-length
+   prompt while monitoring `/jobs/stats` and `/metrics`.
+
+The repository currently provides proxy-side storage, leasing, heartbeat, retry,
+and HTTP worker hooks. Start the built-in hook worker with:
+
+```bash
+python slowbrain_worker.py --worker-id llama-slot-1
+# or process one job for supervised cron/systemd timers:
+python slowbrain_worker.py --worker-id llama-slot-1 --once
+```
+
+It intentionally does not implement llama.cpp, AirLLM, or Accelerate themselves.
 
 ## Docker (Local Testing)
 

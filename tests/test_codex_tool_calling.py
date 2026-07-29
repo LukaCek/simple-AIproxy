@@ -72,7 +72,6 @@ def test_responses_function_call_becomes_chat_tool_call():
 
 def test_responses_sse_function_call_is_parsed():
     event = {
-        "type": "response.completed",
         "response": {
             "output": [{
                 "type": "function_call",
@@ -82,6 +81,30 @@ def test_responses_sse_function_call_is_parsed():
             }]
         },
     }
-    encoded = main.extract_response_text_from_sse(f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n")
+    body = (
+        "event: response.completed\n"
+        f"data: {json.dumps(event)}\n\n"
+        "data: [DONE]\n\n"
+    )
+    encoded = main.extract_response_text_from_sse(body)
     completion = main.chat_completion_from_text("gpt-5.5", encoded)
     assert completion["choices"][0]["message"]["tool_calls"][0]["id"] == "call_abc"
+
+
+def test_responses_sse_output_item_event_is_parsed():
+    event = {
+        "item": {
+            "type": "function_call",
+            "call_id": "call_item",
+            "name": "ping",
+            "arguments": "{}",
+        }
+    }
+    body = (
+        "event: response.output_item.done\n"
+        f"data: {json.dumps(event)}\n\n"
+        "data: [DONE]\n\n"
+    )
+    encoded = main.extract_response_text_from_sse(body)
+    completion = main.chat_completion_from_text("gpt-5.5", encoded)
+    assert completion["choices"][0]["message"]["tool_calls"][0]["id"] == "call_item"

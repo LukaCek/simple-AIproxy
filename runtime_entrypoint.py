@@ -1,12 +1,13 @@
-"""Production entrypoint with Codex model and SSE compatibility patches."""
+"""Runtime extension for normal Codex Responses SSE text compatibility."""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-# Apply selectable Codex model support first.
-import codex_entrypoint  # noqa: F401
+# Import the base compatibility module only. Selectable Codex model support is
+# composed separately by full_entrypoint.py so importing this module in tests
+# does not mutate provider/model configuration as a collection-time side effect.
 import main as _impl
 
 _original_extract_response_text_from_sse = _impl.extract_response_text_from_sse

@@ -19,9 +19,23 @@ _DEFAULT_CODEX_MODELS = (
     "gpt-5.5",
 )
 
-_original_get_default_codex_provider = _impl.get_default_codex_provider
-_original_normalize_config_schema = _impl.normalize_config_schema
-_original_upsert_codex_profile = _impl.upsert_codex_profile
+# Keep stable references to the real implementations. Tests reload this module,
+# and without storing these originals on main_impl itself a reload would capture
+# our already-patched wrappers and recurse forever.
+if not hasattr(_impl, "_codex_original_get_default_codex_provider"):
+    _impl._codex_original_get_default_codex_provider = (
+        _impl.get_default_codex_provider
+    )
+if not hasattr(_impl, "_codex_original_normalize_config_schema"):
+    _impl._codex_original_normalize_config_schema = _impl.normalize_config_schema
+if not hasattr(_impl, "_codex_original_upsert_codex_profile"):
+    _impl._codex_original_upsert_codex_profile = _impl.upsert_codex_profile
+
+_original_get_default_codex_provider = (
+    _impl._codex_original_get_default_codex_provider
+)
+_original_normalize_config_schema = _impl._codex_original_normalize_config_schema
+_original_upsert_codex_profile = _impl._codex_original_upsert_codex_profile
 
 
 def configured_codex_models() -> list[str]:

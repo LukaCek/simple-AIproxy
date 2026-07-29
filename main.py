@@ -293,12 +293,6 @@ def chat_to_responses_payload(
     if payload.get("temperature") is not None:
         converted["temperature"] = payload["temperature"]
 
-    max_output_tokens = payload.get(
-        "max_completion_tokens", payload.get("max_tokens")
-    )
-    if max_output_tokens is not None:
-        converted["max_output_tokens"] = max_output_tokens
-
     return converted
 
 

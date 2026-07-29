@@ -112,7 +112,9 @@ def extract_response_text_from_sse(body: bytes | str) -> str:
         ):
             output_items.append(item)
 
-    calls = _response_tool_calls(completed_response or {"output": output_items})
+    calls = _response_tool_calls(completed_response)
+    if not calls:
+        calls = _response_tool_calls({"output": output_items})
     if calls:
         return _encode_tool_calls(calls)
     return _original_extract_response_text_from_sse(body)

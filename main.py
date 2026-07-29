@@ -75,9 +75,16 @@ def extract_response_text_from_sse(body: bytes | str) -> str:
     )
     completed_response: dict[str, Any] | None = None
     output_items: list[dict[str, Any]] = []
+    current_event = ""
 
-    for line in text_body.splitlines():
+    for raw_line in text_body.splitlines():
+        line = raw_line.strip()
+        if line.startswith("event:"):
+            current_event = line[6:].strip()
+            continue
         if not line.startswith("data:"):
+            if not line:
+                current_event = ""
             continue
 
         data_text = line[5:].strip()
@@ -91,13 +98,14 @@ def extract_response_text_from_sse(body: bytes | str) -> str:
         if not isinstance(event, dict):
             continue
 
+        event_type = str(event.get("type") or current_event or "")
         response = event.get("response")
-        if event.get("type") == "response.completed" and isinstance(response, dict):
+        if event_type == "response.completed" and isinstance(response, dict):
             completed_response = response
 
         item = event.get("item")
         if (
-            event.get("type")
+            event_type
             in {"response.output_item.added", "response.output_item.done"}
             and isinstance(item, dict)
             and item not in output_items

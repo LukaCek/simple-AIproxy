@@ -1,14 +1,18 @@
 """Runtime extension that adds live updates to the admin request-log page.
 
-The existing application writes completed request records to SQLite. This module
-adds a small authenticated polling endpoint and injects a browser client into
-/admin/logs so newly written records appear without a page refresh.
+Completed request logs remain in the existing Logs table. Requests that are still
+being processed are tracked in a small SQLite ActiveRequests table and merged
+into the live admin feed. This keeps the feature working across Uvicorn workers
+without creating duplicate completed Logs rows.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Any
+import uuid
+from datetime import datetime
+from typing import Any, Optional
 
 from fastapi import Depends, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -19,13 +23,167 @@ import main as _impl
 app = _codex.app
 
 
+def init_active_requests_schema() -> None:
+    """Create the shared table used for requests that have not finished yet."""
+    _impl.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _impl.get_db_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ActiveRequests (
+                request_id TEXT PRIMARY KEY,
+                api_key_name TEXT,
+                api_key_hash TEXT,
+                requested_model TEXT,
+                provider_name TEXT,
+                provider_model TEXT,
+                started_at TEXT NOT NULL,
+                prompt TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _active_provider(payload: dict[str, Any]) -> tuple[str, str]:
+    requested_model = str(payload.get("model") or "")
+    if not requested_model:
+        return "-", "-"
+    try:
+        endpoints = _impl.resolve_requested_model(requested_model)
+    except Exception:
+        return "-", requested_model
+    if not endpoints:
+        return "-", requested_model
+    endpoint = endpoints[0]
+    return (
+        str(endpoint.get("name") or "-"),
+        str(endpoint.get("model") or requested_model or "-"),
+    )
+
+
+def start_active_request(
+    payload: dict[str, Any],
+    authorization: str = "",
+    request_id: Optional[str] = None,
+) -> str:
+    """Persist a request before it is sent to an upstream provider."""
+    init_active_requests_schema()
+    active_id = request_id or f"active-{uuid.uuid4().hex}"
+    started_at = datetime.utcnow().isoformat()
+    requested_model = str(payload.get("model") or "")
+    provider_name, provider_model = _active_provider(payload)
+    prompt = _impl.extract_prompt(payload)
+
+    api_key_name = ""
+    api_key_hash = ""
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ", 1)[1].strip()
+        if token:
+            api_key_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+            try:
+                record = _impl.get_api_key_record(token)
+            except Exception:
+                record = None
+            if record is not None and "name" in record.keys():
+                api_key_name = str(record["name"] or "")
+
+    with _impl.get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO ActiveRequests (
+                request_id, api_key_name, api_key_hash, requested_model,
+                provider_name, provider_model, started_at, prompt, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                active_id,
+                api_key_name,
+                api_key_hash,
+                requested_model,
+                provider_name,
+                provider_model,
+                started_at,
+                _impl.truncate_text(prompt),
+                started_at,
+            ),
+        )
+        conn.commit()
+    return active_id
+
+
+def finish_active_request(request_id: Optional[str]) -> None:
+    """Remove a running marker after the downstream response has fully finished."""
+    if not request_id:
+        return
+    init_active_requests_schema()
+    with _impl.get_db_connection() as conn:
+        conn.execute(
+            "DELETE FROM ActiveRequests WHERE request_id = ?",
+            (request_id,),
+        )
+        conn.commit()
+
+
+def list_active_requests() -> list[dict[str, Any]]:
+    """Return a fresh snapshot of all currently running requests."""
+    init_active_requests_schema()
+    with _impl.get_db_connection() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT request_id, api_key_name, api_key_hash, requested_model,
+                       provider_name, provider_model, started_at, prompt, created_at
+                FROM ActiveRequests
+                ORDER BY started_at DESC
+                """
+            ).fetchall()
+        ]
+
+    now = datetime.utcnow()
+    for row in rows:
+        try:
+            started = datetime.fromisoformat(str(row.get("started_at") or ""))
+            elapsed = max((now - started).total_seconds(), 0.0)
+            duration = f"{elapsed:.2f}s"
+        except Exception:
+            duration = "-"
+
+        row.update(
+            {
+                "id": row["request_id"],
+                "group_name": row.get("requested_model"),
+                "status_code": None,
+                "status": "running",
+                "running": True,
+                "first_response_at": None,
+                "ended_at": None,
+                "first_response_ms": None,
+                "total_ms": None,
+                "duration": duration,
+                "first_response": "-",
+                "api_key_display": row.get("api_key_name") or "-",
+                "output": "",
+                "error": None,
+                "type": "LLM",
+            }
+        )
+        row["modal_payload"] = {
+            key: value
+            for key, value in row.items()
+            if key != "modal_payload"
+        }
+    return rows
+
+
 def list_logs_after_id(after_id: int = 0, limit: int = 100) -> dict[str, Any]:
-    """Return newly completed logs in chronological order."""
+    """Return newly completed logs and a snapshot of running requests."""
     safe_after_id = max(int(after_id), 0)
     safe_limit = min(max(int(limit), 1), 200)
 
-    # list_logs returns newest-first. Read the same bounded history used by the
-    # page, filter it, then reverse it so the browser can prepend in order.
+    # list_logs returns newest-first. Reverse the filtered rows so the browser
+    # can prepend them without losing the database order.
     recent_logs = _impl.list_logs(limit=200)
     new_logs = [
         log
@@ -35,7 +193,11 @@ def list_logs_after_id(after_id: int = 0, limit: int = 100) -> dict[str, Any]:
     latest_id = max(
         [safe_after_id, *[int(log.get("id") or 0) for log in recent_logs]]
     )
-    return {"logs": new_logs, "latest_id": latest_id}
+    return {
+        "logs": new_logs,
+        "running": list_active_requests(),
+        "latest_id": latest_id,
+    }
 
 
 async def admin_logs_live(
@@ -72,6 +234,7 @@ _LIVE_LOGS_SCRIPT = r"""
     0,
     ...Array.from(tableBody.querySelectorAll('tr[data-log-id]'))
       .map((row) => Number(row.dataset.logId || 0))
+      .filter(Number.isFinite)
   );
   let failures = 0;
   let stopped = false;
@@ -107,23 +270,36 @@ _LIVE_LOGS_SCRIPT = r"""
   }
 
   function statusMarkup(log) {
+    if (log.running) {
+      return '<span class="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-700 ring-1 ring-amber-200"><span class="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500"></span>Running</span>';
+    }
     const ok = Number(log.status_code) >= 200 && Number(log.status_code) < 300;
     return ok
       ? '<span class="inline-flex rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 ring-1 ring-emerald-200">Success</span>'
       : '<span class="inline-flex rounded-full bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-700 ring-1 ring-rose-200">Failure</span>';
   }
 
+  function payloadId(log) {
+    return String(log.request_id || log.id);
+  }
+
   function createRow(log) {
     const row = document.createElement('tr');
-    row.dataset.logId = String(log.id);
-    row.className = 'group cursor-pointer transition hover:bg-sky-50/70 focus-within:bg-sky-50';
+    const key = payloadId(log);
+    if (log.running) {
+      row.dataset.runningId = key;
+      row.className = 'group cursor-pointer bg-amber-50/40 transition hover:bg-amber-50 focus-within:bg-amber-50';
+    } else {
+      row.dataset.logId = String(log.id);
+      row.className = 'group cursor-pointer transition hover:bg-sky-50/70 focus-within:bg-sky-50';
+    }
     row.setAttribute('role', 'button');
     row.tabIndex = 0;
-    row.addEventListener('click', () => window.openLogModal(String(log.id)));
+    row.addEventListener('click', () => window.openLogModal(key));
     row.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
-        window.openLogModal(String(log.id));
+        window.openLogModal(key);
       }
     });
 
@@ -144,33 +320,60 @@ _LIVE_LOGS_SCRIPT = r"""
   }
 
   function storePayload(log) {
-    let node = document.getElementById(`log-json-${log.id}`);
+    const key = payloadId(log);
+    let node = document.getElementById(`log-json-${key}`);
     if (!node) {
       node = document.createElement('script');
       node.type = 'application/json';
-      node.id = `log-json-${log.id}`;
+      node.id = `log-json-${key}`;
       document.body.appendChild(node);
     }
     node.textContent = JSON.stringify(log.modal_payload || log);
   }
 
   function updateCount() {
-    const count = tableBody.querySelectorAll('tr[data-log-id]').length;
+    const completed = tableBody.querySelectorAll('tr[data-log-id]').length;
+    const running = tableBody.querySelectorAll('tr[data-running-id]').length;
     const badges = Array.from(document.querySelectorAll('section > div:first-child div'));
     const badge = badges.find((node) => /recent calls/.test(node.textContent || ''));
-    if (badge) badge.textContent = `${count} recent calls`;
+    if (badge) {
+      badge.textContent = running
+        ? `${completed} recent calls · ${running} running`
+        : `${completed} recent calls`;
+    }
   }
 
   function addLog(log) {
     if (!log || !log.id || document.querySelector(`tr[data-log-id="${Number(log.id)}"]`)) return;
-    tableBody.querySelector('tr:not([data-log-id])')?.remove();
+    tableBody.querySelector('tr:not([data-log-id]):not([data-running-id])')?.remove();
     tableBody.prepend(createRow(log));
     storePayload(log);
 
     const rows = Array.from(tableBody.querySelectorAll('tr[data-log-id]'));
     for (const oldRow of rows.slice(200)) {
+      document.getElementById(`log-json-log-${oldRow.dataset.logId}`)?.remove();
       document.getElementById(`log-json-${oldRow.dataset.logId}`)?.remove();
       oldRow.remove();
+    }
+  }
+
+  function syncRunning(logs) {
+    const activeKeys = new Set((logs || []).map(payloadId));
+
+    for (const row of Array.from(tableBody.querySelectorAll('tr[data-running-id]'))) {
+      if (!activeKeys.has(row.dataset.runningId)) {
+        document.getElementById(`log-json-${row.dataset.runningId}`)?.remove();
+        row.remove();
+      }
+    }
+
+    for (const log of [...(logs || [])].reverse()) {
+      const key = payloadId(log);
+      const current = Array.from(tableBody.querySelectorAll('tr[data-running-id]'))
+        .find((row) => row.dataset.runningId === key);
+      current?.remove();
+      tableBody.prepend(createRow(log));
+      storePayload(log);
     }
     updateCount();
   }
@@ -193,8 +396,10 @@ _LIVE_LOGS_SCRIPT = r"""
       const data = await response.json();
       for (const log of data.logs || []) addLog(log);
       latestId = Math.max(latestId, Number(data.latest_id || 0));
+      const running = data.running || [];
+      syncRunning(running);
       failures = 0;
-      setStatus('live', 'Live');
+      setStatus('live', running.length ? `Live · ${running.length} running` : 'Live');
     } catch (error) {
       failures += 1;
       setStatus('reconnecting', failures > 1 ? 'Reconnecting' : 'Retrying');
@@ -213,6 +418,49 @@ _LIVE_LOGS_SCRIPT = r"""
 })();
 </script>
 """
+
+
+@app.middleware("http")
+async def track_running_requests(request: Request, call_next: Any) -> Response:
+    """Track chat requests until their response body has been fully consumed."""
+    should_track = (
+        request.method.upper() == "POST"
+        and request.url.path == "/v1/chat/completions"
+    )
+    active_id: Optional[str] = None
+
+    if should_track:
+        try:
+            body = await request.body()
+            payload = json.loads(body) if body else {}
+            if isinstance(payload, dict) and payload.get("background") is not True:
+                active_id = start_active_request(
+                    payload,
+                    request.headers.get("Authorization", ""),
+                )
+        except Exception:
+            # Logging must never be able to break the proxy request.
+            active_id = None
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        finish_active_request(active_id)
+        raise
+
+    original_iterator = getattr(response, "body_iterator", None)
+    if active_id and original_iterator is not None:
+        async def tracked_body() -> Any:
+            try:
+                async for chunk in original_iterator:
+                    yield chunk
+            finally:
+                finish_active_request(active_id)
+
+        response.body_iterator = tracked_body()
+    else:
+        finish_active_request(active_id)
+    return response
 
 
 @app.middleware("http")

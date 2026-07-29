@@ -152,3 +152,52 @@ def test_responses_sse_uses_output_item_when_completed_output_is_empty():
         "type": "function",
         "function": {"name": "ping", "arguments": "{}"},
     }]
+
+
+def test_responses_sse_deduplicates_added_and_done_for_same_call():
+    added = {
+        "type": "response.output_item.added",
+        "item": {
+            "id": "fc_same",
+            "type": "function_call",
+            "status": "in_progress",
+            "arguments": "",
+            "call_id": "call_same",
+            "name": "ping",
+        },
+        "output_index": 0,
+    }
+    done = {
+        "type": "response.output_item.done",
+        "item": {
+            "id": "fc_same",
+            "type": "function_call",
+            "status": "completed",
+            "arguments": "{}",
+            "call_id": "call_same",
+            "name": "ping",
+        },
+        "output_index": 0,
+    }
+    completed = {
+        "type": "response.completed",
+        "response": {"status": "completed", "output": []},
+    }
+    body = (
+        "event: response.output_item.added\n"
+        f"data: {json.dumps(added)}\n\n"
+        "event: response.output_item.done\n"
+        f"data: {json.dumps(done)}\n\n"
+        "event: response.completed\n"
+        f"data: {json.dumps(completed)}\n\n"
+    )
+
+    encoded = main.extract_response_text_from_sse(body)
+    completion = main.chat_completion_from_text("gpt-5.5", encoded)
+    calls = completion["choices"][0]["message"]["tool_calls"]
+
+    assert calls == [{
+        "id": "call_same",
+        "type": "function",
+        "function": {"name": "ping", "arguments": "{}"},
+    }]

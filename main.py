@@ -74,7 +74,7 @@ def extract_response_text_from_sse(body: bytes | str) -> str:
         body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
     )
     completed_response: dict[str, Any] | None = None
-    output_items: list[dict[str, Any]] = []
+    output_items: dict[str, dict[str, Any]] = {}
     current_event = ""
 
     for raw_line in text_body.splitlines():
@@ -108,13 +108,17 @@ def extract_response_text_from_sse(body: bytes | str) -> str:
             event_type
             in {"response.output_item.added", "response.output_item.done"}
             and isinstance(item, dict)
-            and item not in output_items
         ):
-            output_items.append(item)
+            item_key = str(
+                item.get("call_id")
+                or item.get("id")
+                or f"output_{event.get('output_index', len(output_items))}"
+            )
+            output_items[item_key] = item
 
     calls = _response_tool_calls(completed_response)
     if not calls:
-        calls = _response_tool_calls({"output": output_items})
+        calls = _response_tool_calls({"output": list(output_items.values())})
     if calls:
         return _encode_tool_calls(calls)
     return _original_extract_response_text_from_sse(body)

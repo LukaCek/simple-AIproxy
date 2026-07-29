@@ -1,8 +1,30 @@
+import importlib
 import sqlite3
 from pathlib import Path
 
-import live_logs_entrypoint as live
+import pytest
+
 import main
+
+
+@pytest.fixture
+def live():
+    """Import the runtime entrypoint without leaking its Codex patches to tests."""
+    helper_names = (
+        "get_default_codex_provider",
+        "normalize_config_schema",
+        "upsert_codex_profile",
+    )
+    original_helpers = {
+        name: getattr(main, name)
+        for name in helper_names
+    }
+    module = importlib.import_module("live_logs_entrypoint")
+    try:
+        yield module
+    finally:
+        for name, helper in original_helpers.items():
+            setattr(main, name, helper)
 
 
 def setup_logs(tmp_path: Path, monkeypatch) -> None:
@@ -48,7 +70,7 @@ def setup_logs(tmp_path: Path, monkeypatch) -> None:
         conn.commit()
 
 
-def test_list_logs_after_id_returns_only_new_rows_in_order(tmp_path, monkeypatch):
+def test_list_logs_after_id_returns_only_new_rows_in_order(tmp_path, monkeypatch, live):
     setup_logs(tmp_path, monkeypatch)
 
     result = live.list_logs_after_id(after_id=1, limit=100)
@@ -58,7 +80,7 @@ def test_list_logs_after_id_returns_only_new_rows_in_order(tmp_path, monkeypatch
     assert result["latest_id"] == 3
 
 
-def test_list_logs_after_id_honors_limit(tmp_path, monkeypatch):
+def test_list_logs_after_id_honors_limit(tmp_path, monkeypatch, live):
     setup_logs(tmp_path, monkeypatch)
 
     result = live.list_logs_after_id(after_id=0, limit=1)
@@ -67,7 +89,7 @@ def test_list_logs_after_id_honors_limit(tmp_path, monkeypatch):
     assert result["latest_id"] == 3
 
 
-def test_live_route_and_browser_client_are_registered():
+def test_live_route_and_browser_client_are_registered(live):
     assert any(
         getattr(route, "path", None) == "/admin/logs/live"
         for route in live.app.router.routes

@@ -1,4 +1,4 @@
-"""Runtime extension for normal Codex Responses SSE text compatibility."""
+"""Runtime extensions for Codex Responses compatibility."""
 
 from __future__ import annotations
 
@@ -11,6 +11,19 @@ from typing import Any
 import main as _impl
 
 _original_extract_response_text_from_sse = _impl.extract_response_text_from_sse
+_original_chat_to_responses_payload = _impl.chat_to_responses_payload
+
+
+def chat_to_responses_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
+    """Convert Chat Completions input while omitting unsupported Codex fields.
+
+    Home Assistant includes ``temperature`` in its OpenAI-compatible requests.
+    The ChatGPT Codex Responses backend rejects that field, so it must not be
+    forwarded. Other provider modes still receive the original request payload.
+    """
+    converted = _original_chat_to_responses_payload(payload, model)
+    converted.pop("temperature", None)
+    return converted
 
 
 def _text_from_content(value: Any) -> str:
@@ -122,5 +135,6 @@ def extract_response_text_from_sse(body: bytes | str) -> str:
     return original
 
 
+_impl.chat_to_responses_payload = chat_to_responses_payload
 _impl.extract_response_text_from_sse = extract_response_text_from_sse
 app = _impl.app

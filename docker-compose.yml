@@ -7,4 +7,9 @@ services:
     volumes:
       - ./config.yml:/app/config.yml:rw
       - ./app.db:/app/app.db:rw
+    environment:
+      # Full topic URL, e.g. https://ntfy.sh/your-private-topic
+      - AIPROXY_NTFY_URL=${AIPROXY_NTFY_URL:-}
+      # Optional bearer token for a protected ntfy topic
+      - AIPROXY_NTFY_TOKEN=${AIPROXY_NTFY_TOKEN:-}
     mem_limit: 512m

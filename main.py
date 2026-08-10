@@ -6,11 +6,61 @@ from typing import Any
 
 import main_impl as _impl
 
+from provider_monitor import ProviderDisconnectMonitor, send_ntfy_notification
+
 _TOOL_SENTINEL = "__AIPROXY_TOOL_CALLS__"
 _original_extract_response_text = _impl.extract_response_text
 _original_extract_response_text_from_sse = _impl.extract_response_text_from_sse
 _original_chat_completion_from_text = _impl.chat_completion_from_text
 _original_sse_chat_chunks = _impl.sse_chat_chunks
+
+
+def get_ntfy_config() -> dict[str, Any]:
+    notifications = _impl.config_data.get("notifications") or {}
+    configured = notifications.get("ntfy") if isinstance(notifications, dict) else None
+    ntfy = dict(configured or _impl.config_data.get("ntfy") or {})
+    env_url = _impl.os.getenv("AIPROXY_NTFY_URL", "").strip()
+    if env_url:
+        ntfy["url"] = env_url
+        ntfy.setdefault("enabled", True)
+    return ntfy
+
+
+async def run_provider_monitor_once(
+    monitor: ProviderDisconnectMonitor,
+) -> list[dict[str, str]]:
+    ntfy = get_ntfy_config()
+    if not ntfy.get("enabled"):
+        return []
+    events: list[dict[str, str]] = []
+    results = await _impl.test_all_provider_models(
+        str(ntfy.get("prompt") or "Reply with OK.")
+    )
+    for result in results.get("results", []):
+        provider_name = str(result.get("provider") or "unknown")
+        success = bool(result.get("success"))
+        error = "" if success else str(result.get("response") or "Provider check failed")
+        events.extend(monitor.record(provider_name, success, error))
+    if _impl.http_client is not None:
+        for event in events:
+            try:
+                await _impl.send_ntfy_notification(_impl.http_client, ntfy, event)
+            except Exception as exc:
+                print(f"Failed to send ntfy provider alert: {exc}")
+    return events
+
+
+async def provider_monitor_loop(monitor: ProviderDisconnectMonitor) -> None:
+    while True:
+        ntfy = get_ntfy_config()
+        interval = max(15.0, float(ntfy.get("check_interval_seconds", 300)))
+        await _impl.asyncio.sleep(interval)
+        try:
+            await run_provider_monitor_once(monitor)
+        except _impl.asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"Provider monitor check failed: {exc}")
 
 
 def _response_tool_calls(data: Any) -> list[dict[str, Any]]:
@@ -316,6 +366,66 @@ _impl.extract_response_text_from_sse = extract_response_text_from_sse
 _impl.chat_completion_from_text = chat_completion_from_text
 _impl.sse_chat_chunks = sse_chat_chunks
 _impl.chat_to_responses_payload = chat_to_responses_payload
+
+_original_normalize_config_schema = _impl.normalize_config_schema
+
+
+def normalize_config_schema(data: dict[str, Any]) -> dict[str, Any]:
+    data = _original_normalize_config_schema(data)
+    notifications = data.setdefault("notifications", {})
+    if not isinstance(notifications, dict):
+        notifications = {}
+        data["notifications"] = notifications
+    ntfy = notifications.setdefault("ntfy", {})
+    if not isinstance(ntfy, dict):
+        ntfy = {}
+        notifications["ntfy"] = ntfy
+    ntfy.setdefault("enabled", True)
+    ntfy.setdefault("url", "https://ntfy.cekluka.com/aiproxy")
+    ntfy.setdefault("username", "")
+    ntfy.setdefault("password", "")
+    ntfy.setdefault("check_interval_seconds", 300)
+    ntfy.setdefault("failure_threshold", 2)
+    ntfy.setdefault("notify_recovery", True)
+    return data
+
+
+_impl.provider_monitor_task = None
+_original_startup = _impl.startup
+_original_shutdown = _impl.shutdown
+
+
+async def startup() -> None:
+    await _original_startup()
+    ntfy = get_ntfy_config()
+    if ntfy.get("enabled"):
+        monitor = ProviderDisconnectMonitor(
+            failure_threshold=int(ntfy.get("failure_threshold", 2)),
+            notify_recovery=bool(ntfy.get("notify_recovery", True)),
+        )
+        _impl.provider_monitor_task = _impl.asyncio.create_task(
+            provider_monitor_loop(monitor)
+        )
+
+
+async def shutdown() -> None:
+    if _impl.provider_monitor_task is not None:
+        _impl.provider_monitor_task.cancel()
+        try:
+            await _impl.provider_monitor_task
+        except _impl.asyncio.CancelledError:
+            pass
+        _impl.provider_monitor_task = None
+    await _original_shutdown()
+
+
+_impl.normalize_config_schema = normalize_config_schema
+_impl.send_ntfy_notification = send_ntfy_notification
+_impl.get_ntfy_config = get_ntfy_config
+_impl.run_provider_monitor_once = run_provider_monitor_once
+_impl.provider_monitor_loop = provider_monitor_loop
+_impl.startup = startup
+_impl.shutdown = shutdown
 
 # Expose the implementation module as `main` so existing monkeypatch-based tests and
 # runtime configuration updates modify the exact globals used by FastAPI handlers.

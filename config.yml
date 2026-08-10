@@ -80,3 +80,15 @@ groups:
     members:
       - provider: ollama-local
         model: llama3.2
+
+# Optional provider disconnect/recovery notifications. For protected topics,
+# keep the token in AIPROXY_NTFY_TOKEN rather than in this file.
+notifications:
+  ntfy:
+    enabled: false
+    url: https://ntfy.cekluka.com/aiproxy
+    username: ""
+    password: ""
+    check_interval_seconds: 300
+    failure_threshold: 2
+    notify_recovery: true

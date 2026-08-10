@@ -11,6 +11,7 @@ A lightweight FastAPI-based LLM API gateway with an OpenAI-compatible facade:
 - minimal Responses/Codex adapter for OpenAI Codex OAuth profiles
 - request logging and a simple Jinja2/Tailwind admin GUI
 - durable background jobs for slow-brain inference
+- optional ntfy alerts when a provider disconnects or recovers
 
 ## Why this version exists
 
@@ -41,6 +42,32 @@ Routes:
 - `/admin/providers` — inspect/add providers
 - `/admin/logs` — view request logs
 - `/admin/config` — edit YAML config
+
+## ntfy provider alerts
+
+The proxy can periodically test every configured provider and publish one ntfy
+alert after repeated failures. It sends no duplicate alerts while the provider
+remains down, and can send a recovery notification when it works again.
+
+Enable it in `config.yml`:
+
+```yaml
+notifications:
+  ntfy:
+    enabled: true
+    url: https://ntfy.cekluka.com/aiproxy
+    username: ""
+    password: ""
+    check_interval_seconds: 300
+    failure_threshold: 2
+    notify_recovery: true
+```
+
+For protected topics, fill `username` and `password`, or set
+`AIPROXY_NTFY_TOKEN`. You can instead set the complete topic URL with
+`AIPROXY_NTFY_URL`; this overrides the configured URL. Provider
+checks use the first configured model and the normal provider adapter, so choose
+an interval appropriate for providers that charge per request.
 
 ## Client usage
 

@@ -54,3 +54,13 @@ groups:
     members:
       - provider: ollama-local
         model: llama3.2
+
+notifications:
+  ntfy:
+    enabled: true
+    url: https://ntfy.cekluka.com/aiproxy
+    username: ""
+    password: ""
+    check_interval_seconds: 300
+    failure_threshold: 2
+    notify_recovery: true

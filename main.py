@@ -5,7 +5,6 @@ import uuid
 from typing import Any
 
 import main_impl as _impl
-
 from provider_monitor import ProviderDisconnectMonitor, send_ntfy_notification
 
 _TOOL_SENTINEL = "__AIPROXY_TOOL_CALLS__"
@@ -45,7 +44,7 @@ async def run_provider_monitor_once(
         for event in events:
             try:
                 await _impl.send_ntfy_notification(_impl.http_client, ntfy, event)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate notification failures
                 print(f"Failed to send ntfy provider alert: {exc}")
     return events
 
@@ -59,7 +58,7 @@ async def provider_monitor_loop(monitor: ProviderDisconnectMonitor) -> None:
             await run_provider_monitor_once(monitor)
         except _impl.asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - keep the monitor loop alive
             print(f"Provider monitor check failed: {exc}")
 
 

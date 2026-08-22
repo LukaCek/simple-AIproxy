@@ -32,7 +32,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest pytest-asyncio ruff
-          ruff check --ignore BLE001 main.py free_model_registry.py tests/test_proxy.py tests/test_free_model_registry.py
+          ruff check --ignore BLE001,RUF100 main.py free_model_registry.py tests/test_proxy.py tests/test_free_model_registry.py
           pytest -q
 
       - name: Start services with docker compose

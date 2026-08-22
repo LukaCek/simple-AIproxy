@@ -12,6 +12,7 @@ import asyncio
 import copy
 import json
 import os
+import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,16 @@ def mask_secret(secret: str) -> str:
     return f"{value[:4]}••••{value[-4:]}"
 
 
+def _column_names(rows: list[Any]) -> set[str]:
+    names: set[str] = set()
+    for row in rows:
+        try:
+            names.add(str(row["name"]))
+        except (KeyError, IndexError, TypeError):
+            names.add(str(row[1]))
+    return names
+
+
 def init_free_provider_key_schema(impl: Any) -> None:
     with impl.get_db_connection() as conn:
         conn.execute(
@@ -122,13 +133,34 @@ def init_free_provider_key_schema(impl: Any) -> None:
                 provider_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 api_key TEXT NOT NULL,
+                extra_values_json TEXT NOT NULL DEFAULT '{}',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 UNIQUE(provider_id, name)
             )
             """
         )
+        columns = _column_names(conn.execute("PRAGMA table_info(FreeProviderKeys)").fetchall())
+        if "extra_values_json" not in columns:
+            conn.execute(
+                "ALTER TABLE FreeProviderKeys "
+                "ADD COLUMN extra_values_json TEXT NOT NULL DEFAULT '{}'"
+            )
         conn.commit()
+
+
+def _decode_extra_values(value: Any) -> dict[str, str]:
+    try:
+        decoded = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {
+        str(key): str(item)
+        for key, item in decoded.items()
+        if item is not None and str(item).strip()
+    }
 
 
 def list_stored_key_records(
@@ -138,18 +170,19 @@ def list_stored_key_records(
         with impl.get_db_connection() as conn:
             rows = conn.execute(
                 """
-                SELECT id, provider_id, name, api_key, enabled, created_at
+                SELECT id, provider_id, name, api_key, extra_values_json, enabled, created_at
                 FROM FreeProviderKeys
                 ORDER BY provider_id, id
                 """
             ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return []
 
     result: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         item["enabled"] = bool(item.get("enabled"))
+        item["extra_values"] = _decode_extra_values(item.pop("extra_values_json", "{}"))
         item["key_display"] = mask_secret(str(item.get("api_key") or ""))
         if not include_secret:
             item.pop("api_key", None)
@@ -157,7 +190,14 @@ def list_stored_key_records(
     return result
 
 
-def upsert_stored_key(impl: Any, provider_id: str, name: str, api_key: str) -> None:
+def upsert_stored_key(
+    impl: Any,
+    provider_id: str,
+    name: str,
+    api_key: str,
+    *,
+    extra_values: Mapping[str, str] | None = None,
+) -> None:
     clean_provider = provider_id.strip()
     clean_name = name.strip()
     clean_key = api_key.strip()
@@ -169,17 +209,30 @@ def upsert_stored_key(impl: Any, provider_id: str, name: str, api_key: str) -> N
         raise ValueError("Key name is too long")
     if not clean_key:
         raise ValueError("API key is required")
+    clean_extra = {
+        str(key): str(value).strip()
+        for key, value in (extra_values or {}).items()
+        if str(value).strip()
+    }
     init_free_provider_key_schema(impl)
     with impl.get_db_connection() as conn:
         conn.execute(
             """
-            INSERT INTO FreeProviderKeys (provider_id, name, api_key, enabled, created_at)
-            VALUES (?, ?, ?, 1, ?)
+            INSERT INTO FreeProviderKeys
+                (provider_id, name, api_key, extra_values_json, enabled, created_at)
+            VALUES (?, ?, ?, ?, 1, ?)
             ON CONFLICT(provider_id, name) DO UPDATE SET
                 api_key = excluded.api_key,
+                extra_values_json = excluded.extra_values_json,
                 enabled = 1
             """,
-            (clean_provider, clean_name, clean_key, impl.datetime.utcnow().isoformat()),
+            (
+                clean_provider,
+                clean_name,
+                clean_key,
+                json.dumps(clean_extra, sort_keys=True),
+                impl.datetime.utcnow().isoformat(),
+            ),
         )
         conn.commit()
 
@@ -201,6 +254,17 @@ def set_stored_key_enabled(impl: Any, key_id: int, enabled: bool) -> bool:
         return cursor.rowcount > 0
 
 
+def _account_id_env(provider: Mapping[str, Any]) -> str:
+    return str(provider.get("account_id_env") or "").strip()
+
+
+def _stored_account_id(record: Mapping[str, Any]) -> str:
+    extra = record.get("extra_values")
+    if not isinstance(extra, Mapping):
+        return ""
+    return str(extra.get("account_id") or "").strip()
+
+
 def _credentials_for_provider(
     provider: dict[str, Any],
     env: Mapping[str, str],
@@ -208,17 +272,21 @@ def _credentials_for_provider(
 ) -> list[dict[str, Any]]:
     provider_id = str(provider.get("id") or "").strip()
     credentials: list[dict[str, Any]] = []
-    seen_keys: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    account_env = _account_id_env(provider)
 
     key_env = str(provider.get("api_key_env") or "").strip()
     env_key = str(env.get(key_env, "") or "").strip() if key_env else ""
-    if env_key:
-        seen_keys.add(env_key)
+    env_account_id = str(env.get(account_env, "") or "").strip() if account_env else ""
+    if env_key and (not account_env or env_account_id):
+        identity = (env_key, env_account_id)
+        seen.add(identity)
         credentials.append(
             {
                 "id": "env",
                 "name": key_env,
                 "api_key": env_key,
+                "account_id": env_account_id,
                 "source": "environment",
             }
         )
@@ -229,18 +297,37 @@ def _credentials_for_provider(
         if record.get("enabled") is False:
             continue
         api_key = str(record.get("api_key") or "").strip()
-        if not api_key or api_key in seen_keys:
+        account_id = _stored_account_id(record) if account_env else ""
+        if not api_key or (account_env and not account_id):
             continue
-        seen_keys.add(api_key)
+        identity = (api_key, account_id)
+        if identity in seen:
+            continue
+        seen.add(identity)
         credentials.append(
             {
                 "id": f"db-{record.get('id')}",
                 "name": str(record.get("name") or f"Key {record.get('id')}"),
                 "api_key": api_key,
+                "account_id": account_id,
                 "source": "database",
             }
         )
     return credentials
+
+
+def _render_endpoint_url(provider: Mapping[str, Any], credential: Mapping[str, Any]) -> str:
+    endpoint_url = str(provider.get("chat_completions_url") or "").strip()
+    account_env = _account_id_env(provider)
+    if not account_env:
+        return endpoint_url
+    account_id = str(credential.get("account_id") or "").strip()
+    if not account_id:
+        return ""
+    encoded_account_id = quote(account_id, safe="")
+    endpoint_url = endpoint_url.replace(f"{{{account_env}}}", encoded_account_id)
+    endpoint_url = endpoint_url.replace(account_env, encoded_account_id)
+    return endpoint_url
 
 
 def build_registry_overlay(
@@ -253,6 +340,8 @@ def build_registry_overlay(
     Each configured credential becomes a separate endpoint. Credentials for the
     same provider/model are adjacent, so retryable failures such as 429 naturally
     fall through to the next key before the proxy tries a lower-priority model.
+    Provider-specific endpoint values such as a Cloudflare Account ID are resolved
+    per credential before the in-memory provider is created.
     """
 
     validate_registry(registry)
@@ -270,8 +359,7 @@ def build_registry_overlay(
         ):
             continue
         provider_id = str(provider.get("id") or "").strip()
-        endpoint_url = str(provider.get("chat_completions_url") or "").strip()
-        if not provider_id or not endpoint_url:
+        if not provider_id or not str(provider.get("chat_completions_url") or "").strip():
             continue
 
         credentials = _credentials_for_provider(provider, env, stored)
@@ -297,11 +385,12 @@ def build_registry_overlay(
         if not enabled_models or not default_models:
             continue
 
-        provider_names: list[str] = []
         for credential_index, credential in enumerate(credentials):
+            endpoint_url = _render_endpoint_url(provider, credential)
+            if not endpoint_url:
+                continue
             credential_id = str(credential["id"])
             provider_name = f"free-registry-{provider_id}-{credential_id}"
-            provider_names.append(provider_name)
             providers.append(
                 {
                     "name": provider_name,
@@ -412,6 +501,14 @@ def _apply_to_impl(impl: Any, registry: dict[str, Any]) -> None:
         )
 
 
+def _stored_record_complete(provider: Mapping[str, Any], record: Mapping[str, Any]) -> bool:
+    if record.get("enabled") is False:
+        return False
+    if not _account_id_env(provider):
+        return True
+    return bool(_stored_account_id(record))
+
+
 def provider_statuses(impl: Any, registry: dict[str, Any] | None) -> list[dict[str, Any]]:
     if registry is None:
         return []
@@ -423,14 +520,26 @@ def provider_statuses(impl: Any, registry: dict[str, Any] | None) -> list[dict[s
         provider_id = str(provider.get("id") or "").strip()
         if not provider_id:
             continue
-        free_tier = provider.get("free_tier") if isinstance(provider.get("free_tier"), dict) else {}
+        free_tier = (
+            provider.get("free_tier")
+            if isinstance(provider.get("free_tier"), dict)
+            else {}
+        )
         eligible = bool(free_tier.get("default_group_eligible", False))
         key_env = str(provider.get("api_key_env") or "").strip()
-        env_configured = bool(str(os.environ.get(key_env, "") or "").strip()) if key_env else False
+        account_env = _account_id_env(provider)
+        env_key_present = bool(str(os.environ.get(key_env, "") or "").strip()) if key_env else False
+        env_account_present = (
+            bool(str(os.environ.get(account_env, "") or "").strip())
+            if account_env
+            else True
+        )
+        env_configured = env_key_present and env_account_present
         stored_for_provider = [
             key
             for key in stored
-            if key.get("provider_id") == provider_id and key.get("enabled")
+            if key.get("provider_id") == provider_id
+            and _stored_record_complete(provider, key)
         ]
         default_models = [
             str(model.get("id"))
@@ -451,6 +560,8 @@ def provider_statuses(impl: Any, registry: dict[str, Any] | None) -> list[dict[s
                 "stored_count": len(stored_for_provider),
                 "env_configured": env_configured,
                 "api_key_env": key_env,
+                "account_id_env": account_env,
+                "account_id_required": bool(account_env),
                 "models": default_models,
                 "signup_url": str(provider.get("signup_url") or ""),
                 "free_tier_type": str(free_tier.get("type") or "unknown"),
@@ -462,16 +573,19 @@ def provider_statuses(impl: Any, registry: dict[str, Any] | None) -> list[dict[s
 
 def stored_keys_for_ui(impl: Any, registry: dict[str, Any] | None) -> list[dict[str, Any]]:
     provider_names: dict[str, str] = {}
+    provider_account_envs: dict[str, str] = {}
     if registry is not None:
         for provider in registry.get("providers", []):
             if isinstance(provider, dict) and provider.get("id"):
-                provider_names[str(provider["id"])] = str(
-                    provider.get("name") or provider["id"]
-                )
+                provider_id = str(provider["id"])
+                provider_names[provider_id] = str(provider.get("name") or provider_id)
+                provider_account_envs[provider_id] = _account_id_env(provider)
     keys = list_stored_key_records(impl, include_secret=False)
     for key in keys:
         provider_id = str(key.get("provider_id") or "")
         key["provider_name"] = provider_names.get(provider_id, provider_id)
+        key["account_id_required"] = bool(provider_account_envs.get(provider_id))
+        key["account_id_display"] = _stored_account_id(key)
     return keys
 
 
@@ -588,6 +702,7 @@ def install(impl: Any) -> None:
         provider_id: str = Form(...),
         key_name: str = Form(...),
         api_key: str = Form(...),
+        account_id: str = Form(""),
     ) -> RedirectResponse:
         registry = _registry_for_impl(impl)
         provider = _find_registry_provider(registry, provider_id.strip())
@@ -604,15 +719,31 @@ def install(impl: Any) -> None:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="This provider is not eligible for the default free-models pool",
             )
+        account_env = _account_id_env(provider)
+        clean_account_id = account_id.strip()
+        if account_env and not clean_account_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Account ID is required for {provider.get('name') or provider_id}",
+            )
+        extra_values = {"account_id": clean_account_id} if account_env else {}
         try:
-            upsert_stored_key(impl, provider_id, key_name, api_key)
+            upsert_stored_key(
+                impl,
+                provider_id,
+                key_name,
+                api_key,
+                extra_values=extra_values,
+            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
             ) from exc
         if registry is not None:
             _apply_to_impl(impl, registry)
-        message = quote(f"Saved {provider.get('name') or provider_id} key '{key_name.strip()}'")
+        message = quote(
+            f"Saved {provider.get('name') or provider_id} key '{key_name.strip()}'"
+        )
         return RedirectResponse(
             url=f"/admin/config?message={message}",
             status_code=status.HTTP_303_SEE_OTHER,

@@ -7,7 +7,7 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch:    # Bonus: Doda gumb za ročni zagon akcije v GitHub vmesniku!
+  workflow_dispatch:
 
 jobs:
   test:
@@ -96,11 +96,29 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
-      - name: Deploy via SSH
+      - name: Checkout deployment files
+        uses: actions/checkout@v4
+
+      - name: Sync production Docker Compose and update script
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "server_deployment/docker-compose.yml,server_deployment/update.sh"
+          target: ${{ secrets.DEPLOY_PATH }}
+          strip_components: 1
+          overwrite: true
+
+      - name: Deploy via SSH and verify health
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           port: ${{ secrets.DEPLOY_PORT }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: cd ${{ secrets.DEPLOY_PATH }} && ./update.sh
+          script: |
+            cd ${{ secrets.DEPLOY_PATH }}
+            chmod +x update.sh
+            ./update.sh

@@ -158,9 +158,13 @@ jobs:
           if [ "${DEPLOY_RESULT}" = "success" ]; then
             STATUS="verified"
             DEPLOYED_SHA="${COMMIT_SHA}"
+            FASTAPI_HEALTH=true
+            ADMIN_CONFIG_UI=true
           else
             STATUS="failed"
             DEPLOYED_SHA=""
+            FASTAPI_HEALTH=false
+            ADMIN_CONFIG_UI=false
           fi
           cat > deployment-status.json <<EOF
           {
@@ -175,8 +179,8 @@ jobs:
               "deploy": "${DEPLOY_RESULT}"
             },
             "checks": {
-              "fastapi_health": ${DEPLOY_RESULT == "success"},
-              "admin_config_free_provider_ui": ${DEPLOY_RESULT == "success"}
+              "fastapi_health": ${FASTAPI_HEALTH},
+              "admin_config_free_provider_ui": ${ADMIN_CONFIG_UI}
             }
           }
           EOF

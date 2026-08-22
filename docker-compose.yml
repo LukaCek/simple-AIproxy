@@ -7,9 +7,20 @@ services:
     volumes:
       - ./config.yml:/app/config.yml:rw
       - ./app.db:/app/app.db:rw
+      - ./cache:/app/cache:rw
     environment:
       # Full topic URL, e.g. https://ntfy.sh/your-private-topic
       - AIPROXY_NTFY_URL=${AIPROXY_NTFY_URL:-}
       # Optional bearer token for a protected ntfy topic
       - AIPROXY_NTFY_TOKEN=${AIPROXY_NTFY_TOKEN:-}
+      # Dynamic free-model registry. Override only if you maintain another registry.
+      - AIPROXY_FREE_MODELS_REGISTRY_URL=${AIPROXY_FREE_MODELS_REGISTRY_URL:-https://raw.githubusercontent.com/LukaCek/free-ai-models/main/registry.json}
+      - AIPROXY_FREE_MODELS_REFRESH_SECONDS=${AIPROXY_FREE_MODELS_REFRESH_SECONDS:-1800}
+      # Provider credentials stay local. Only providers with a configured key enter free-models.
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - SAMBANOVA_API_KEY=${SAMBANOVA_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
     mem_limit: 512m

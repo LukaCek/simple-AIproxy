@@ -28,7 +28,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest pytest-asyncio ruff
-          ruff check main.py tests/test_proxy.py
+          ruff check main.py free_model_registry.py tests/test_proxy.py tests/test_free_model_registry.py
           pytest -q
 
       - name: Start services with docker compose

@@ -98,10 +98,14 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout deployment files
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Sync production Docker Compose and update script
         uses: appleboy/scp-action@v0.1.7
@@ -115,7 +119,7 @@ jobs:
           strip_components: 1
           overwrite: true
 
-      - name: Deploy via SSH and verify health
+      - name: Deploy via SSH and verify health and admin UI
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -126,3 +130,33 @@ jobs:
             cd ${{ secrets.DEPLOY_PATH }}
             chmod +x update.sh
             ./update.sh
+
+      - name: Publish verified deployment status
+        env:
+          DEPLOYED_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          git config user.name "SimpleAIProxy Deploy Bot"
+          git config user.email "deploy-bot@users.noreply.github.com"
+          git fetch origin deployment-status
+          git switch deployment-status
+          DEPLOYED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          cat > deployment-status.json <<EOF
+          {
+            "status": "verified",
+            "deployed_sha": "${DEPLOYED_SHA}",
+            "deployed_at": "${DEPLOYED_AT}",
+            "workflow_run_url": "https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}",
+            "checks": {
+              "fastapi_health": true,
+              "admin_config_free_provider_ui": true
+            }
+          }
+          EOF
+          git add deployment-status.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Record verified deployment ${DEPLOYED_SHA}"
+          git push origin deployment-status

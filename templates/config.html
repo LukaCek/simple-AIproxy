@@ -61,12 +61,13 @@
                   <div class="font-semibold text-slate-900">{{ provider.name }}</div>
                   <div class="mt-1 text-xs text-slate-500">{{ provider.id }}</div>
                   {% if provider.free_tier_summary %}<div class="mt-2 max-w-xl text-xs text-slate-500">{{ provider.free_tier_summary }}</div>{% endif %}
+                  {% if provider.account_id_required %}<div class="mt-2 text-xs font-medium text-sky-700">Requires Account ID per credential.</div>{% endif %}
                 </td>
                 <td class="px-4 py-4 align-top">
                   {% if provider.configured %}
                     <span class="inline-flex rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-semibold text-emerald-800">Ready</span>
                   {% else %}
-                    <span class="inline-flex rounded-full bg-amber-100 px-2.5 py-1 text-xs font-semibold text-amber-800">Key needed</span>
+                    <span class="inline-flex rounded-full bg-amber-100 px-2.5 py-1 text-xs font-semibold text-amber-800">Credential needed</span>
                   {% endif %}
                 </td>
                 <td class="px-4 py-4 align-top text-slate-700">
@@ -80,7 +81,7 @@
                 </td>
                 <td class="px-4 py-4 align-top">
                   <div class="font-medium text-slate-800">{{ provider.configured_count }} configured</div>
-                  <div class="mt-1 text-xs text-slate-500">{{ provider.stored_count }} from UI{% if provider.env_configured %} + ENV {{ provider.api_key_env }}{% endif %}</div>
+                  <div class="mt-1 text-xs text-slate-500">{{ provider.stored_count }} from UI{% if provider.env_configured %} + ENV {{ provider.api_key_env }}{% if provider.account_id_env %} / {{ provider.account_id_env }}{% endif %}{% endif %}</div>
                 </td>
                 <td class="px-4 py-4 align-top">
                   {% if provider.signup_url %}
@@ -98,33 +99,37 @@
     </div>
 
     <div class="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-5">
-      <h3 class="font-semibold text-slate-900">Add or replace a named key</h3>
-      <p class="mt-1 text-sm text-slate-500">Use different names such as <code>Luka</code>, <code>Brother</code>, or <code>Backup</code>. Reusing the same provider + name replaces that key instead of creating a duplicate.</p>
-      <form action="/admin/config/free-provider-keys" method="post" class="mt-4 grid gap-4 lg:grid-cols-[1fr_1fr_2fr_auto] lg:items-end">
+      <h3 class="font-semibold text-slate-900">Add or replace a named credential</h3>
+      <p class="mt-1 text-sm text-slate-500">Use different names such as <code>Luka</code>, <code>Brother</code>, or <code>Backup</code>. Reusing the same provider + name replaces that credential instead of creating a duplicate. Cloudflare also needs the Account ID for the account that owns the API token.</p>
+      <form action="/admin/config/free-provider-keys" method="post" class="mt-4 grid gap-4 lg:grid-cols-2 xl:grid-cols-[1fr_1fr_2fr_1.5fr_auto] xl:items-end">
         <label class="block">
           <span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Provider</span>
-          <select name="provider_id" required class="w-full rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
+          <select id="free-provider-select" name="provider_id" required class="w-full rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200">
             {% for provider in free_provider_statuses %}
-              {% if provider.eligible %}<option value="{{ provider.id }}">{{ provider.name }}</option>{% endif %}
+              {% if provider.eligible %}<option value="{{ provider.id }}" data-account-id-required="{% if provider.account_id_required %}1{% else %}0{% endif %}">{{ provider.name }}</option>{% endif %}
             {% endfor %}
           </select>
         </label>
         <label class="block">
-          <span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Key name</span>
+          <span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Credential name</span>
           <input name="key_name" required maxlength="120" placeholder="e.g. Luka" class="w-full rounded-2xl border border-slate-200 bg-white px-3 py-3 text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
         </label>
         <label class="block">
-          <span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">API key</span>
+          <span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">API key / token</span>
           <input name="api_key" type="password" required autocomplete="off" placeholder="Paste provider API key" class="w-full rounded-2xl border border-slate-200 bg-white px-3 py-3 font-mono text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
         </label>
-        <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Save key</button>
+        <label id="free-provider-account-id-field" class="hidden block">
+          <span class="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-500">Cloudflare Account ID</span>
+          <input id="free-provider-account-id-input" name="account_id" autocomplete="off" placeholder="32-character account ID" class="w-full rounded-2xl border border-slate-200 bg-white px-3 py-3 font-mono text-sm outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200" />
+        </label>
+        <button type="submit" class="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700">Save credential</button>
       </form>
     </div>
 
     <div class="mt-6">
       <div class="flex items-center justify-between gap-3">
-        <h3 class="font-semibold text-slate-900">Keys stored from this UI</h3>
-        <span class="text-xs text-slate-500">Secret values are always masked here.</span>
+        <h3 class="font-semibold text-slate-900">Credentials stored from this UI</h3>
+        <span class="text-xs text-slate-500">API secrets are always masked here.</span>
       </div>
       {% if free_provider_keys %}
         <div class="mt-3 overflow-hidden rounded-2xl border border-slate-200">
@@ -134,7 +139,8 @@
                 <tr>
                   <th class="px-4 py-3">Provider</th>
                   <th class="px-4 py-3">Name</th>
-                  <th class="px-4 py-3">Key</th>
+                  <th class="px-4 py-3">API key</th>
+                  <th class="px-4 py-3">Account ID</th>
                   <th class="px-4 py-3">State</th>
                   <th class="px-4 py-3">Actions</th>
                 </tr>
@@ -145,6 +151,7 @@
                     <td class="px-4 py-3 font-medium text-slate-900">{{ key.provider_name }}</td>
                     <td class="px-4 py-3 text-slate-700">{{ key.name }}</td>
                     <td class="px-4 py-3 font-mono text-xs text-slate-600">{{ key.key_display }}</td>
+                    <td class="px-4 py-3 font-mono text-xs text-slate-600">{% if key.account_id_required %}{{ key.account_id_display or "missing" }}{% else %}<span class="text-slate-400">—</span>{% endif %}</td>
                     <td class="px-4 py-3">
                       {% if key.enabled %}<span class="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-semibold text-emerald-800">Enabled</span>{% else %}<span class="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">Disabled</span>{% endif %}
                     </td>
@@ -154,7 +161,7 @@
                           <input type="hidden" name="enabled" value="{% if key.enabled %}0{% else %}1{% endif %}" />
                           <button type="submit" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50">{% if key.enabled %}Disable{% else %}Enable{% endif %}</button>
                         </form>
-                        <form action="/admin/config/free-provider-keys/{{ key.id }}/delete" method="post" onsubmit="return confirm('Delete this provider key?');">
+                        <form action="/admin/config/free-provider-keys/{{ key.id }}/delete" method="post" onsubmit="return confirm('Delete this provider credential?');">
                           <button type="submit" class="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-100">Delete</button>
                         </form>
                       </div>
@@ -166,9 +173,27 @@
           </div>
         </div>
       {% else %}
-        <div class="mt-3 rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-5 text-sm text-slate-500">No UI-managed free-provider keys yet.</div>
+        <div class="mt-3 rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-5 text-sm text-slate-500">No UI-managed free-provider credentials yet.</div>
       {% endif %}
     </div>
   {% endif %}
 </section>
+
+<script>
+  (() => {
+    const select = document.getElementById('free-provider-select');
+    const field = document.getElementById('free-provider-account-id-field');
+    const input = document.getElementById('free-provider-account-id-input');
+    if (!select || !field || !input) return;
+    const sync = () => {
+      const option = select.options[select.selectedIndex];
+      const required = option && option.dataset.accountIdRequired === '1';
+      field.classList.toggle('hidden', !required);
+      input.required = required;
+      if (!required) input.value = '';
+    };
+    select.addEventListener('change', sync);
+    sync();
+  })();
+</script>
 {% endblock %}

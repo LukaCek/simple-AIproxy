@@ -1,6 +1,16 @@
 {
-  "status": "not-yet-reported",
-  "deployed_sha": null,
-  "deployed_at": null,
-  "workflow_run_url": null
+  "status": "failed",
+  "commit_sha": "11ce288fa6145ce434db76a63f88b0669ecf11c9",
+  "deployed_sha": "",
+  "reported_at": "2026-08-22T09:53:48Z",
+  "workflow_run_url": "https://github.com/LukaCek/simple-AIproxy/actions/runs/32566144404",
+  "jobs": {
+    "test": "failure",
+    "build_and_push": "skipped",
+    "deploy": "skipped"
+  },
+  "checks": {
+    "fastapi_health": false,
+    "admin_config_free_provider_ui": false
+  }
 }

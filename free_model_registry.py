@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 
@@ -44,14 +45,14 @@ def cache_path(base_dir: Path) -> Path:
 
 def validate_registry(registry: Any) -> dict[str, Any]:
     if not isinstance(registry, dict):
-        raise ValueError("Free-model registry must be a JSON object")
+        raise TypeError("Free-model registry must be a JSON object")
     if registry.get("schema_version") != 1:
         raise ValueError(
             f"Unsupported free-model registry schema_version: {registry.get('schema_version')!r}"
         )
     providers = registry.get("providers")
     if not isinstance(providers, list):
-        raise ValueError("Free-model registry providers must be a list")
+        raise TypeError("Free-model registry providers must be a list")
     return registry
 
 
@@ -59,7 +60,7 @@ def load_cached_registry(path: Path) -> dict[str, Any] | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return validate_registry(data)
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
 

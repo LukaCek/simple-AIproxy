@@ -1,6 +1,6 @@
 # Dynamic `free-models` pool
 
-SimpleAIProxy can build a live fallback group named `free-models` from the public registry at:
+SimpleAIProxy builds a live fallback group named `free-models` from the public registry at:
 
 `https://raw.githubusercontent.com/LukaCek/free-ai-models/main/registry.json`
 
@@ -12,7 +12,7 @@ On startup the proxy:
 2. fetches the latest registry,
 3. validates `schema_version`,
 4. keeps only providers marked as eligible for the default free group,
-5. checks whether the provider's required local API-key environment variable exists,
+5. loads provider credentials from local environment variables and the local SQLite credential store,
 6. creates in-memory `free-registry-*` providers,
 7. sorts selected models by registry `priority`, and
 8. exposes them as the `free-models` group with `strategy: fallback`.
@@ -21,9 +21,18 @@ The registry is refreshed every 30 minutes by default. A failed fetch does not r
 
 ## Credentials
 
-API keys are never read from the public registry. The registry contains only the name of the environment variable that should hold each key.
+API keys are never read from the public registry and never written to `config.yml`.
 
-Set whichever providers you want to use in the deployment `.env` file:
+The recommended way to manage free-provider credentials is **Admin → Config → Free provider API keys**. Each key has:
+
+- a registry provider,
+- a user-defined name such as `Luka`, `Brother`, or `Backup`,
+- an enabled/disabled state,
+- the secret API key, stored in the local `app.db` SQLite database.
+
+You can add multiple named keys to the same provider. For a given provider/model, the generated fallback order keeps those credentials adjacent, so retryable failures such as quota/rate-limit responses can fall through to another key before trying the next model/provider.
+
+Environment variables remain supported and are treated as the first credential for their provider:
 
 ```bash
 GEMINI_API_KEY=...
@@ -34,7 +43,9 @@ OPENROUTER_API_KEY=...
 NVIDIA_API_KEY=...
 ```
 
-Only providers with a non-empty local key become active. NVIDIA is tracked by the registry but is currently excluded from the automatic group because its hosted free access is classified as prototype/API-trial access.
+The Admin Config page shows whether each eligible free provider currently has at least one usable key. Secret values are masked in the UI.
+
+NVIDIA is tracked by the registry but is currently excluded from the automatic group because its hosted free access is classified as prototype/API-trial access.
 
 ## Client request
 
@@ -47,7 +58,7 @@ curl -sS http://localhost:8000/v1/chat/completions \
   -d '{"model":"free-models","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-The first available provider is tried first. Retryable failures such as 401/403/429 and common 5xx responses fall through to the next registry member using the proxy's existing fallback behavior.
+The highest-priority configured free model is tried first. Retryable failures such as 401/403/429 and common 5xx responses fall through to the next credential/model using the proxy's existing fallback behavior.
 
 ## Configuration
 
@@ -59,12 +70,13 @@ AIPROXY_FREE_MODELS_REFRESH_SECONDS=1800
 AIPROXY_FREE_MODELS_CACHE_PATH=/app/cache/free-models-registry.json
 ```
 
-The Docker Compose configuration mounts `./cache` into `/app/cache` so the last-known-good registry survives container recreation.
+The production Docker Compose configuration mounts both `app.db` and `./cache`, so UI-managed provider keys and the last-known-good registry survive container recreation.
 
 ## Safety properties
 
-- registry data is configuration only; no provider secrets are stored there,
-- provider credentials remain local environment variables,
-- registry-generated providers exist only in memory and are never written into `config.yml`,
+- registry data is public configuration only; no provider secrets are stored there,
+- provider credentials live only in local environment variables or the local SQLite database,
+- dynamic registry providers are stripped before YAML is rendered or persisted,
+- an older accidentally persisted registry overlay is automatically removed on startup,
 - trial/prototype providers do not enter `free-models` unless the registry explicitly marks them eligible,
 - user-configured providers are preserved when the registry refreshes.

@@ -55,6 +55,29 @@ def sample_registry():
                 ],
             },
             {
+                "id": "cloud",
+                "name": "Cloud",
+                "enabled": True,
+                "chat_completions_url": (
+                    "https://api.example/accounts/{CLOUD_ACCOUNT_ID}/ai/v1/chat/completions"
+                ),
+                "api_mode": "openai_chat_completions",
+                "api_key_env": "CLOUD_KEY",
+                "account_id_env": "CLOUD_ACCOUNT_ID",
+                "free_tier": {
+                    "type": "ongoing",
+                    "default_group_eligible": True,
+                },
+                "models": [
+                    {
+                        "id": "cloud-model",
+                        "enabled": True,
+                        "include_in_default_group": True,
+                        "priority": 15,
+                    }
+                ],
+            },
+            {
                 "id": "trial",
                 "name": "Trial",
                 "enabled": True,
@@ -86,6 +109,7 @@ def test_build_overlay_uses_env_and_multiple_stored_keys_in_priority_order():
             "name": "Luka",
             "api_key": "alpha-luka",
             "enabled": True,
+            "extra_values": {},
         },
         {
             "id": 12,
@@ -93,6 +117,7 @@ def test_build_overlay_uses_env_and_multiple_stored_keys_in_priority_order():
             "name": "Brother",
             "api_key": "alpha-brother",
             "enabled": True,
+            "extra_values": {},
         },
     ]
     providers, group = registry.build_registry_overlay(
@@ -123,6 +148,64 @@ def test_build_overlay_uses_env_and_multiple_stored_keys_in_priority_order():
     ]
 
 
+def test_build_overlay_resolves_account_id_from_environment():
+    providers, group = registry.build_registry_overlay(
+        sample_registry(),
+        environ={"CLOUD_KEY": "cloud-secret", "CLOUD_ACCOUNT_ID": "abc123"},
+    )
+
+    assert [provider["name"] for provider in providers] == ["free-registry-cloud-env"]
+    assert providers[0]["url"] == (
+        "https://api.example/accounts/abc123/ai/v1/chat/completions"
+    )
+    assert group["members"] == [
+        {"provider": "free-registry-cloud-env", "model": "cloud-model"}
+    ]
+
+
+def test_build_overlay_skips_account_scoped_provider_when_account_id_missing():
+    providers, group = registry.build_registry_overlay(
+        sample_registry(), environ={"CLOUD_KEY": "cloud-secret"}
+    )
+
+    assert providers == []
+    assert group["members"] == []
+
+
+def test_build_overlay_resolves_per_key_account_id_from_ui_storage():
+    providers, group = registry.build_registry_overlay(
+        sample_registry(),
+        environ={},
+        stored_credentials=[
+            {
+                "id": 21,
+                "provider_id": "cloud",
+                "name": "Luka",
+                "api_key": "cloud-luka",
+                "enabled": True,
+                "extra_values": {"account_id": "luka-account"},
+            },
+            {
+                "id": 22,
+                "provider_id": "cloud",
+                "name": "Brother",
+                "api_key": "cloud-brother",
+                "enabled": True,
+                "extra_values": {"account_id": "brother-account"},
+            },
+        ],
+    )
+
+    assert [provider["url"] for provider in providers] == [
+        "https://api.example/accounts/luka-account/ai/v1/chat/completions",
+        "https://api.example/accounts/brother-account/ai/v1/chat/completions",
+    ]
+    assert group["members"] == [
+        {"provider": "free-registry-cloud-db-21", "model": "cloud-model"},
+        {"provider": "free-registry-cloud-db-22", "model": "cloud-model"},
+    ]
+
+
 def test_build_overlay_uses_ui_key_when_environment_key_is_missing():
     providers, group = registry.build_registry_overlay(
         sample_registry(),
@@ -134,6 +217,7 @@ def test_build_overlay_uses_ui_key_when_environment_key_is_missing():
                 "name": "Backup",
                 "api_key": "alpha-backup",
                 "enabled": True,
+                "extra_values": {},
             }
         ],
     )
@@ -157,6 +241,7 @@ def test_build_overlay_skips_disabled_and_duplicate_stored_keys():
                 "name": "Duplicate",
                 "api_key": "same-secret",
                 "enabled": True,
+                "extra_values": {},
             },
             {
                 "id": 2,
@@ -164,6 +249,7 @@ def test_build_overlay_skips_disabled_and_duplicate_stored_keys():
                 "name": "Disabled",
                 "api_key": "disabled-secret",
                 "enabled": False,
+                "extra_values": {},
             },
         ],
     )

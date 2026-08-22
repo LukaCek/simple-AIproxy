@@ -27,6 +27,34 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
+echo "[$(date +'%Y-%m-%d %H:%M:%S')] Verifying Free provider API keys UI..."
+docker compose exec -T llm-proxy python - <<'PY'
+import base64
+import os
+import sys
+import urllib.request
+
+username = os.environ.get("ADMIN_USERNAME", "admin")
+password = os.environ.get("ADMIN_PASSWORD", "admin")
+token = base64.b64encode(f"{username}:{password}".encode()).decode()
+request = urllib.request.Request(
+    "http://127.0.0.1:8000/admin/config",
+    headers={"Authorization": f"Basic {token}"},
+)
+try:
+    with urllib.request.urlopen(request, timeout=5) as response:
+        body = response.read().decode("utf-8", errors="replace")
+except Exception as exc:
+    print(f"Failed to open /admin/config: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+marker = "Free provider API keys"
+if marker not in body:
+    print(f"/admin/config is reachable but missing expected UI marker: {marker}", file=sys.stderr)
+    sys.exit(1)
+print("Verified /admin/config contains Free provider API keys UI.")
+PY
+
 echo "[$(date +'%Y-%m-%d %H:%M:%S')] Cleaning up dangling images..."
 docker image prune -f
 

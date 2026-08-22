@@ -98,8 +98,6 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout deployment files
@@ -131,26 +129,54 @@ jobs:
             chmod +x update.sh
             ./update.sh
 
-      - name: Publish verified deployment status
+  report:
+    needs: [test, build-and-push, deploy]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish pipeline result
         env:
-          DEPLOYED_SHA: ${{ github.sha }}
+          COMMIT_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
+          TEST_RESULT: ${{ needs.test.result }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
         run: |
           git config user.name "SimpleAIProxy Deploy Bot"
           git config user.email "deploy-bot@users.noreply.github.com"
           git fetch origin deployment-status
           git switch deployment-status
-          DEPLOYED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          REPORTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          if [ "${DEPLOY_RESULT}" = "success" ]; then
+            STATUS="verified"
+            DEPLOYED_SHA="${COMMIT_SHA}"
+          else
+            STATUS="failed"
+            DEPLOYED_SHA=""
+          fi
           cat > deployment-status.json <<EOF
           {
-            "status": "verified",
+            "status": "${STATUS}",
+            "commit_sha": "${COMMIT_SHA}",
             "deployed_sha": "${DEPLOYED_SHA}",
-            "deployed_at": "${DEPLOYED_AT}",
+            "reported_at": "${REPORTED_AT}",
             "workflow_run_url": "https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}",
+            "jobs": {
+              "test": "${TEST_RESULT}",
+              "build_and_push": "${BUILD_RESULT}",
+              "deploy": "${DEPLOY_RESULT}"
+            },
             "checks": {
-              "fastapi_health": true,
-              "admin_config_free_provider_ui": true
+              "fastapi_health": ${DEPLOY_RESULT == "success"},
+              "admin_config_free_provider_ui": ${DEPLOY_RESULT == "success"}
             }
           }
           EOF
@@ -158,5 +184,5 @@ jobs:
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m "Record verified deployment ${DEPLOYED_SHA}"
+          git commit -m "Record deployment pipeline ${COMMIT_SHA}"
           git push origin deployment-status

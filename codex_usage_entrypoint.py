@@ -8,13 +8,15 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-import live_logs_entrypoint as _live
+# Register usage routes directly on the shared base app. Importing the live-log or
+# Codex entrypoint here would apply their global runtime patches during pytest
+# collection, leaking production-only behavior into unrelated tests.
 import main as _impl
 
-app = _live.app
+app = _impl.app
 
 
 def _decode_jwt_payload(token: str) -> dict[str, Any]:

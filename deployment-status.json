@@ -1,16 +1,16 @@
 {
-  "status": "failed",
-  "commit_sha": "c7a363300f7af2418ab75926eb9b5ba112178c52",
-  "deployed_sha": "",
-  "reported_at": "2026-08-25T15:17:55Z",
-  "workflow_run_url": "https://github.com/LukaCek/simple-AIproxy/actions/runs/32864870965",
+  "status": "verified",
+  "commit_sha": "299690a4f922551dbe51d0c7055ba5781b0a7fc1",
+  "deployed_sha": "299690a4f922551dbe51d0c7055ba5781b0a7fc1",
+  "reported_at": "2026-08-25T15:53:17Z",
+  "workflow_run_url": "https://github.com/LukaCek/simple-AIproxy/actions/runs/32868257037",
   "jobs": {
-    "test": "failure",
-    "build_and_push": "skipped",
-    "deploy": "skipped"
+    "test": "success",
+    "build_and_push": "success",
+    "deploy": "success"
   },
   "checks": {
-    "fastapi_health": false,
-    "admin_config_free_provider_ui": false
+    "fastapi_health": true,
+    "admin_config_free_provider_ui": true
   }
 }

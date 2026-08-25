@@ -6,6 +6,9 @@ import runtime_entrypoint as _runtime  # noqa: F401
 # Then register live request-log routes and middleware behavior.
 import live_logs_entrypoint as _live
 
+# Register the Codex usage dashboard/API on the same shared FastAPI app.
+import codex_usage_entrypoint as _codex_usage  # noqa: F401
+
 # Finally attach the dynamic free-model registry to the shared base application.
 import free_model_registry as _free_registry
 import main_impl as _impl

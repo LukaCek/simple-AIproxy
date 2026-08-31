@@ -232,6 +232,100 @@ def test_responses_adapter_returns_chat_completion_and_sse(tmp_path, monkeypatch
     assert fake.requests[0]["timeout"] == main.UPSTREAM_REQUEST_TIMEOUT_SECONDS
 
 
+def test_responses_adapter_converts_chat_vision_parts(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = FakeResponsesClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {
+                "name": "codex-vision",
+                "url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "token",
+                "models": ["gpt-5.5"],
+                "api_mode": "codex_responses",
+            }
+        ],
+        "groups": {
+            "vision": {
+                "members": [
+                    {"provider": "codex-vision", "model": "gpt-5.5"}
+                ]
+            }
+        },
+    }
+    image_data_url = "data:image/png;base64,iVBORw0KGgo="
+
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "vision",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What is in this image?"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_data_url,
+                                    "detail": "high",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert fake.requests[0]["json"]["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is in this image?"},
+                {
+                    "type": "input_image",
+                    "image_url": image_data_url,
+                    "detail": "high",
+                },
+            ],
+        }
+    ]
+
+
+def test_responses_vision_conversion_accepts_string_url_and_is_idempotent():
+    converted = main.chat_to_responses_payload(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": "https://example.com/a.png"},
+                        {"type": "input_text", "text": "Already converted"},
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/b.png",
+                        },
+                    ],
+                }
+            ]
+        },
+        "gpt-5.5",
+    )
+
+    assert converted["input"][0]["content"] == [
+        {"type": "input_image", "image_url": "https://example.com/a.png"},
+        {"type": "input_text", "text": "Already converted"},
+        {"type": "input_image", "image_url": "https://example.com/b.png"},
+    ]
+
+
 def test_codex_responses_html_challenge_is_not_returned_as_success(tmp_path, monkeypatch):
     setup_key_db(tmp_path, monkeypatch)
     fake = FakeCloudflareResponsesClient()

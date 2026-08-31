@@ -242,6 +242,53 @@ def sse_chat_chunks(model: str, text: str):
     yield b"data: [DONE]\n\n"
 
 
+def _chat_content_to_responses(content: Any) -> Any:
+    """Translate Chat Completions content parts to Responses API parts.
+
+    OpenAI-compatible vision clients send ``text`` and ``image_url`` parts.
+    Responses expects ``input_text`` and ``input_image`` instead, with the
+    image URL lifted out of Chat Completions' nested ``image_url`` object.
+    Strings and already-native Responses parts are left unchanged.
+    """
+    if not isinstance(content, list):
+        return content
+
+    converted: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            converted.append(part)
+            continue
+
+        part_type = part.get("type")
+        if part_type == "text":
+            converted.append({"type": "input_text", "text": str(part.get("text") or "")})
+            continue
+
+        if part_type == "image_url":
+            raw_image = part.get("image_url")
+            if isinstance(raw_image, dict):
+                image_url = raw_image.get("url")
+                detail = raw_image.get("detail") or part.get("detail")
+            else:
+                image_url = raw_image
+                detail = part.get("detail")
+
+            image_part: dict[str, Any] = {
+                "type": "input_image",
+                "image_url": image_url,
+            }
+            if detail is not None:
+                image_part["detail"] = detail
+            converted.append(image_part)
+            continue
+
+        # This also makes the adapter idempotent for callers that already send
+        # Responses API content such as input_text/input_image/input_file.
+        converted.append(dict(part))
+
+    return converted
+
+
 def chat_to_responses_payload(
     payload: dict[str, Any], model: str
 ) -> dict[str, Any]:
@@ -306,7 +353,9 @@ def chat_to_responses_payload(
                 )
             continue
 
-        input_items.append({"role": role, "content": content})
+        input_items.append(
+            {"role": role, "content": _chat_content_to_responses(content)}
+        )
 
     converted: dict[str, Any] = {
         "model": model,

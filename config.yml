@@ -36,6 +36,18 @@ providers:
     api_key: ""
     api_mode: openai_chat_completions
 
+  # OpenAI-compatible speech-to-text example. Keep the real key in GROQ_API_KEY
+  # on the server; clients authenticate only to AIProxy.
+  - name: groq-transcription
+    url: https://api.groq.com/openai/v1
+    description: Groq Whisper speech transcription
+    models:
+      - whisper-large-v3-turbo
+      - whisper-large-v3
+    api_key: ""
+    api_key_env: GROQ_API_KEY
+    api_mode: openai_audio_transcriptions
+
 model_profiles:
   slowbrain-70b:
     type: llamacpp_rpc

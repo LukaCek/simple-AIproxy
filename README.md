@@ -42,6 +42,7 @@ Routes:
 - `/admin/providers` — inspect/add providers
 - `/admin/logs` — view request logs
 - `/admin/config` — edit YAML config
+- `/admin/codex-usage` — inspect live limits for every Codex OAuth profile
 
 ## ntfy provider alerts
 
@@ -132,6 +133,40 @@ groups:
 With `strategy: round_robin`, requests rotate `codex-a`, `codex-b`, `codex-a`, `codex-b`, ... while still falling back on retryable upstream failures.
 
 Important: Codex is not a normal `/v1/chat/completions` backend. The proxy exposes `/v1/chat/completions` to clients, then translates simple chat requests to the Codex/Responses backend. This supports basic text requests and a compatibility SSE stream; advanced tool/reasoning behavior may need deeper adapter work later.
+
+### Live Codex usage API
+
+`GET /v1/codex/usage` returns the same live OpenAI subscription limits as the
+admin Codex Usage page, but for all configured Codex profiles in one response.
+It uses the normal proxy bearer-key authentication. The results are fetched
+from OpenAI for each request and are not written to the proxy database or used
+to derive historical usage.
+
+```bash
+curl -sS http://localhost:8000/v1/codex/usage \
+  -H 'Authorization: Bearer API_KEY'
+```
+
+One unavailable profile is returned as an error item while healthy profiles
+remain available. Responses include `Cache-Control: no-store` and never include
+OAuth tokens or ChatGPT account IDs.
+
+The included `omarchy_agent_usage.py` collector converts this response into the
+record consumed by Omarchy's Agents panel. Its configuration supports either a
+direct `apiKey`, the `AIPROXY_API_KEY` environment variable, or a reference to
+an existing dotenv credential:
+
+```json
+{
+  "baseUrl": "https://proxy.example.com",
+  "apiKeyEnvFile": "~/.config/example/client.env",
+  "apiKeyEnvName": "AI_API_KEY",
+  "labels": {
+    "codex-a": "First account",
+    "codex-b": "Second account"
+  }
+}
+```
 
 ## OpenAI-compatible and Ollama providers
 

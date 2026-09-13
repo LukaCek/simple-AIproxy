@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import time
@@ -225,6 +226,73 @@ async def fetch_codex_usage(provider_name: str) -> dict[str, Any]:
             _impl.mark_provider_reauth_required(provider_name, f"Codex usage authentication failed ({response.status_code}). Reauthenticate this profile.")
         raise HTTPException(status_code=response.status_code, detail=text or f"Codex usage request failed ({response.status_code})")
     raise HTTPException(status_code=502, detail=last_error or "Codex usage endpoint is unavailable")
+
+
+def _public_usage_error(provider_name: str, status_code: int) -> str:
+    if status_code in {401, 403}:
+        return f"Codex profile '{provider_name}' requires reauthentication"
+    if status_code == 400:
+        return f"Codex profile '{provider_name}' is not configured correctly"
+    return f"Codex usage for '{provider_name}' is unavailable (HTTP {status_code})"
+
+
+async def fetch_all_codex_usage() -> dict[str, Any]:
+    """Fetch every Codex profile live without exposing credentials or failing as a group."""
+    providers = [
+        provider
+        for provider in _impl.get_providers()
+        if provider.get("is_codex_oauth")
+    ]
+
+    async def fetch_one(provider: dict[str, Any]) -> dict[str, Any]:
+        provider_name = str(provider.get("name") or "").strip()
+        display_name = str(provider.get("description") or provider_name).strip()
+        try:
+            data = await fetch_codex_usage(provider_name)
+            return {
+                "provider": provider_name,
+                "name": display_name,
+                "ok": True,
+                "usage": data,
+            }
+        except HTTPException as exc:
+            return {
+                "provider": provider_name,
+                "name": display_name,
+                "ok": False,
+                "error": {
+                    "status": int(exc.status_code),
+                    "message": _public_usage_error(provider_name, int(exc.status_code)),
+                },
+            }
+        except Exception:
+            return {
+                "provider": provider_name,
+                "name": display_name,
+                "ok": False,
+                "error": {
+                    "status": 502,
+                    "message": _public_usage_error(provider_name, 502),
+                },
+            }
+
+    results = await asyncio.gather(*(fetch_one(provider) for provider in providers))
+    return {
+        "object": "codex.usage.list",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "data": results,
+    }
+
+
+@app.get("/v1/codex/usage")
+async def codex_usage_api(
+    api_key_record: Any = Depends(_impl.validate_api_key),
+) -> JSONResponse:
+    del api_key_record
+    return JSONResponse(
+        await fetch_all_codex_usage(),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/admin/codex-usage", response_class=HTMLResponse, dependencies=[Depends(_impl.verify_admin)])

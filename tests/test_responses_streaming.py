@@ -3,7 +3,13 @@ import json
 
 import httpx
 
-import responses_streaming_entrypoint as streaming
+
+def get_streaming_module():
+    # Import lazily so the production Codex runtime extension does not mutate
+    # global model configuration while pytest is still collecting older tests.
+    import responses_streaming_entrypoint as streaming
+
+    return streaming
 
 
 class GateSSEStream(httpx.AsyncByteStream):
@@ -120,6 +126,8 @@ def data_payload(chunk: bytes):
 
 
 def test_first_chunk_is_emitted_before_upstream_completion():
+    streaming = get_streaming_module()
+
     async def scenario():
         upstream = GateSSEStream()
         response = make_response(upstream)
@@ -161,6 +169,8 @@ def test_first_chunk_is_emitted_before_upstream_completion():
 
 
 def test_silent_reasoning_emits_heartbeat_without_cancelling_read():
+    streaming = get_streaming_module()
+
     async def scenario():
         upstream = SilentSSEStream()
         response = make_response(upstream)
@@ -184,6 +194,8 @@ def test_silent_reasoning_emits_heartbeat_without_cancelling_read():
 
 
 def test_function_calls_are_streamed_as_openai_tool_call_deltas():
+    streaming = get_streaming_module()
+
     async def scenario():
         response = make_response(ToolCallSSEStream())
         chunks = [
@@ -194,7 +206,9 @@ def test_function_calls_are_streamed_as_openai_tool_call_deltas():
                 heartbeat_seconds=0.05,
             )
         ]
-        payloads = [payload for payload in map(data_payload, chunks) if isinstance(payload, dict)]
+        payloads = [
+            payload for payload in map(data_payload, chunks) if isinstance(payload, dict)
+        ]
 
         tool_deltas = [
             payload["choices"][0]["delta"]["tool_calls"][0]
@@ -215,6 +229,7 @@ def test_function_calls_are_streamed_as_openai_tool_call_deltas():
 
 
 def test_production_route_is_replaced_once():
+    streaming = get_streaming_module()
     routes = [
         route
         for route in streaming.app.router.routes

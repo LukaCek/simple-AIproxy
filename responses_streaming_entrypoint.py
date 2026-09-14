@@ -1,10 +1,10 @@
 """True streaming adapter for Responses/Codex providers.
 
 The base proxy historically buffered the complete Responses API body and only
-then converted it to Chat Completions SSE. That makes long Codex generations
-look idle to clients/reverse proxies. This extension replaces only the public
-chat-completions route and keeps non-streaming requests on the original code
-path.
+then converted it to Chat Completions SSE. Long Codex generations therefore
+looked idle to clients and reverse proxies. This extension replaces the public
+streaming chat-completions path while keeping non-streaming/background requests
+on the original implementation.
 """
 
 from __future__ import annotations
@@ -21,7 +21,8 @@ import httpx
 from fastapi import BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
 
-# Apply all existing payload/SSE/tool-call compatibility patches first.
+# Apply the existing payload, text-SSE, tool-call, and selectable-model patches
+# before installing the replacement route.
 import runtime_entrypoint as _runtime  # noqa: F401
 import codex_entrypoint as _codex
 import main_impl as _impl
@@ -84,11 +85,11 @@ def _pop_sse_events(buffer: str) -> tuple[list[str], str]:
     while True:
         lf = buffer.find("\n\n")
         crlf = buffer.find("\r\n\r\n")
-        candidates = [(lf, 2), (crlf, 4)]
-        candidates = [(index, size) for index, size in candidates if index >= 0]
-        if not candidates:
+        delimiters = [(lf, 2), (crlf, 4)]
+        delimiters = [(index, size) for index, size in delimiters if index >= 0]
+        if not delimiters:
             break
-        index, size = min(candidates, key=lambda item: item[0])
+        index, size = min(delimiters, key=lambda item: item[0])
         events.append(buffer[:index])
         buffer = buffer[index + size :]
     return events, buffer
@@ -114,26 +115,19 @@ async def responses_to_chat_sse(
     on_upstream_bytes: Optional[Callable[[bytes], None]] = None,
     on_text: Optional[Callable[[str], None]] = None,
 ) -> AsyncIterator[bytes]:
-    """Translate Responses SSE to Chat Completions SSE as events arrive.
+    """Translate Responses SSE to Chat Completions SSE incrementally.
 
-    A role chunk is emitted immediately after upstream response headers arrive.
-    While the upstream is silent, SSE comments are emitted as heartbeats without
-    cancelling the pending HTTP read. This prevents reverse-proxy idle timeouts
-    during long reasoning phases.
+    The assistant-role chunk is emitted as soon as upstream response headers are
+    available. If the Responses stream is silent while the model is reasoning,
+    SSE comments are emitted periodically without cancelling the in-flight read.
+    These comments are ignored by OpenAI-compatible clients but keep reverse
+    proxies from treating the connection as idle.
     """
 
     chunk_id = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
-    first_marked = False
-
-    def mark_first() -> None:
-        nonlocal first_marked
-        if not first_marked:
-            first_marked = True
-            if on_first is not None:
-                on_first()
-
-    mark_first()
+    if on_first is not None:
+        on_first()
     yield _chat_chunk(model, chunk_id, created, {"role": "assistant"})
 
     text_buffer = ""
@@ -152,32 +146,43 @@ async def responses_to_chat_sse(
             or f"output_{event.get('output_index', 0)}"
         )
 
-    def get_tool_state(event: dict[str, Any], item: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    def get_tool_state(
+        event: dict[str, Any], item: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
         nonlocal next_tool_index
         key = tool_key(event, item)
         state = tool_states.get(key)
         if state is None:
+            index_value = event.get("output_index")
+            index = int(index_value) if isinstance(index_value, int) else next_tool_index
             state = {
-                "index": int(event.get("output_index")) if isinstance(event.get("output_index"), int) else next_tool_index,
+                "index": index,
                 "started": False,
                 "arguments_streamed": False,
                 "id": "",
                 "name": "",
             }
-            next_tool_index = max(next_tool_index, int(state["index"]) + 1)
+            next_tool_index = max(next_tool_index, index + 1)
             tool_states[key] = state
         if item:
-            state["id"] = str(item.get("call_id") or item.get("id") or state["id"] or f"call_{uuid.uuid4().hex}")
+            state["id"] = str(
+                item.get("call_id")
+                or item.get("id")
+                or state["id"]
+                or f"call_{uuid.uuid4().hex}"
+            )
             state["name"] = str(item.get("name") or state["name"] or "")
         return state
 
     def tool_start_delta(state: dict[str, Any]) -> dict[str, Any]:
         state["started"] = True
+        if not state["id"]:
+            state["id"] = f"call_{uuid.uuid4().hex}"
         return {
             "tool_calls": [
                 {
                     "index": state["index"],
-                    "id": state["id"] or f"call_{uuid.uuid4().hex}",
+                    "id": state["id"],
                     "type": "function",
                     "function": {"name": state["name"], "arguments": ""},
                 }
@@ -208,7 +213,11 @@ async def responses_to_chat_sse(
             return
 
         item = event.get("item") if isinstance(event.get("item"), dict) else None
-        if event_type == "response.output_item.added" and item and item.get("type") == "function_call":
+        if (
+            event_type == "response.output_item.added"
+            and item
+            and item.get("type") == "function_call"
+        ):
             saw_tool_call = True
             state = get_tool_state(event, item)
             if not state["started"]:
@@ -238,13 +247,21 @@ async def responses_to_chat_sse(
                 )
             return
 
-        if event_type == "response.output_item.done" and item and item.get("type") == "function_call":
+        if (
+            event_type == "response.output_item.done"
+            and item
+            and item.get("type") == "function_call"
+        ):
             saw_tool_call = True
             state = get_tool_state(event, item)
             if not state["started"]:
                 yield _chat_chunk(model, chunk_id, created, tool_start_delta(state))
             arguments = item.get("arguments")
-            if isinstance(arguments, str) and arguments and not state["arguments_streamed"]:
+            if (
+                isinstance(arguments, str)
+                and arguments
+                and not state["arguments_streamed"]
+            ):
                 yield _chat_chunk(
                     model,
                     chunk_id,
@@ -264,8 +281,6 @@ async def responses_to_chat_sse(
         while pending is not None:
             done, _ = await asyncio.wait({pending}, timeout=heartbeat_seconds)
             if not done:
-                # SSE comments are ignored by OpenAI-compatible clients but count
-                # as response bytes for nginx/Cloudflare idle timers.
                 yield b": aiproxy keep-alive\n\n"
                 continue
             try:
@@ -314,25 +329,6 @@ async def _passthrough_stream(
         yield chunk
 
 
-def _install_route() -> None:
-    # FastAPI stores the function object in APIRoute, so monkey-patching the
-    # module symbol is not enough. Replace the registered POST route explicitly.
-    app.router.routes[:] = [
-        route
-        for route in app.router.routes
-        if not (
-            getattr(route, "path", None) == "/v1/chat/completions"
-            and "POST" in (getattr(route, "methods", None) or set())
-        )
-    ]
-    app.add_api_route(
-        "/v1/chat/completions",
-        chat_completions,
-        methods=["POST"],
-        response_class=Response,
-    )
-
-
 async def chat_completions(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -340,14 +336,17 @@ async def chat_completions(
 ) -> Response:
     payload = await request.json()
 
-    # The bug only affects streaming callers. Keep the mature original path for
-    # non-streaming/background requests and all their compatibility behavior.
+    # Only replace the path that needs incremental delivery. Everything else
+    # remains on the established implementation.
     if payload.get("stream") is not True or payload.get("background") is True:
         return await _original_chat_completions(request, background_tasks, api_key_record)
 
     requested_model = str(payload.get("model") or "")
     if not requested_model:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing model in request payload")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing model in request payload",
+        )
 
     endpoints = _impl.resolve_requested_model(requested_model)
     api_key_value = api_key_record["key"]
@@ -363,7 +362,9 @@ async def chat_completions(
         first_ms: Optional[float] = None
         if first_at:
             try:
-                first_ms = (datetime.fromisoformat(first_at) - datetime.fromisoformat(started_at)).total_seconds() * 1000
+                first_ms = (
+                    datetime.fromisoformat(first_at) - datetime.fromisoformat(started_at)
+                ).total_seconds() * 1000
             except Exception:
                 first_ms = None
         return ended_at, first_ms, total_ms
@@ -371,7 +372,9 @@ async def chat_completions(
     for endpoint in endpoints:
         provider_name = str(endpoint.get("name", "unknown"))
         provider_model = str(endpoint.get("model") or "")
-        provider_payload = _impl.prepare_provider_chat_payload(payload, endpoint, provider_model)
+        provider_payload = _impl.prepare_provider_chat_payload(
+            payload, endpoint, provider_model
+        )
         response: Optional[httpx.Response] = None
 
         try:
@@ -380,70 +383,118 @@ async def chat_completions(
                 raise RuntimeError("HTTP client is not initialized")
 
             api_mode = str(endpoint.get("api_mode", "openai_chat_completions"))
-            if api_mode in {"openai_responses", "codex_responses"}:
-                converted = _impl.chat_to_responses_payload(provider_payload, provider_model)
+            responses_mode = api_mode in {"openai_responses", "codex_responses"}
+            if responses_mode:
+                upstream_payload = _impl.chat_to_responses_payload(
+                    provider_payload, provider_model
+                )
                 target_url = _impl.resolve_responses_url(endpoint)
-                request_obj = _impl.http_client.build_request(
-                    "POST",
-                    target_url,
-                    json=converted,
-                    headers=_impl.build_provider_headers(endpoint),
-                )
             else:
+                upstream_payload = provider_payload
                 target_url = _impl.resolve_endpoint_url(endpoint)
-                request_obj = _impl.http_client.build_request(
-                    "POST",
-                    target_url,
-                    json=provider_payload,
-                    headers=_impl.build_provider_headers(endpoint),
-                )
 
+            request_obj = _impl.http_client.build_request(
+                "POST",
+                target_url,
+                json=upstream_payload,
+                headers=_impl.build_provider_headers(endpoint),
+            )
             response = await _impl.http_client.send(request_obj, stream=True)
+            upstream_status = response.status_code
             content_type = response.headers.get("content-type", "application/json")
 
-            # Errors must be consumed before a StreamingResponse is returned so
-            # fallback/reauth behavior is still possible.
-            if response.status_code != 200:
+            # Before returning a StreamingResponse we can still inspect failures,
+            # refresh auth state, or fall back to the next configured provider.
+            if upstream_status != 200:
                 content = await response.aread()
                 await response.aclose()
                 response = None
                 raw_text = content.decode("utf-8", errors="replace")
                 first_response_at = datetime.utcnow().isoformat()
 
-                if api_mode == "codex_responses" and _impl.response_indicates_token_expired(response.status_code if response else 401, raw_text):
+                if (
+                    api_mode == "codex_responses"
+                    and _impl.response_indicates_token_expired(upstream_status, raw_text)
+                ):
                     error_msg = _impl.codex_reauth_message(provider_name)
                     _impl.mark_provider_reauth_required(provider_name, error_msg)
                     ended_at, first_ms, total_ms = timing(first_response_at)
-                    _impl.insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 401, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                    _impl.insert_log(
+                        api_key_value,
+                        api_key_name,
+                        requested_model,
+                        requested_model,
+                        provider_name,
+                        provider_model,
+                        upstream_status,
+                        started_at,
+                        first_response_at,
+                        ended_at,
+                        first_ms,
+                        total_ms,
+                        prompt_text,
+                        None,
+                        error_msg,
+                    )
                     last_error = error_msg
                     continue
 
-                if response is None:
-                    status_code = 502 if api_mode == "codex_responses" and _impl.looks_like_html_response(raw_text, content_type) else 0
-                else:
-                    status_code = response.status_code
-                # Preserve the original upstream status for ordinary failures.
-                if not status_code:
-                    # response was intentionally cleared after close; derive from
-                    # the already-read status saved on the request path below.
-                    status_code = int(getattr(request_obj, "extensions", {}).get("aiproxy_status", 0) or 0)
-                # The request extension above is normally empty; use a local
-                # variable instead for clarity on all real calls.
-                status_code = int(getattr(request, "_aiproxy_unused", 0) or 0) or 0
-                # Reconstruct from the response status captured before close.
-                # (Kept separate so closed responses are never referenced later.)
-                # This assignment is replaced below by upstream_status.
+                if _impl.looks_like_html_response(raw_text, content_type):
+                    error_msg = _impl.provider_html_error(api_mode, raw_text)
+                    ended_at, first_ms, total_ms = timing(first_response_at)
+                    _impl.insert_log(
+                        api_key_value,
+                        api_key_name,
+                        requested_model,
+                        requested_model,
+                        provider_name,
+                        provider_model,
+                        502,
+                        started_at,
+                        first_response_at,
+                        ended_at,
+                        first_ms,
+                        total_ms,
+                        prompt_text,
+                        None,
+                        error_msg,
+                    )
+                    last_error = f"{provider_name} returned HTML challenge: {error_msg}"
+                    continue
 
-            upstream_status = response.status_code if response is not None else None
-            if upstream_status is None:
-                # The non-200 branch above closes the response. Reissue the
-                # status handling with an explicit request-local status by using
-                # the stored last response status from the already-read object.
-                # This path is unreachable because the branch continues/returns
-                # below in the finalized block generated at runtime.
-                pass
+                error_msg = raw_text
+                if upstream_status in _FALLBACK_STATUSES:
+                    last_error = (
+                        f"{provider_name} returned {upstream_status}: {error_msg}"
+                    )
+                    continue
 
-            if response is not None and response.status_code == 200 and "text/html" in content_type.lower():
+                ended_at, first_ms, total_ms = timing(first_response_at)
+                _impl.insert_log(
+                    api_key_value,
+                    api_key_name,
+                    requested_model,
+                    requested_model,
+                    provider_name,
+                    provider_model,
+                    upstream_status,
+                    started_at,
+                    first_response_at,
+                    ended_at,
+                    first_ms,
+                    total_ms,
+                    prompt_text,
+                    None,
+                    error_msg,
+                )
+                return Response(
+                    content,
+                    status_code=upstream_status,
+                    media_type=content_type,
+                )
+
+            # A 200 HTML challenge is also an error, not a successful stream.
+            if "text/html" in content_type.lower():
                 content = await response.aread()
                 await response.aclose()
                 response = None
@@ -451,13 +502,24 @@ async def chat_completions(
                 first_response_at = datetime.utcnow().isoformat()
                 error_msg = _impl.provider_html_error(api_mode, raw_text)
                 ended_at, first_ms, total_ms = timing(first_response_at)
-                _impl.insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                _impl.insert_log(
+                    api_key_value,
+                    api_key_name,
+                    requested_model,
+                    requested_model,
+                    provider_name,
+                    provider_model,
+                    502,
+                    started_at,
+                    first_response_at,
+                    ended_at,
+                    first_ms,
+                    total_ms,
+                    prompt_text,
+                    None,
+                    error_msg,
+                )
                 last_error = f"{provider_name} returned HTML challenge: {error_msg}"
-                continue
-
-            if response is None:
-                # Defensive guard. All expected non-200 paths return/continue in
-                # the explicit block below once upstream status is known.
                 continue
 
             first_response_at: Optional[str] = None
@@ -480,7 +542,7 @@ async def chat_completions(
             async def body() -> AsyncIterator[bytes]:
                 nonlocal stream_error
                 try:
-                    if api_mode in {"openai_responses", "codex_responses"}:
+                    if responses_mode:
                         async for out in responses_to_chat_sse(
                             response,
                             provider_model,
@@ -505,10 +567,14 @@ async def chat_completions(
                     if text_parts:
                         output_text = "".join(text_parts)
                     elif captured:
-                        if api_mode in {"openai_responses", "codex_responses"}:
-                            output_text = _impl.extract_response_text_from_sse(bytes(captured))
+                        if responses_mode:
+                            output_text = _impl.extract_response_text_from_sse(
+                                bytes(captured)
+                            )
                         else:
-                            output_text = _impl.extract_output_from_body(bytes(captured), content_type)
+                            output_text = _impl.extract_output_from_body(
+                                bytes(captured), content_type
+                            )
                     else:
                         output_text = ""
                     _impl.insert_log(
@@ -529,7 +595,7 @@ async def chat_completions(
                         stream_error,
                     )
 
-            media_type = "text/event-stream" if api_mode in {"openai_responses", "codex_responses"} else content_type
+            media_type = "text/event-stream" if responses_mode else content_type
             return StreamingResponse(
                 body(),
                 status_code=200,
@@ -570,7 +636,29 @@ async def chat_completions(
         None,
         last_error,
     )
-    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=last_error or "All provider endpoints failed")
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=last_error or "All provider endpoints failed",
+    )
+
+
+def _install_route() -> None:
+    # FastAPI stores the endpoint object in APIRoute, so replacing the module
+    # symbol alone does not affect an already-registered route.
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not (
+            getattr(route, "path", None) == "/v1/chat/completions"
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+    ]
+    app.add_api_route(
+        "/v1/chat/completions",
+        chat_completions,
+        methods=["POST"],
+        response_class=Response,
+    )
 
 
 _install_route()

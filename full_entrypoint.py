@@ -3,6 +3,9 @@
 # Apply Codex model and normal-text SSE compatibility first.
 import runtime_entrypoint as _runtime  # noqa: F401
 
+# Replace the buffered Responses/Codex chat route with true SSE streaming.
+import responses_streaming_entrypoint as _responses_streaming  # noqa: F401
+
 # Then register live request-log routes and middleware behavior.
 import live_logs_entrypoint as _live
 

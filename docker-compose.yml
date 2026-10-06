@@ -9,6 +9,9 @@ services:
       - ./app.db:/app/app.db:rw
       - ./cache:/app/cache:rw
     environment:
+      # Admin credentials for local Docker testing. Change these outside development.
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
       # Full topic URL, e.g. https://ntfy.sh/your-private-topic
       - AIPROXY_NTFY_URL=${AIPROXY_NTFY_URL:-}
       # Optional bearer token for a protected ntfy topic
@@ -16,11 +19,24 @@ services:
       # Dynamic free-model registry. Override only if you maintain another registry.
       - AIPROXY_FREE_MODELS_REGISTRY_URL=${AIPROXY_FREE_MODELS_REGISTRY_URL:-https://raw.githubusercontent.com/LukaCek/free-ai-models/main/registry.json}
       - AIPROXY_FREE_MODELS_REFRESH_SECONDS=${AIPROXY_FREE_MODELS_REFRESH_SECONDS:-1800}
+      - AIPROXY_FREE_MODELS_CACHE_PATH=${AIPROXY_FREE_MODELS_CACHE_PATH:-/app/cache/free-models-registry.json}
+      # Provider/model routing and circuit-breaker tuning.
+      - AIPROXY_UPSTREAM_TIMEOUT_SECONDS=${AIPROXY_UPSTREAM_TIMEOUT_SECONDS:-3600}
+      - AIPROXY_MIN_COMPLETION_TOKENS=${AIPROXY_MIN_COMPLETION_TOKENS:-1024}
+      - AIPROXY_OLLAMA_DISABLE_THINKING=${AIPROXY_OLLAMA_DISABLE_THINKING:-false}
+      - AIPROXY_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS=${AIPROXY_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS:-60}
+      - AIPROXY_PROVIDER_TIMEOUT_COOLDOWN_SECONDS=${AIPROXY_PROVIDER_TIMEOUT_COOLDOWN_SECONDS:-30}
+      - AIPROXY_PROVIDER_TRANSIENT_COOLDOWN_SECONDS=${AIPROXY_PROVIDER_TRANSIENT_COOLDOWN_SECONDS:-20}
+      # Audio transcription limits.
+      - AIPROXY_MAX_AUDIO_BYTES=${AIPROXY_MAX_AUDIO_BYTES:-26214400}
+      - AIPROXY_AUDIO_TIMEOUT_SECONDS=${AIPROXY_AUDIO_TIMEOUT_SECONDS:-120}
       # Provider credentials stay local. Only providers with a configured key enter free-models.
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
       - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
       - SAMBANOVA_API_KEY=${SAMBANOVA_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - CLOUDFLARE_API_KEY=${CLOUDFLARE_API_KEY:-}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
     mem_limit: 512m

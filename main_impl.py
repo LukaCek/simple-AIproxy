@@ -2370,6 +2370,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     api_key_value = api_key_record["key"]
     api_key_name = api_key_record["name"] if "name" in api_key_record.keys() else None
     prompt_text = extract_prompt(payload)
+    request_id = uuid.uuid4().hex
+    attempt_no = 0
     started_monotonic = time.monotonic()
     started_at = datetime.utcnow().isoformat()
     last_error: Optional[str] = None
@@ -2386,14 +2388,58 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                 first_ms = None
         return ended, first_ms, total_ms
 
+    def begin_attempt() -> tuple[int, str, float]:
+        nonlocal attempt_no
+        attempt_no += 1
+        return attempt_no, datetime.utcnow().isoformat(), time.monotonic()
+
+    def record_attempt(
+        number: int,
+        provider_name: str,
+        provider_model: str,
+        status_code: Optional[int],
+        action: str,
+        error: Optional[str],
+        attempt_started_at: str,
+        attempt_started_monotonic: float,
+    ) -> None:
+        attempt_ended_at = datetime.utcnow().isoformat()
+        attempt_total_ms = (time.monotonic() - attempt_started_monotonic) * 1000
+        insert_provider_attempt(
+            request_id,
+            number,
+            requested_model,
+            provider_name,
+            provider_model,
+            status_code,
+            action,
+            error,
+            attempt_started_at,
+            attempt_ended_at,
+            attempt_total_ms,
+        )
+
     for endpoint in endpoints:
         provider_name = str(endpoint.get("name", "unknown"))
         provider_model = str(endpoint.get("model") or "")
         provider_payload = prepare_provider_chat_payload(payload, endpoint, provider_model)
         preflight_reason = provider_preflight_skip_reason(provider_payload, endpoint)
         if preflight_reason:
+            number, attempt_started_at, attempt_started_monotonic = begin_attempt()
+            record_attempt(
+                number,
+                provider_name,
+                provider_model,
+                None,
+                "preflight_skip",
+                preflight_reason,
+                attempt_started_at,
+                attempt_started_monotonic,
+            )
             last_error = f"{provider_name} skipped: {preflight_reason}"
             continue
+
+        number, attempt_started_at, attempt_started_monotonic = begin_attempt()
         try:
             await ensure_provider_token(endpoint)
             api_mode = str(endpoint.get("api_mode", "openai_chat_completions"))
@@ -2406,14 +2452,16 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                 if api_mode == "codex_responses" and response_indicates_token_expired(response.status_code, raw_text):
                     error_msg = codex_reauth_message(provider_name)
                     mark_provider_reauth_required(provider_name, error_msg)
+                    record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     ended_at, first_ms, total_ms = timing(first_response_at)
-                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg, request_id=request_id)
                     last_error = error_msg
                     continue
                 if looks_like_html_response(raw_text, content_type):
                     error_msg = provider_html_error(api_mode, raw_text)
+                    record_attempt(number, provider_name, provider_model, 502, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     ended_at, first_ms, total_ms = timing(first_response_at)
-                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg, request_id=request_id)
                     last_error = f"{provider_name} returned HTML challenge: {error_msg}"
                     continue
                 if response.status_code == 200:
@@ -2421,17 +2469,20 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                         text = extract_response_text(response.json())
                     except Exception:
                         text = extract_response_text_from_sse(content) or raw_text
+                    record_attempt(number, provider_name, provider_model, 200, "success", None, attempt_started_at, attempt_started_monotonic)
                     ended_at, first_ms, total_ms = timing(first_response_at)
-                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, text, None)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, text, None, request_id=request_id)
                     if payload.get("stream"):
                         return StreamingResponse(sse_chat_chunks(provider_model, text), status_code=200, media_type="text/event-stream")
                     return Response(json.dumps(chat_completion_from_text(provider_model, text), ensure_ascii=False), status_code=200, media_type="application/json")
                 error_msg = raw_text
                 if response.status_code in fallback_statuses:
+                    record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     last_error = f"{provider_name} returned {response.status_code}: {error_msg}"
                     continue
+                record_attempt(number, provider_name, provider_model, response.status_code, "returned_error", error_msg, attempt_started_at, attempt_started_monotonic)
                 ended_at, first_ms, total_ms = timing(first_response_at)
-                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg, request_id=request_id)
                 return Response(content, status_code=response.status_code, media_type=response.headers.get("content-type", "application/json"))
 
             headers = build_provider_headers(endpoint)
@@ -2445,8 +2496,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                 if is_unsupported_reasoning_content_error(response.status_code, initial_error_text):
                     sanitized_payload = payload_without_reasoning_content(provider_payload)
                     if sanitized_payload != provider_payload:
+                        record_attempt(number, provider_name, provider_model, response.status_code, "retry_sanitized", initial_error_text, attempt_started_at, attempt_started_monotonic)
                         await response.aclose()
                         provider_payload = sanitized_payload
+                        number, attempt_started_at, attempt_started_monotonic = begin_attempt()
                         request_obj = http_client.build_request("POST", target_url, json=provider_payload, headers=headers)
                         response = await http_client.send(request_obj, stream=True)
                         content_type = response.headers.get("content-type", "application/json")
@@ -2468,51 +2521,56 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                             raise
                         finally:
                             await response.aclose()
+                            record_attempt(number, provider_name, provider_model, 200 if error_msg is None else 502, "success" if error_msg is None else "stream_error", error_msg, attempt_started_at, attempt_started_monotonic)
                             ended_at, first_ms, total_ms = timing(first_response_at)
                             output_text = extract_output_from_body(bytes(captured), content_type) if captured else ""
-                            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200 if error_msg is None else 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, error_msg)
+                            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200 if error_msg is None else 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, error_msg, request_id=request_id)
                     return StreamingResponse(proxy_stream(), status_code=200, media_type=content_type)
                 content = await response.aread()
                 await response.aclose()
                 first_response_at = datetime.utcnow().isoformat()
                 raw_text = content.decode("utf-8", errors="replace")
-                if api_mode == "codex_responses" and response_indicates_token_expired(response.status_code, raw_text):
-                    error_msg = codex_reauth_message(provider_name)
-                    mark_provider_reauth_required(provider_name, error_msg)
-                    ended_at, first_ms, total_ms = timing(first_response_at)
-                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
-                    last_error = error_msg
-                    continue
                 if looks_like_html_response(raw_text, content_type):
                     error_msg = provider_html_error(api_mode, raw_text)
+                    record_attempt(number, provider_name, provider_model, 502, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     ended_at, first_ms, total_ms = timing(first_response_at)
-                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+                    insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg, request_id=request_id)
                     last_error = f"{provider_name} returned HTML challenge: {error_msg}"
                     continue
+                record_attempt(number, provider_name, provider_model, response.status_code, "success", None, attempt_started_at, attempt_started_monotonic)
                 ended_at, first_ms, total_ms = timing(first_response_at)
                 output_text = extract_output_from_body(content, content_type)
-                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, None)
+                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, None, request_id=request_id)
                 return Response(content, status_code=200, media_type=content_type)
+
             content = await response.aread()
             await response.aclose()
             first_response_at = datetime.utcnow().isoformat()
             error_msg = content.decode("utf-8", errors="replace")
             if response.status_code in fallback_statuses:
+                record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                 last_error = f"{provider_name} returned {response.status_code}: {error_msg}"
                 continue
+            record_attempt(number, provider_name, provider_model, response.status_code, "returned_error", error_msg, attempt_started_at, attempt_started_monotonic)
             ended_at, first_ms, total_ms = timing(first_response_at)
-            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg)
+            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, response.status_code, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg, request_id=request_id)
             return Response(content, status_code=response.status_code, media_type=content_type)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            last_error = f"{provider_name} failed: {format_provider_exception(exc)}"
+            error_msg = f"{provider_name} failed: {format_provider_exception(exc)}"
+            record_attempt(number, provider_name, provider_model, 502, "fallback_exception", error_msg, attempt_started_at, attempt_started_monotonic)
+            last_error = error_msg
             continue
         except Exception as exc:
-            last_error = f"{provider_name} unexpected error: {exc}"
+            error_msg = f"{provider_name} unexpected error: {exc}"
+            record_attempt(number, provider_name, provider_model, 502, "fallback_exception", error_msg, attempt_started_at, attempt_started_monotonic)
+            last_error = error_msg
             continue
+
     ended_at, first_ms, total_ms = timing(None)
     last_endpoint = endpoints[-1] if endpoints else {}
-    insert_log(api_key_value, api_key_name, requested_model, requested_model, str(last_endpoint.get("name", "unknown")), str(last_endpoint.get("model", "unknown")), 502, started_at, None, ended_at, first_ms, total_ms, prompt_text, None, last_error)
+    insert_log(api_key_value, api_key_name, requested_model, requested_model, str(last_endpoint.get("name", "unknown")), str(last_endpoint.get("model", "unknown")), 502, started_at, None, ended_at, first_ms, total_ms, prompt_text, None, last_error, request_id=request_id)
     raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=last_error or "All provider endpoints failed")
+
 
 @app.get("/admin/keys", response_class=HTMLResponse, dependencies=[Depends(verify_admin)])
 def admin_keys(request: Request) -> Any:

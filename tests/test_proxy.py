@@ -1067,14 +1067,16 @@ def test_provider_attempts_record_sanitized_retry(tmp_path, monkeypatch):
         ]
     )
     monkeypatch.setattr(main, "http_client", fake)
-    main.config_data = {
+    desired_config = {
         "providers": [
             {"name": "groq", "url": "http://groq.local/v1", "api_key": "k", "models": ["m"]}
         ],
         "groups": {},
     }
+    main.config_data = desired_config
     with TestClient(main.app) as client:
         monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
         response = client.post(
             "/v1/chat/completions",
             headers={"Authorization": "Bearer test-key"},

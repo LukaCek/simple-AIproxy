@@ -427,3 +427,18 @@ def test_streaming_413_falls_back_to_next_provider(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert "fallback worked" in response.text
     assert fake.hosts == ["groq.local", "mistral.local"]
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        conn.row_factory = sqlite3.Row
+        attempts = conn.execute(
+            "SELECT request_id, attempt_no, provider_name, status_code, action "
+            "FROM ProviderAttempts ORDER BY attempt_no"
+        ).fetchall()
+        final_log = conn.execute(
+            "SELECT request_id FROM Logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert [(row["attempt_no"], row["provider_name"], row["status_code"], row["action"]) for row in attempts] == [
+        (1, "groq", 413, "fallback"),
+        (2, "mistral", 200, "success"),
+    ]
+    assert attempts[0]["request_id"] == attempts[1]["request_id"]
+    assert final_log["request_id"] == attempts[0]["request_id"]

@@ -336,8 +336,6 @@ async def chat_completions(
 ) -> Response:
     payload = await request.json()
 
-    # Only replace the path that needs incremental delivery. Everything else
-    # remains on the established implementation.
     if payload.get("stream") is not True or payload.get("background") is True:
         return await _original_chat_completions(request, background_tasks, api_key_record)
 
@@ -352,6 +350,8 @@ async def chat_completions(
     api_key_value = api_key_record["key"]
     api_key_name = api_key_record["name"] if "name" in api_key_record.keys() else None
     prompt_text = _impl.extract_prompt(payload)
+    request_id = uuid.uuid4().hex
+    attempt_no = 0
     started_monotonic = time.monotonic()
     started_at = datetime.utcnow().isoformat()
     last_error: Optional[str] = None
@@ -369,6 +369,35 @@ async def chat_completions(
                 first_ms = None
         return ended_at, first_ms, total_ms
 
+    def begin_attempt() -> tuple[int, str, float]:
+        nonlocal attempt_no
+        attempt_no += 1
+        return attempt_no, datetime.utcnow().isoformat(), time.monotonic()
+
+    def record_attempt(
+        number: int,
+        provider_name: str,
+        provider_model: str,
+        status_code: Optional[int],
+        action: str,
+        error: Optional[str],
+        attempt_started_at: str,
+        attempt_started_monotonic: float,
+    ) -> None:
+        _impl.insert_provider_attempt(
+            request_id,
+            number,
+            requested_model,
+            provider_name,
+            provider_model,
+            status_code,
+            action,
+            error,
+            attempt_started_at,
+            datetime.utcnow().isoformat(),
+            (time.monotonic() - attempt_started_monotonic) * 1000,
+        )
+
     for endpoint in endpoints:
         provider_name = str(endpoint.get("name", "unknown"))
         provider_model = str(endpoint.get("model") or "")
@@ -379,10 +408,22 @@ async def chat_completions(
             provider_payload, endpoint
         )
         if preflight_reason:
+            number, attempt_started_at, attempt_started_monotonic = begin_attempt()
+            record_attempt(
+                number,
+                provider_name,
+                provider_model,
+                None,
+                "preflight_skip",
+                preflight_reason,
+                attempt_started_at,
+                attempt_started_monotonic,
+            )
             last_error = f"{provider_name} skipped: {preflight_reason}"
             continue
-        response: Optional[httpx.Response] = None
 
+        number, attempt_started_at, attempt_started_monotonic = begin_attempt()
+        response: Optional[httpx.Response] = None
         try:
             await _impl.ensure_provider_token(endpoint)
             if _impl.http_client is None:
@@ -423,9 +464,20 @@ async def chat_completions(
                         provider_payload
                     )
                     if sanitized_payload != provider_payload:
+                        record_attempt(
+                            number,
+                            provider_name,
+                            provider_model,
+                            upstream_status,
+                            "retry_sanitized",
+                            initial_error_text,
+                            attempt_started_at,
+                            attempt_started_monotonic,
+                        )
                         await response.aclose()
                         provider_payload = sanitized_payload
                         upstream_payload = provider_payload
+                        number, attempt_started_at, attempt_started_monotonic = begin_attempt()
                         request_obj = _impl.http_client.build_request(
                             "POST",
                             target_url,
@@ -441,8 +493,6 @@ async def chat_completions(
                         )
                         buffered_error_content = None
 
-            # Before returning a StreamingResponse we can still inspect failures,
-            # refresh auth state, or fall back to the next configured provider.
             if upstream_status != 200:
                 content = (
                     buffered_error_content
@@ -460,82 +510,46 @@ async def chat_completions(
                 ):
                     error_msg = _impl.codex_reauth_message(provider_name)
                     _impl.mark_provider_reauth_required(provider_name, error_msg)
+                    record_attempt(number, provider_name, provider_model, upstream_status, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     ended_at, first_ms, total_ms = timing(first_response_at)
                     _impl.insert_log(
-                        api_key_value,
-                        api_key_name,
-                        requested_model,
-                        requested_model,
-                        provider_name,
-                        provider_model,
-                        upstream_status,
-                        started_at,
-                        first_response_at,
-                        ended_at,
-                        first_ms,
-                        total_ms,
-                        prompt_text,
-                        None,
-                        error_msg,
+                        api_key_value, api_key_name, requested_model, requested_model,
+                        provider_name, provider_model, upstream_status, started_at,
+                        first_response_at, ended_at, first_ms, total_ms, prompt_text,
+                        None, error_msg, request_id=request_id,
                     )
                     last_error = error_msg
                     continue
 
                 if _impl.looks_like_html_response(raw_text, content_type):
                     error_msg = _impl.provider_html_error(api_mode, raw_text)
+                    record_attempt(number, provider_name, provider_model, 502, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     ended_at, first_ms, total_ms = timing(first_response_at)
                     _impl.insert_log(
-                        api_key_value,
-                        api_key_name,
-                        requested_model,
-                        requested_model,
-                        provider_name,
-                        provider_model,
-                        502,
-                        started_at,
-                        first_response_at,
-                        ended_at,
-                        first_ms,
-                        total_ms,
-                        prompt_text,
-                        None,
-                        error_msg,
+                        api_key_value, api_key_name, requested_model, requested_model,
+                        provider_name, provider_model, 502, started_at,
+                        first_response_at, ended_at, first_ms, total_ms, prompt_text,
+                        None, error_msg, request_id=request_id,
                     )
                     last_error = f"{provider_name} returned HTML challenge: {error_msg}"
                     continue
 
                 error_msg = raw_text
                 if upstream_status in _FALLBACK_STATUSES:
-                    last_error = (
-                        f"{provider_name} returned {upstream_status}: {error_msg}"
-                    )
+                    record_attempt(number, provider_name, provider_model, upstream_status, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
+                    last_error = f"{provider_name} returned {upstream_status}: {error_msg}"
                     continue
 
+                record_attempt(number, provider_name, provider_model, upstream_status, "returned_error", error_msg, attempt_started_at, attempt_started_monotonic)
                 ended_at, first_ms, total_ms = timing(first_response_at)
                 _impl.insert_log(
-                    api_key_value,
-                    api_key_name,
-                    requested_model,
-                    requested_model,
-                    provider_name,
-                    provider_model,
-                    upstream_status,
-                    started_at,
-                    first_response_at,
-                    ended_at,
-                    first_ms,
-                    total_ms,
-                    prompt_text,
-                    None,
-                    error_msg,
+                    api_key_value, api_key_name, requested_model, requested_model,
+                    provider_name, provider_model, upstream_status, started_at,
+                    first_response_at, ended_at, first_ms, total_ms, prompt_text,
+                    None, error_msg, request_id=request_id,
                 )
-                return Response(
-                    content,
-                    status_code=upstream_status,
-                    media_type=content_type,
-                )
+                return Response(content, status_code=upstream_status, media_type=content_type)
 
-            # A 200 HTML challenge is also an error, not a successful stream.
             if "text/html" in content_type.lower():
                 content = await response.aread()
                 await response.aclose()
@@ -543,23 +557,13 @@ async def chat_completions(
                 raw_text = content.decode("utf-8", errors="replace")
                 first_response_at = datetime.utcnow().isoformat()
                 error_msg = _impl.provider_html_error(api_mode, raw_text)
+                record_attempt(number, provider_name, provider_model, 502, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                 ended_at, first_ms, total_ms = timing(first_response_at)
                 _impl.insert_log(
-                    api_key_value,
-                    api_key_name,
-                    requested_model,
-                    requested_model,
-                    provider_name,
-                    provider_model,
-                    502,
-                    started_at,
-                    first_response_at,
-                    ended_at,
-                    first_ms,
-                    total_ms,
-                    prompt_text,
-                    None,
-                    error_msg,
+                    api_key_value, api_key_name, requested_model, requested_model,
+                    provider_name, provider_model, 502, started_at,
+                    first_response_at, ended_at, first_ms, total_ms, prompt_text,
+                    None, error_msg, request_id=request_id,
                 )
                 last_error = f"{provider_name} returned HTML challenge: {error_msg}"
                 continue
@@ -605,6 +609,16 @@ async def chat_completions(
                     raise
                 finally:
                     await response.aclose()
+                    record_attempt(
+                        number,
+                        provider_name,
+                        provider_model,
+                        200 if stream_error is None else 502,
+                        "success" if stream_error is None else "stream_error",
+                        stream_error,
+                        attempt_started_at,
+                        attempt_started_monotonic,
+                    )
                     ended_at, first_ms, total_ms = timing(first_response_at)
                     if text_parts:
                         output_text = "".join(text_parts)
@@ -620,21 +634,11 @@ async def chat_completions(
                     else:
                         output_text = ""
                     _impl.insert_log(
-                        api_key_value,
-                        api_key_name,
-                        requested_model,
-                        requested_model,
-                        provider_name,
-                        provider_model,
-                        200 if stream_error is None else 502,
-                        started_at,
-                        first_response_at,
-                        ended_at,
-                        first_ms,
-                        total_ms,
-                        prompt_text,
-                        output_text,
-                        stream_error,
+                        api_key_value, api_key_name, requested_model, requested_model,
+                        provider_name, provider_model,
+                        200 if stream_error is None else 502, started_at,
+                        first_response_at, ended_at, first_ms, total_ms, prompt_text,
+                        output_text, stream_error, request_id=request_id,
                     )
 
             media_type = "text/event-stream" if responses_mode else content_type
@@ -651,32 +655,26 @@ async def chat_completions(
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             if response is not None:
                 await response.aclose()
-            last_error = f"{provider_name} failed: {_impl.format_provider_exception(exc)}"
+            error_msg = f"{provider_name} failed: {_impl.format_provider_exception(exc)}"
+            record_attempt(number, provider_name, provider_model, 502, "fallback_exception", error_msg, attempt_started_at, attempt_started_monotonic)
+            last_error = error_msg
             continue
         except Exception as exc:
             if response is not None:
                 await response.aclose()
-            last_error = f"{provider_name} unexpected error: {exc}"
+            error_msg = f"{provider_name} unexpected error: {exc}"
+            record_attempt(number, provider_name, provider_model, 502, "fallback_exception", error_msg, attempt_started_at, attempt_started_monotonic)
+            last_error = error_msg
             continue
 
     ended_at, first_ms, total_ms = timing(None)
     last_endpoint = endpoints[-1] if endpoints else {}
     _impl.insert_log(
-        api_key_value,
-        api_key_name,
-        requested_model,
-        requested_model,
+        api_key_value, api_key_name, requested_model, requested_model,
         str(last_endpoint.get("name", "unknown")),
-        str(last_endpoint.get("model", "unknown")),
-        502,
-        started_at,
-        None,
-        ended_at,
-        first_ms,
-        total_ms,
-        prompt_text,
-        None,
-        last_error,
+        str(last_endpoint.get("model", "unknown")), 502, started_at, None,
+        ended_at, first_ms, total_ms, prompt_text, None, last_error,
+        request_id=request_id,
     )
     raise HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,

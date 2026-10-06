@@ -1,174 +1,248 @@
 # GitHub Actions CI/CD Deployment Guide
 
-This directory contains the GitHub Actions workflow and server deployment scripts for the FastAPI LLM Proxy.
+The production workflow is defined in `.github/workflows/deploy.yml`. It runs
+on pushes and pull requests targeting `main`, with deployment restricted to
+pushes on `main`.
 
-## Workflow Overview
+## Pipeline
 
-### 1. Test Job (`test`)
-- Triggers on every push and pull request to `main`
-- Creates a minimal `config.yml` for testing
-- Starts the application using `docker compose up -d`
-- Performs a health check by pinging `localhost:8000`
-- Cleans up resources after completion
+### 1. Test job
 
-### 2. Build and Push Job (`build-and-push`)
-- **Depends on:** `test` job must pass
-- **Triggers:** Only on pushes to `main` (not on PRs)
-- Builds Docker images for both `linux/amd64` and `linux/arm64`
-- Pushes to GitHub Container Registry (GHCR) with:
-  - `:latest` tag (always points to latest main branch build)
-  - `:${COMMIT_SHA}` tag (immutable reference to specific commit)
-- Uses GitHub Actions cache (type=gha) for faster builds
+Runs for pushes and pull requests to `main`.
 
-### 3. Deploy Job (`deploy`)
-- **Depends on:** `build-and-push` job must complete
-- **Triggers:** Only on pushes to `main`
-- Connects to Oracle ARM server via SSH
-- Executes `./update.sh` to pull latest image and restart container
+It:
 
-## Production server files
+1. checks out the repository,
+2. creates a minimal test `config.yml` and `app.db`,
+3. installs runtime/test dependencies,
+4. runs the configured Ruff checks and the complete pytest suite,
+5. starts the application with `docker compose up -d`,
+6. waits for `http://localhost:8000/` to become healthy, and
+7. tears down the test containers.
 
-For the current production layout at `/home/ubuntu/docker/simple-AIproxy`, use:
+A pull request stops here; image publishing and deployment are skipped.
+
+### 2. Build and push
+
+Runs only after the test job succeeds on a push to `main`.
+
+The workflow:
+
+- enables QEMU for ARM64 builds,
+- uses Docker Buildx,
+- logs in to GHCR using `GITHUB_TOKEN`,
+- builds `linux/amd64` and `linux/arm64`, and
+- pushes:
+  - `ghcr.io/lukacek/simple-aiproxy:latest`
+  - `ghcr.io/lukacek/simple-aiproxy:<COMMIT_SHA>`
+
+GitHub Actions cache is used for Docker layers.
+
+### 3. Deploy
+
+Runs only after a successful image build/push.
+
+The workflow first copies these tracked files to the server `DEPLOY_PATH`:
 
 - `server_deployment/docker-compose.yml`
-- `server_deployment/.env.example` copied to server as `.env`
-- `server_deployment/config.production.example.yml` copied to server as `config.yml`
 - `server_deployment/update.sh`
 
-Detailed server-side instructions are in `server_deployment/PRODUCTION_SETUP.md`.
+It then connects over SSH, runs `./update.sh`, and treats the deployment as
+failed if the script does not complete successfully.
 
-## Setup Instructions
+`update.sh`:
 
-### Step 1: Set GitHub Secrets
+1. ensures the persistent `cache/` directory exists,
+2. pulls the latest image,
+3. recreates/updates the container,
+4. verifies FastAPI from inside the container,
+5. authenticates to `/admin/config` and verifies that the
+   **Free provider API keys** UI is present, and
+6. prunes dangling Docker images.
 
-In your GitHub repository, add the following secrets (go to **Settings > Secrets and variables > Actions**):
+### 4. Deployment report
 
-| Secret Name | Description | Example |
-| --- | --- | --- |
-| `DEPLOY_HOST` | IP address or hostname of Oracle ARM server | `192.0.2.1` or `oracle.example.com` |
-| `DEPLOY_USER` | SSH username | `ubuntu` or `root` |
-| `DEPLOY_PORT` | SSH port (default is 22) | `22` |
-| `DEPLOY_SSH_KEY` | Private SSH key (use multiline format) | `-----BEGIN OPENSSH PRIVATE KEY-----...` |
-| `DEPLOY_PATH` | Absolute path on server where `docker-compose.yml` and `update.sh` reside | `/home/ubuntu/llm-proxy` |
+The final `report` job always runs after a `main` push and publishes
+`deployment-status.json` on the dedicated `deployment-status` branch.
 
-### Step 2: Prepare Oracle Server
+A verified deployment records:
 
-1. Create deployment directory:
-   ```bash
-   mkdir -p /home/ubuntu/llm-proxy
-   cd /home/ubuntu/llm-proxy
-   ```
+- the source `commit_sha`,
+- the matching `deployed_sha`,
+- test/build/deploy results,
+- FastAPI health status,
+- Admin Config UI verification, and
+- a link to the exact workflow run.
 
-2. Copy files from `server_deployment/`:
-   ```bash
-   # Copy docker-compose.yml
-   scp server_deployment/docker-compose.yml ubuntu@<SERVER_IP>:/home/ubuntu/llm-proxy/
-   
-   # Copy update.sh
-   scp server_deployment/update.sh ubuntu@<SERVER_IP>:/home/ubuntu/llm-proxy/
-   ```
+This is the authoritative repository-side record that a specific commit was
+actually deployed, not merely merged.
 
-3. On the server, edit `docker-compose.yml` and replace `YOUR_GITHUB_USERNAME` with your actual GitHub username.
+## Production server layout
 
-4. Ensure Docker and Docker Compose are installed:
-   ```bash
-   docker --version
-   docker compose version
-   ```
+Current production path:
 
-5. Log in to GitHub Container Registry (requires a Personal Access Token with `read:packages` scope):
-   ```bash
-   docker login ghcr.io
-   # Username: your_github_username
-   # Password: your_personal_access_token
-   ```
+```text
+/home/ubuntu/docker/simple-AIproxy
+```
 
-6. Create a sample `config.yml` and `app.db` placeholder:
-   ```bash
-   touch config.yml app.db
-   ```
+Set the GitHub Actions secret `DEPLOY_PATH` to that exact directory.
 
-### Step 3: Test Manually
+Persistent/runtime files in that directory are:
 
-Before relying on automation, test the update script manually:
+```text
+app.db
+cache/
+config.yml
+.env
+docker-compose.yml
+update.sh
+```
+
+The workflow overwrites only the tracked deployment copies of
+`docker-compose.yml` and `update.sh`. It does **not** replace `app.db`,
+`config.yml`, `.env`, or the registry cache.
+
+See `server_deployment/PRODUCTION_SETUP.md` for initial server setup.
+
+## Required GitHub Actions secrets
+
+Configure these under **Settings → Secrets and variables → Actions**:
+
+| Secret | Purpose |
+| --- | --- |
+| `DEPLOY_HOST` | Production host/IP reachable from GitHub Actions |
+| `DEPLOY_USER` | SSH user, currently `ubuntu` |
+| `DEPLOY_PORT` | SSH port, normally `22` |
+| `DEPLOY_SSH_KEY` | Private deployment key |
+| `DEPLOY_PATH` | `/home/ubuntu/docker/simple-AIproxy` |
+
+## Initial server preparation
 
 ```bash
-cd /home/ubuntu/llm-proxy
+mkdir -p /home/ubuntu/docker/simple-AIproxy/cache
+cd /home/ubuntu/docker/simple-AIproxy
+```
+
+Copy the starter files once:
+
+```bash
+scp server_deployment/docker-compose.yml ubuntu@<SERVER>:/home/ubuntu/docker/simple-AIproxy/
+scp server_deployment/update.sh ubuntu@<SERVER>:/home/ubuntu/docker/simple-AIproxy/
+scp server_deployment/.env.example ubuntu@<SERVER>:/home/ubuntu/docker/simple-AIproxy/.env
+scp server_deployment/config.production.example.yml ubuntu@<SERVER>:/home/ubuntu/docker/simple-AIproxy/config.yml
+```
+
+Then create the SQLite bind-mount file before the first container start:
+
+```bash
+cd /home/ubuntu/docker/simple-AIproxy
+touch app.db
+mkdir -p cache
+```
+
+This matters because a missing host-side `app.db` bind source can otherwise be
+created as a directory by Docker.
+
+Then edit `.env` and `config.yml` on the server. Never commit production
+tokens or admin credentials.
+
+Make the update script executable:
+
+```bash
+chmod +x update.sh
+```
+
+If the GHCR package is private, log Docker into GHCR on the production server
+with credentials that can read packages:
+
+```bash
+docker login ghcr.io
+```
+
+For a public package, an authenticated server-side GHCR login is not normally
+required.
+
+## Manual deployment/smoke test
+
+From the production directory:
+
+```bash
 ./update.sh
 ```
 
-### Step 4: Push to Main Branch
-
-Once everything is set up, push a commit to the `main` branch:
+The script itself performs both FastAPI and authenticated Admin Config checks.
+For additional inspection:
 
 ```bash
-git push origin main
+docker compose ps
+docker compose logs --tail=200 llm-proxy
 ```
 
-The GitHub Actions workflow will:
-1. Run tests
-2. Build multi-platform Docker images
-3. Push to GHCR
-4. Deploy to your Oracle server
+## SSH key setup
 
-## SSH Key Setup
+Generate a dedicated deployment key:
 
-### Generate SSH Key (on your local machine):
 ```bash
 ssh-keygen -t ed25519 -f deploy_key -N ""
 ```
 
-### Add Public Key to Server:
+Install its public key on the server:
+
 ```bash
-ssh-copy-id -i deploy_key.pub ubuntu@<SERVER_IP>
+ssh-copy-id -i deploy_key.pub ubuntu@<SERVER>
 ```
 
-### Add Private Key to GitHub Secrets:
-1. Copy the contents of `deploy_key` (private key)
-2. In GitHub repo settings, add a secret named `DEPLOY_SSH_KEY`
-3. Paste the entire private key content (including `-----BEGIN...` and `-----END...` lines)
-
-## Monitoring
-
-### View Workflow Runs
-- Go to **Actions** tab in your GitHub repository
-- Click on "Deploy FastAPI LLM Proxy" to see recent runs
-
-### Check Server Logs
-```bash
-ssh ubuntu@<SERVER_IP>
-cd /home/ubuntu/llm-proxy
-docker compose logs -f llm-proxy
-```
+Store the private key as the `DEPLOY_SSH_KEY` GitHub Actions secret.
 
 ## Troubleshooting
 
-### Workflow Fails at Test Stage
-- Check that Docker and Docker Compose are installed on the GitHub Actions runner (they are by default)
-- Verify the `Dockerfile` is correct and can build successfully
+### Test job fails
 
-### Build Job Fails for ARM64
-- This is expected if the GitHub Actions runner is x86_64; QEMU is set up to emulate ARM64 builds
-- The workflow includes the `setup-qemu-action` to handle cross-platform builds
+Run the same high-level checks locally:
 
-### Deploy Job Fails
-- Verify SSH secrets are set correctly in GitHub
-- Test SSH connection manually from your local machine:
-  ```bash
-  ssh -p <DEPLOY_PORT> <DEPLOY_USER>@<DEPLOY_HOST>
-  ```
-- Ensure `DEPLOY_PATH` exists and contains `docker-compose.yml` and `update.sh`
-- Check server logs for any Docker errors
+```bash
+pip install -r requirements.txt pytest pytest-asyncio ruff
+pytest -q
+docker compose up -d
+curl -f http://localhost:8000/
+docker compose down -v
+```
 
-### Image Pull Fails on Server
-- Ensure you've logged in to GHCR on the server:
-  ```bash
-  docker login ghcr.io
-  ```
-- Verify the image name in `server_deployment/docker-compose.yml` matches your GitHub username
+The workflow also runs a targeted Ruff command; inspect
+`.github/workflows/deploy.yml` for the exact current file list/options.
 
-## Additional Notes
+### ARM64 image build fails
 
-- The memory limit of `512m` is enforced in the production `docker-compose.yml` to protect the 2GB RAM server.
-- The `update.sh` script automatically cleans up old dangling images to save disk space.
-- All timestamps in `update.sh` logs are in UTC (use `date -d "$(date -u)"` to convert locally if needed).
+The build runs on an x86 GitHub-hosted runner with QEMU + Buildx. Inspect the
+`build-and-push` job rather than assuming ARM64 emulation itself is unsupported.
+
+### Deploy fails
+
+Verify:
+
+```bash
+ssh -p <DEPLOY_PORT> <DEPLOY_USER>@<DEPLOY_HOST>
+cd /home/ubuntu/docker/simple-AIproxy
+docker compose config
+./update.sh
+```
+
+Because `update.sh` verifies both FastAPI and `/admin/config`, a failure can
+mean the container started but the application or admin UI is not actually
+healthy. The workflow logs will show the failing step.
+
+### Image pull fails
+
+Check the exact image configured in
+`server_deployment/docker-compose.yml` and, if the package is private, verify
+the server's GHCR login.
+
+## Notes
+
+- Production currently enforces a `512m` container memory limit.
+- `app.db` and `cache/` are bind-mounted and survive container recreation.
+- `update.sh` timestamps use the production server's configured local
+  timezone; they are not explicitly forced to UTC.
+- The deployment workflow deliberately does not copy a git-tracked production
+  `config.yml` or `.env`, preventing CI from overwriting server-side
+  credentials.

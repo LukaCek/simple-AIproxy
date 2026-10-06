@@ -15,8 +15,10 @@ On startup the proxy:
 5. loads provider credentials from local environment variables and the local SQLite credential store,
 6. resolves provider-specific endpoint values such as Cloudflare Account IDs,
 7. creates in-memory `free-registry-*` providers,
-8. sorts selected models by registry `priority`, and
-9. exposes them as the `free-models` group with `strategy: fallback`.
+8. preserves per-model routing metadata such as `context_tokens`, `free_limits`,
+   `capabilities`, and registry status,
+9. sorts selected models by registry `priority`, and
+10. exposes them as the `free-models` group with `strategy: fallback`.
 
 The registry is refreshed every 30 minutes by default. A failed fetch does not remove the last-known-good pool.
 
@@ -74,7 +76,30 @@ curl -sS http://localhost:8000/v1/chat/completions \
   -d '{"model":"free-models","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-The highest-priority configured free model is tried first. Retryable failures such as 401/403/429 and common 5xx responses fall through to the next credential/model using the proxy's existing fallback behavior.
+The highest-priority configured free model is considered first, but the proxy may
+skip it before dispatch when the request is clearly too large for that model's
+published TPM or context limit. The preflight token estimate is deliberately
+conservative and includes a safety margin; it is a routing guard, not an exact
+provider tokenizer.
+
+At runtime:
+
+- `401`, `403`, `408`, `409`, `413`, `425`, `429`, and common
+  transient `5xx` responses fall through to the next credential/model.
+- `413` is treated as request/model-specific and does **not** put the provider
+  on cooldown.
+- `429` falls through and temporarily cools that provider+model; a numeric
+  `Retry-After` header is respected when present.
+- timeouts/network errors and `500/502/503/504` also cause short temporary
+  cooldowns, so the next client request can skip the unhealthy member instead
+  of immediately retrying it.
+- a provider-specific compatibility `400` complaining about historical
+  assistant `reasoning_content` is retried once after stripping only that
+  unsupported field. Other `400` errors are returned rather than hidden by a
+  blind fallback.
+- successful requests clear stale cooldown state.
+
+Cooldown state is in memory and resets when the process restarts.
 
 ## Configuration
 
@@ -84,9 +109,28 @@ Optional environment variables:
 AIPROXY_FREE_MODELS_REGISTRY_URL=https://raw.githubusercontent.com/LukaCek/free-ai-models/main/registry.json
 AIPROXY_FREE_MODELS_REFRESH_SECONDS=1800
 AIPROXY_FREE_MODELS_CACHE_PATH=/app/cache/free-models-registry.json
+
+# Provider/model circuit-breaker defaults used by free-models and other groups.
+AIPROXY_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS=60
+AIPROXY_PROVIDER_TIMEOUT_COOLDOWN_SECONDS=30
+AIPROXY_PROVIDER_TRANSIENT_COOLDOWN_SECONDS=20
 ```
 
 The production Docker Compose configuration mounts both `app.db` and `./cache`, so UI-managed provider credentials and the last-known-good registry survive container recreation.
+
+## Observability
+
+Every request routed through the normal chat path receives a shared
+`request_id`. Each provider decision is written to SQLite
+`ProviderAttempts`, including preflight skips, cooldown skips, compatibility
+retries, fallbacks, exceptions, and successes. The final `Logs` row stores the
+same `request_id`, so one client request can be correlated with every upstream
+attempt.
+
+The admin logs page continues to show the client-visible request/result. Its
+human-readable output intentionally excludes reasoning-only and protocol-only
+SSE chunks; tool-call-only completions are summarized instead of logging raw SSE
+JSON.
 
 ## Safety properties
 
@@ -95,4 +139,8 @@ The production Docker Compose configuration mounts both `app.db` and `./cache`, 
 - dynamic registry providers are stripped before YAML is rendered or persisted,
 - an older accidentally persisted registry overlay is automatically removed on startup,
 - trial/prototype providers do not enter `free-models` unless the registry explicitly marks them eligible,
-- user-configured providers are preserved when the registry refreshes.
+- user-configured providers are preserved when the registry refreshes,
+- published model limits are used only as routing metadata; the proxy does not
+  treat its heuristic token estimate as exact billing/quota accounting,
+- provider cooldowns are temporary runtime state and never overwrite registry
+  data or stored credentials.

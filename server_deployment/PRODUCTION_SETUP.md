@@ -133,7 +133,7 @@ Example Codex pool:
 providers:
   - name: codex-a
     url: https://chatgpt.com/backend-api/codex
-    models: [gpt-5.5]
+    models: [gpt-5.6-sol]
     api_mode: codex_responses
     oauth: true
     client_id: app_EMoamEEZ73f0CkXaXp7hrann
@@ -144,7 +144,7 @@ providers:
 
   - name: codex-b
     url: https://chatgpt.com/backend-api/codex
-    models: [gpt-5.5]
+    models: [gpt-5.6-sol]
     api_mode: codex_responses
     oauth: true
     client_id: app_EMoamEEZ73f0CkXaXp7hrann
@@ -153,14 +153,9 @@ providers:
     refresh_token: ""
     expires_at: ""
 
-groups:
-  gpt-5.5:
-    strategy: round_robin
-    members:
-      - provider: codex-a
-        model: gpt-5.5
-      - provider: codex-b
-        model: gpt-5.5
+# The production Codex entrypoint automatically creates the direct model pools
+# plus a default "codex" group. An explicit group is therefore optional.
+groups: {}
 ```
 
 OAuth tokens may also be created/imported through the Admin Providers UI. Real

@@ -14,7 +14,7 @@ providers:
     url: https://chatgpt.com/backend-api/codex
     description: First OpenAI Codex OAuth profile
     models:
-      - gpt-5.5
+      - gpt-5.6-sol
     api_mode: codex_responses
     oauth: true
     client_id: app_EMoamEEZ73f0CkXaXp7hrann
@@ -27,7 +27,7 @@ providers:
     url: https://chatgpt.com/backend-api/codex
     description: Second OpenAI Codex OAuth profile
     models:
-      - gpt-5.5
+      - gpt-5.6-sol
     api_mode: codex_responses
     oauth: true
     client_id: app_EMoamEEZ73f0CkXaXp7hrann
@@ -59,14 +59,14 @@ providers:
     api_mode: openai_chat_completions
 
 groups:
-  gpt-5.5:
+  gpt-5.6-sol:
     description: Balanced Codex pool for Hermes/OpenAI-compatible clients
     strategy: round_robin
     members:
       - provider: codex-a
-        model: gpt-5.5
+        model: gpt-5.6-sol
       - provider: codex-b
-        model: gpt-5.5
+        model: gpt-5.6-sol
 
   local-llama:
     description: Optional local Ollama model

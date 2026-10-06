@@ -565,6 +565,62 @@ def extract_output_from_chat_payload(data: Any) -> str:
     return truncate_text(data)
 
 
+def _log_text_from_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for part in value:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text") or part.get("value")
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def extract_log_output_from_chat_payload(data: Any) -> str:
+    """Extract human-visible output for request logs without dumping protocol JSON."""
+    if not isinstance(data, dict):
+        return truncate_text(data)
+
+    texts: List[str] = []
+    tool_names: List[str] = []
+    choices = data.get("choices")
+    for choice in choices if isinstance(choices, list) else []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+
+        for container in (message, delta):
+            content = _log_text_from_content(container.get("content"))
+            if content:
+                texts.append(content)
+
+            calls = container.get("tool_calls")
+            for call in calls if isinstance(calls, list) else []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = function.get("name")
+                if isinstance(name, str) and name and name not in tool_names:
+                    tool_names.append(name)
+
+            function_call = container.get("function_call")
+            if isinstance(function_call, dict):
+                name = function_call.get("name")
+                if isinstance(name, str) and name and name not in tool_names:
+                    tool_names.append(name)
+
+    if texts:
+        return truncate_text("".join(texts))
+    if tool_names:
+        return truncate_text(f"[tool_calls: {', '.join(tool_names)}]")
+    return ""
+
+
 def extract_output_from_body(content: bytes, content_type: str = "") -> str:
     text = content.decode("utf-8", errors="replace")
     if "text/event-stream" in (content_type or "").lower():
@@ -576,14 +632,21 @@ def extract_output_from_body(content: bytes, content_type: str = "") -> str:
             if not data_text or data_text == "[DONE]":
                 continue
             try:
-                parts.append(extract_output_from_chat_payload(json.loads(data_text)))
+                extracted = extract_log_output_from_chat_payload(json.loads(data_text))
             except Exception:
-                parts.append(data_text)
-        return truncate_text("".join(parts) or text)
+                # Preserve genuinely plain-text SSE data, but never copy malformed
+                # JSON/protocol blobs into the human-readable output column.
+                stripped = data_text.lstrip()
+                extracted = "" if stripped.startswith(("{", "[")) else data_text
+            if extracted:
+                parts.append(extracted)
+        return truncate_text("".join(parts))
+
     try:
-        return extract_output_from_chat_payload(json.loads(text))
+        return extract_log_output_from_chat_payload(json.loads(text))
     except Exception:
         return truncate_text(text)
+
 
 
 def list_logs(limit: int = 200) -> List[Dict[str, Any]]:

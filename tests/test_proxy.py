@@ -984,3 +984,135 @@ def test_preflight_skips_obviously_oversized_context_provider(tmp_path, monkeypa
         )
     assert response.status_code == 200
     assert fake.hosts == ["fallback.local"]
+
+
+def test_provider_attempts_link_fallback_chain_to_final_log(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = SequencedChatClient(
+        [
+            (429, {"error": {"message": "rate limited"}}),
+            (
+                200,
+                {
+                    "id": "ok",
+                    "object": "chat.completion",
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "recovered"}}
+                    ],
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {"name": "p1", "url": "http://p1.local/v1", "api_key": "k1", "models": ["m1"]},
+            {"name": "p2", "url": "http://p2.local/v1", "api_key": "k2", "models": ["m2"]},
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "p1", "model": "m1"},
+                    {"provider": "p2", "model": "m2"},
+                ],
+            }
+        },
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "g", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+    with sqlite3.connect(tmp_path / "app.db") as conn:
+        conn.row_factory = sqlite3.Row
+        attempts = conn.execute(
+            "SELECT request_id, attempt_no, provider_name, status_code, action "
+            "FROM ProviderAttempts ORDER BY attempt_no"
+        ).fetchall()
+        final_log = conn.execute(
+            "SELECT request_id, provider_name, status_code FROM Logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert [(row["attempt_no"], row["provider_name"], row["status_code"], row["action"]) for row in attempts] == [
+        (1, "p1", 429, "fallback"),
+        (2, "p2", 200, "success"),
+    ]
+    assert attempts[0]["request_id"] == attempts[1]["request_id"]
+    assert final_log["request_id"] == attempts[0]["request_id"]
+    assert final_log["provider_name"] == "p2"
+    assert final_log["status_code"] == 200
+
+
+def test_provider_attempts_record_sanitized_retry(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = SequencedChatClient(
+        [
+            (400, {"error": {"message": "property 'reasoning_content' is unsupported"}}),
+            (
+                200,
+                {
+                    "id": "ok",
+                    "object": "chat.completion",
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "recovered"}}
+                    ],
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(main, "http_client", fake)
+    main.config_data = {
+        "providers": [
+            {"name": "groq", "url": "http://groq.local/v1", "api_key": "k", "models": ["m"]}
+        ],
+        "groups": {},
+    }
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "m",
+                "messages": [
+                    {"role": "assistant", "content": "x", "reasoning_content": "secret"},
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+        )
+    assert response.status_code == 200
+    with sqlite3.connect(tmp_path / "app.db") as conn:
+        rows = conn.execute(
+            "SELECT attempt_no, status_code, action FROM ProviderAttempts ORDER BY attempt_no"
+        ).fetchall()
+    assert rows == [(1, 400, "retry_sanitized"), (2, 200, "success")]
+
+
+def test_init_database_migrates_request_id_and_provider_attempts(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE Logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    main.init_database()
+    with sqlite3.connect(db_path) as conn:
+        log_columns = {row[1] for row in conn.execute("PRAGMA table_info(Logs)")}
+        attempt_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ProviderAttempts'"
+        ).fetchone()
+    assert "request_id" in log_columns
+    assert attempt_table == ("ProviderAttempts",)

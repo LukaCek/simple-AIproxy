@@ -123,13 +123,13 @@ curl -N -sS http://localhost:8000/v1/chat/completions \
 
 ## Balanced Codex OAuth profiles
 
-`config.yml` contains an example with two Codex profiles:
+Codex providers use `api_mode: codex_responses`. A minimal two-profile setup is:
 
 ```yaml
 providers:
   - name: codex-a
     url: https://chatgpt.com/backend-api/codex
-    models: [gpt-5.5]
+    models: [gpt-5.6-sol]
     api_mode: codex_responses
     oauth: true
     client_id: app_EMoamEEZ73f0CkXaXp7hrann
@@ -140,7 +140,7 @@ providers:
 
   - name: codex-b
     url: https://chatgpt.com/backend-api/codex
-    models: [gpt-5.5]
+    models: [gpt-5.6-sol]
     api_mode: codex_responses
     oauth: true
     client_id: app_EMoamEEZ73f0CkXaXp7hrann
@@ -148,20 +148,42 @@ providers:
     access_token: ""
     refresh_token: ""
     expires_at: ""
-
-groups:
-  gpt-5.5:
-    strategy: round_robin
-    members:
-      - provider: codex-a
-        model: gpt-5.5
-      - provider: codex-b
-        model: gpt-5.5
 ```
 
-With `strategy: round_robin`, requests rotate `codex-a`, `codex-b`, `codex-a`, `codex-b`, ... while still falling back on retryable upstream failures.
+The production Codex entrypoint automatically exposes every configured Codex
+profile through round-robin model pools. The built-in selectable order is:
 
-Important: Codex is not a normal `/v1/chat/completions` backend. The proxy exposes `/v1/chat/completions` to clients and translates requests to the Responses backend. The production adapter supports normal text, multimodal chat content conversion, Chat Completions tool definitions/tool choice, assistant tool calls, tool outputs, and streaming function-call deltas. Provider-specific reasoning fields are not assumed to be portable: if an OpenAI-compatible provider rejects historical assistant `reasoning_content`, the proxy retries once with that unsupported field removed while preserving tool-call structure.
+```text
+gpt-5.6-sol
+gpt-5.6-terra
+gpt-5.6-luna
+gpt-5.5
+```
+
+It also creates a client-facing `codex` group that points at the preferred
+default model (currently `gpt-5.6-sol`). You therefore do not need to duplicate
+all of those groups manually in YAML. Existing explicit groups are preserved and
+the Codex members are added without duplication.
+
+Override the selectable list/default at runtime when needed:
+
+```bash
+CODEX_DEFAULT_MODEL=gpt-5.6-sol
+CODEX_MODELS=gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5
+```
+
+With multiple Codex profiles, each generated model group uses
+`strategy: round_robin`, so requests rotate across the profiles while still
+falling back on retryable upstream failures.
+
+Important: Codex is not a normal `/v1/chat/completions` backend. The proxy exposes
+`/v1/chat/completions` to clients and translates requests to the Responses
+backend. The production adapter supports normal text, multimodal chat content
+conversion, Chat Completions tool definitions/tool choice, assistant tool calls,
+tool outputs, and streaming function-call deltas. Provider-specific reasoning
+fields are not assumed to be portable: if an OpenAI-compatible provider rejects
+historical assistant `reasoning_content`, the proxy retries once with that
+unsupported field removed while preserving tool-call structure.
 
 ### Live Codex usage API
 

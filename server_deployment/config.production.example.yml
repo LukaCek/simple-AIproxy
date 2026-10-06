@@ -1,5 +1,13 @@
 # Production starter config for ~/docker/simple-AIproxy/config.yml
 # Keep real tokens only on the server. Never commit real access_token/refresh_token values.
+#
+# The dynamic "free-models" group is injected at runtime from the public registry.
+# Manage its named credentials under Admin -> Config -> Free provider API keys or
+# through provider environment variables in .env; do not add a static free-models
+# group here just to enable the registry.
+#
+# Runtime timeout/cooldown/audio tuning belongs in .env. See .env.example and
+# PRODUCTION_SETUP.md.
 
 providers:
   - name: codex-a
@@ -27,6 +35,18 @@ providers:
     access_token: "PASTE_CODEX_B_ACCESS_TOKEN_HERE"
     refresh_token: "PASTE_CODEX_B_REFRESH_TOKEN_HERE"
     expires_at: ""
+
+  # Optional OpenAI-compatible transcription provider. The secret is read
+  # from GROQ_API_KEY in .env; clients still authenticate only to AIProxy.
+  - name: groq-transcription
+    url: https://api.groq.com/openai/v1
+    description: Groq Whisper speech transcription
+    models:
+      - whisper-large-v3-turbo
+      - whisper-large-v3
+    api_key: ""
+    api_key_env: GROQ_API_KEY
+    api_mode: openai_audio_transcriptions
 
   # Optional local Ollama through its OpenAI-compatible endpoint.
   # This only works if the container can reach Ollama at this host.

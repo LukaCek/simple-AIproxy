@@ -5,7 +5,7 @@ providers:
     url: https://chatgpt.com/backend-api/codex
     description: First OpenAI Codex OAuth profile; paste/import tokens on the server
     models:
-      - gpt-5.5
+      - gpt-5.6-sol
     api_mode: codex_responses
     oauth: true
     client_id: app_EMoamEEZ73f0CkXaXp7hrann
@@ -18,7 +18,7 @@ providers:
     url: https://chatgpt.com/backend-api/codex
     description: Second OpenAI Codex OAuth profile; used evenly by round-robin
     models:
-      - gpt-5.5
+      - gpt-5.6-sol
     api_mode: codex_responses
     oauth: true
     client_id: app_EMoamEEZ73f0CkXaXp7hrann
@@ -80,14 +80,14 @@ model_profiles:
 # free_model_registry at runtime. Do not define it statically here unless you
 # intentionally want to replace that behavior.
 groups:
-  gpt-5.5:
-    description: Balanced Codex profile pool
+  codex:
+    description: Default balanced Codex profile pool (runtime also exposes each selectable model directly)
     strategy: round_robin
     members:
       - provider: codex-a
-        model: gpt-5.5
+        model: gpt-5.6-sol
       - provider: codex-b
-        model: gpt-5.5
+        model: gpt-5.6-sol
 
   local-llama:
     description: Local Ollama model

@@ -66,7 +66,29 @@ class TimeoutChatClient(FakeChatClient):
         raise httpx.ReadTimeout("", request=request)
 
 
+class TimeoutFirstThenSuccessChatClient(FakeChatClient):
+    async def send(self, request, stream=False):
+        self.hosts.append(request.url.host)
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        payload = {
+            "id": "ok",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": f"from {request.url.host}",
+                    }
+                }
+            ],
+        }
+        return httpx.Response(200, json=payload, request=request)
+
+
 def setup_key_db(tmp_path: Path, monkeypatch):
+    main.provider_cooldowns.clear()
     db_path = tmp_path / "app.db"
     monkeypatch.setattr(main, "DB_PATH", db_path)
     main.init_database()
@@ -1141,3 +1163,144 @@ def test_log_output_summarizes_tool_call_without_arguments_blob():
 def test_log_output_nonstream_reasoning_only_is_empty():
     body = b'{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"private"}}]}'
     assert main.extract_output_from_body(body, "application/json") == ""
+
+
+def test_429_cooldown_skips_provider_on_next_request(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = SequencedChatClient(
+        [
+            (429, {"error": {"message": "rate limited"}}),
+            (
+                200,
+                {
+                    "id": "first-fallback",
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "fallback one"}}],
+                },
+            ),
+            (
+                200,
+                {
+                    "id": "second-fallback",
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "fallback two"}}],
+                },
+            ),
+        ]
+    )
+    desired_config = {
+        "providers": [
+            {"name": "limited", "url": "http://limited.local/v1", "api_key": "k1", "models": ["m1"]},
+            {"name": "fallback", "url": "http://fallback.local/v1", "api_key": "k2", "models": ["m2"]},
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "limited", "model": "m1"},
+                    {"provider": "fallback", "model": "m2"},
+                ],
+            }
+        },
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        first = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "g", "messages": [{"role": "user", "content": "one"}]},
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "g", "messages": [{"role": "user", "content": "two"}]},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert fake.hosts == ["limited.local", "fallback.local", "fallback.local"]
+    with sqlite3.connect(tmp_path / "app.db") as conn:
+        actions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT action FROM ProviderAttempts ORDER BY id"
+            ).fetchall()
+        ]
+    assert actions == ["fallback", "success", "cooldown_skip", "success"]
+
+
+def test_timeout_cooldown_skips_provider_on_next_request(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = TimeoutFirstThenSuccessChatClient()
+    desired_config = {
+        "providers": [
+            {"name": "slow", "url": "http://slow.local/v1", "api_key": "k1", "models": ["m1"]},
+            {"name": "fallback", "url": "http://fallback.local/v1", "api_key": "k2", "models": ["m2"]},
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "slow", "model": "m1"},
+                    {"provider": "fallback", "model": "m2"},
+                ],
+            }
+        },
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        first = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "g", "messages": [{"role": "user", "content": "one"}]},
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "g", "messages": [{"role": "user", "content": "two"}]},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert fake.hosts == ["slow.local", "fallback.local", "fallback.local"]
+    assert main.provider_cooldown_remaining({"name": "slow", "model": "m1"}) > 0
+
+
+def test_retry_after_header_controls_rate_limit_cooldown():
+    main.provider_cooldowns.clear()
+    endpoint = {"name": "limited", "model": "m1"}
+    response = httpx.Response(
+        429,
+        headers={"retry-after": "120"},
+        request=httpx.Request("POST", "https://example.test"),
+    )
+    seconds = main.apply_provider_cooldown_from_response(endpoint, response)
+    remaining = main.provider_cooldown_remaining(endpoint)
+    assert seconds == 120
+    assert 119 <= remaining <= 120
+    main.provider_cooldowns.clear()
+
+
+def test_413_does_not_put_provider_on_cooldown():
+    main.provider_cooldowns.clear()
+    endpoint = {"name": "limited", "model": "m1"}
+    response = httpx.Response(
+        413,
+        request=httpx.Request("POST", "https://example.test"),
+    )
+    seconds = main.apply_provider_cooldown_from_response(endpoint, response)
+    assert seconds == 0
+    assert main.provider_cooldown_remaining(endpoint) == 0
+
+
+def test_expired_provider_cooldown_is_removed():
+    main.provider_cooldowns.clear()
+    endpoint = {"name": "limited", "model": "m1"}
+    key = main.provider_cooldown_key(endpoint)
+    main.provider_cooldowns[key] = main.time.monotonic() - 1
+    assert main.provider_cooldown_remaining(endpoint) == 0
+    assert key not in main.provider_cooldowns

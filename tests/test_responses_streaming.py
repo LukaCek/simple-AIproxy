@@ -288,6 +288,7 @@ class SequencedStreamingRouteClient:
 
 
 def setup_streaming_key_db(streaming, tmp_path, monkeypatch):
+    streaming._impl.provider_cooldowns.clear()
     db_path = tmp_path / "streaming.db"
     monkeypatch.setattr(streaming._impl, "DB_PATH", db_path)
     streaming._impl.init_database()
@@ -442,3 +443,75 @@ def test_streaming_413_falls_back_to_next_provider(tmp_path, monkeypatch):
     ]
     assert attempts[0]["request_id"] == attempts[1]["request_id"]
     assert final_log["request_id"] == attempts[0]["request_id"]
+
+
+def test_streaming_429_cooldown_skips_provider_on_next_request(tmp_path, monkeypatch):
+    streaming = get_streaming_module()
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    fake = SequencedStreamingRouteClient(
+        [
+            (429, {"error": {"message": "rate limited"}}),
+            (200, "fallback one"),
+            (200, "fallback two"),
+        ]
+    )
+    desired_config = {
+        "providers": [
+            {
+                "name": "limited",
+                "url": "http://limited.local/v1",
+                "api_key": "k1",
+                "models": ["m1"],
+            },
+            {
+                "name": "fallback",
+                "url": "http://fallback.local/v1",
+                "api_key": "k2",
+                "models": ["m2"],
+            },
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "limited", "model": "m1"},
+                    {"provider": "fallback", "model": "m2"},
+                ],
+            }
+        },
+    }
+
+    streaming._impl.config_data = desired_config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(streaming._impl, "http_client", fake)
+        streaming._impl.config_data = desired_config
+        first = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "g",
+                "stream": True,
+                "messages": [{"role": "user", "content": "one"}],
+            },
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "g",
+                "stream": True,
+                "messages": [{"role": "user", "content": "two"}],
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert fake.hosts == ["limited.local", "fallback.local", "fallback.local"]
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        actions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT action FROM ProviderAttempts ORDER BY id"
+            ).fetchall()
+        ]
+    assert actions == ["fallback", "success", "cooldown_skip", "success"]

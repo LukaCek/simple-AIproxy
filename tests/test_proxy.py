@@ -1118,3 +1118,26 @@ def test_init_database_migrates_request_id_and_provider_attempts(tmp_path, monke
         ).fetchone()
     assert "request_id" in log_columns
     assert attempt_table == ("ProviderAttempts",)
+
+
+def test_log_output_ignores_reasoning_only_sse_chunks():
+    body = b'''data: {"choices":[{"delta":{"role":"assistant"}}]}\n\ndata: {"choices":[{"delta":{"reasoning":"private chain"}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'''
+    assert main.extract_output_from_body(body, "text/event-stream") == ""
+
+
+def test_log_output_keeps_content_but_not_reasoning_json():
+    body = b'''data: {"choices":[{"delta":{"reasoning":"private chain"}}]}\n\ndata: {"choices":[{"delta":{"content":"hello "}}]}\n\ndata: {"choices":[{"delta":{"content":"world"}}]}\n\ndata: [DONE]\n\n'''
+    output = main.extract_output_from_body(body, "text/event-stream")
+    assert output == "hello world"
+    assert "reasoning" not in output
+    assert "choices" not in output
+
+
+def test_log_output_summarizes_tool_call_without_arguments_blob():
+    body = b'''data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"ping","arguments":""}}]}}]}\n\ndata: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\\"value\\\":1}"}}]}}]}\n\ndata: [DONE]\n\n'''
+    assert main.extract_output_from_body(body, "text/event-stream") == "[tool_calls: ping]"
+
+
+def test_log_output_nonstream_reasoning_only_is_empty():
+    body = b'{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"private"}}]}'
+    assert main.extract_output_from_body(body, "application/json") == ""

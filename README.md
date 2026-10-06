@@ -8,7 +8,7 @@ A lightweight FastAPI-based LLM API gateway with an OpenAI-compatible facade:
 - YAML-backed providers/groups
 - round-robin or fallback routing per group
 - OpenAI-compatible provider forwarding, including Ollama
-- minimal Responses/Codex adapter for OpenAI Codex OAuth profiles
+- Responses/Codex compatibility adapter with true SSE streaming and tool-call support
 - request logging, live in-flight request visibility, provider-attempt tracing, and a simple Jinja2/Tailwind admin GUI
 - dynamic `free-models` fallback routing from the public registry, including limit-aware preflight checks
 - temporary provider/model cooldowns after rate limits, timeouts, and transient upstream failures
@@ -21,7 +21,7 @@ A lightweight FastAPI-based LLM API gateway with an OpenAI-compatible facade:
 The original version mixed provider auth, provider protocol, and client-facing model names. That made the Codex OAuth use-case unreliable. This version separates the important ideas:
 
 - **providers** are real upstream accounts/endpoints (`codex-a`, `codex-b`, `ollama-local`, ...)
-- **groups** are model names exposed to clients (`gpt-5.5`, `local-llama`, ...)
+- **groups** are model names exposed to clients (`gpt-5.6-sol`, `local-llama`, ...)
 - a group can route to multiple providers with `strategy: round_robin` for even usage or `strategy: fallback` for fixed priority fallback
 - Codex OAuth profiles use `api_mode: codex_responses`; normal OpenAI-compatible APIs use `api_mode: openai_chat_completions`
 
@@ -107,10 +107,14 @@ Create an API key in `/admin/keys`, then call the proxy as an OpenAI-compatible 
 curl -sS http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer API_KEY' \
-  -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"Say hello"}]}'
+  -d '{"model":"codex","messages":[{"role":"user","content":"Say hello"}]}'
 ```
 
-`model` is the **group name** from `config.yml`, not necessarily the upstream model ID. The proxy rewrites it to each selected provider member's `model`.
+`model` is a **client-facing group name** after configuration normalization,
+not necessarily the upstream model ID. Groups may come directly from
+`config.yml` or be generated at runtime (for example `codex`,
+`gpt-5.6-sol`, and `free-models`). The proxy rewrites the request to each
+selected provider member's upstream model.
 
 For slow local/Ollama models behind Cloudflare or another reverse proxy, use streaming so the edge connection receives chunks instead of waiting silently for the full completion:
 
@@ -118,7 +122,7 @@ For slow local/Ollama models behind Cloudflare or another reverse proxy, use str
 curl -N -sS http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer API_KEY' \
-  -d '{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"Say hello"}]}'
+  -d '{"model":"codex","stream":true,"messages":[{"role":"user","content":"Say hello"}]}'
 ```
 
 ## Balanced Codex OAuth profiles

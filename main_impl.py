@@ -87,6 +87,7 @@ def init_database() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_key TEXT,
                 api_key_name TEXT,
+                request_id TEXT,
                 requested_model TEXT,
                 group_name TEXT,
                 provider_name TEXT,
@@ -108,6 +109,7 @@ def init_database() -> None:
         existing_columns = {row[1] for row in cursor.fetchall()}
         migrations = {
             "api_key_name": "TEXT",
+            "request_id": "TEXT",
             "requested_model": "TEXT",
             "first_response_at": "TEXT",
             "first_response_ms": "REAL",
@@ -118,6 +120,29 @@ def init_database() -> None:
         for column, column_type in migrations.items():
             if column not in existing_columns:
                 cursor.execute(f"ALTER TABLE Logs ADD COLUMN {column} {column_type}")
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ProviderAttempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL,
+                attempt_no INTEGER NOT NULL,
+                requested_model TEXT,
+                provider_name TEXT,
+                provider_model TEXT,
+                status_code INTEGER,
+                action TEXT NOT NULL,
+                error TEXT,
+                started_at TEXT,
+                ended_at TEXT,
+                total_ms REAL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_provider_attempts_request_id "
+            "ON ProviderAttempts(request_id, attempt_no)"
+        )
         conn.commit()
 
 
@@ -566,7 +591,7 @@ def list_logs(limit: int = 200) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, api_key, api_key_name, requested_model, group_name, provider_name, provider_model,
+            SELECT id, api_key, api_key_name, request_id, requested_model, group_name, provider_name, provider_model,
                    status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
                    prompt, output, error, created_at
             FROM Logs ORDER BY id DESC LIMIT ?
@@ -589,7 +614,7 @@ def list_logs(limit: int = 200) -> List[Dict[str, Any]]:
         row["api_key_display"] = f"{row.get('api_key_name') or '-'} ({key[:6]}…{key[-4:]})" if key else (row.get("api_key_name") or "-")
         row["api_key_hash"] = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] if key else "-"
         row["type"] = "LLM"
-        row["request_id"] = f"log-{row.get('id')}"
+        row["request_id"] = row.get("request_id") or f"log-{row.get('id')}"
         row["modal_payload"] = {k: v for k, v in row.items() if k not in {"api_key", "modal_payload"}}
     return rows
 
@@ -610,20 +635,22 @@ def insert_log(
     prompt: Optional[str],
     output: Optional[str],
     error: Optional[str],
+    request_id: Optional[str] = None,
 ) -> None:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             INSERT INTO Logs (
-                api_key, api_key_name, requested_model, group_name, provider_name, provider_model,
+                api_key, api_key_name, request_id, requested_model, group_name, provider_name, provider_model,
                 status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
                 prompt, output, error, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 api_key,
                 api_key_name,
+                request_id,
                 requested_model,
                 group_name,
                 provider_name,
@@ -641,6 +668,47 @@ def insert_log(
             ),
         )
         conn.commit()
+
+
+def insert_provider_attempt(
+    request_id: str,
+    attempt_no: int,
+    requested_model: str,
+    provider_name: str,
+    provider_model: str,
+    status_code: Optional[int],
+    action: str,
+    error: Optional[str],
+    started_at: str,
+    ended_at: str,
+    total_ms: Optional[float],
+) -> None:
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO ProviderAttempts (
+                request_id, attempt_no, requested_model, provider_name,
+                provider_model, status_code, action, error, started_at,
+                ended_at, total_ms, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                attempt_no,
+                requested_model,
+                provider_name,
+                provider_model,
+                status_code,
+                action,
+                truncate_text(error or "", 4000) if error else None,
+                started_at,
+                ended_at,
+                total_ms,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+
 
 def create_api_key(name: str) -> str:
     token = uuid.uuid4().hex

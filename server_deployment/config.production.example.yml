@@ -59,8 +59,10 @@ providers:
     api_mode: openai_chat_completions
 
 groups:
-  gpt-5.6-sol:
-    description: Balanced Codex pool for Hermes/OpenAI-compatible clients
+  # The Codex runtime also creates this group automatically; keeping it explicit
+  # here makes the starter config readable before runtime normalization.
+  codex:
+    description: Default balanced Codex pool for Hermes/OpenAI-compatible clients
     strategy: round_robin
     members:
       - provider: codex-a

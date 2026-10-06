@@ -33,6 +33,18 @@ Persistence matters:
 
 Do not replace `app.db`, `config.yml`, or `.env` during routine deploys.
 
+Before the very first container start, make sure the bind-mount targets have
+the correct host-side types:
+
+```bash
+cd /home/ubuntu/docker/simple-AIproxy
+touch app.db
+mkdir -p cache
+```
+
+Do this before `docker compose up`; if `app.db` does not exist, Docker can
+otherwise create a directory at that bind source.
+
 ## 1. Production Docker Compose
 
 Use the tracked `server_deployment/docker-compose.yml`:

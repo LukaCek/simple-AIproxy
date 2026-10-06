@@ -132,6 +132,17 @@ scp server_deployment/.env.example ubuntu@<SERVER>:/home/ubuntu/docker/simple-AI
 scp server_deployment/config.production.example.yml ubuntu@<SERVER>:/home/ubuntu/docker/simple-AIproxy/config.yml
 ```
 
+Then create the SQLite bind-mount file before the first container start:
+
+```bash
+cd /home/ubuntu/docker/simple-AIproxy
+touch app.db
+mkdir -p cache
+```
+
+This matters because a missing host-side `app.db` bind source can otherwise be
+created as a directory by Docker.
+
 Then edit `.env` and `config.yml` on the server. Never commit production
 tokens or admin credentials.
 

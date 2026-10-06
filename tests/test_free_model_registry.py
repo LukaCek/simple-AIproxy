@@ -25,6 +25,9 @@ def sample_registry():
                         "enabled": True,
                         "include_in_default_group": True,
                         "priority": 20,
+                        "context_tokens": 131072,
+                        "free_limits": {"tpm": 8000, "rpm": 30},
+                        "capabilities": ["text", "tools"],
                     },
                     {
                         "id": "alpha-extra",
@@ -137,6 +140,11 @@ def test_build_overlay_uses_env_and_multiple_stored_keys_in_priority_order():
         "free-registry-beta-env",
     ]
     assert providers[0]["models"] == ["alpha-best", "alpha-extra"]
+    assert providers[0]["model_metadata"]["alpha-best"] == {
+        "context_tokens": 131072,
+        "free_limits": {"tpm": 8000, "rpm": 30},
+        "capabilities": ["text", "tools"],
+    }
     assert providers[1]["registry_key_name"] == "Luka"
     assert providers[2]["registry_key_name"] == "Brother"
     assert group["strategy"] == "fallback"

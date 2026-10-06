@@ -842,3 +842,145 @@ def test_429_still_falls_back_to_next_provider(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "second provider"
     assert fake.hosts == ["provider-a.local", "provider-b.local"]
+
+
+def test_preflight_skips_obviously_oversized_tpm_provider(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = FakeChatClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {
+                "name": "limited",
+                "url": "http://limited.local/v1",
+                "api_key": "k1",
+                "models": ["m1"],
+                "model_metadata": {
+                    "m1": {"context_tokens": 100000, "free_limits": {"tpm": 100}}
+                },
+            },
+            {
+                "name": "fallback",
+                "url": "http://fallback.local/v1",
+                "api_key": "k2",
+                "models": ["m2"],
+            },
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "limited", "model": "m1"},
+                    {"provider": "fallback", "model": "m2"},
+                ],
+            }
+        },
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "g",
+                "messages": [{"role": "user", "content": "x" * 1200}],
+            },
+        )
+    assert response.status_code == 200
+    assert fake.hosts == ["fallback.local"]
+
+
+def test_preflight_allows_small_request_to_limited_provider(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = FakeChatClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {
+                "name": "limited",
+                "url": "http://limited.local/v1",
+                "api_key": "k1",
+                "models": ["m1"],
+                "model_metadata": {
+                    "m1": {"context_tokens": 100000, "free_limits": {"tpm": 8000}}
+                },
+            },
+            {
+                "name": "fallback",
+                "url": "http://fallback.local/v1",
+                "api_key": "k2",
+                "models": ["m2"],
+            },
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "limited", "model": "m1"},
+                    {"provider": "fallback", "model": "m2"},
+                ],
+            }
+        },
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "g",
+                "messages": [{"role": "user", "content": "short"}],
+            },
+        )
+    assert response.status_code == 200
+    assert fake.hosts == ["limited.local"]
+
+
+def test_preflight_skips_obviously_oversized_context_provider(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = FakeChatClient()
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {
+                "name": "tiny-context",
+                "url": "http://tiny.local/v1",
+                "api_key": "k1",
+                "models": ["m1"],
+                "model_metadata": {"m1": {"context_tokens": 100}},
+            },
+            {
+                "name": "fallback",
+                "url": "http://fallback.local/v1",
+                "api_key": "k2",
+                "models": ["m2"],
+            },
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "tiny-context", "model": "m1"},
+                    {"provider": "fallback", "model": "m2"},
+                ],
+            }
+        },
+    }
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "g",
+                "messages": [{"role": "user", "content": "x" * 1200}],
+            },
+        )
+    assert response.status_code == 200
+    assert fake.hosts == ["fallback.local"]

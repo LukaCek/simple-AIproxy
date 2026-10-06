@@ -432,6 +432,60 @@ def prepare_provider_chat_payload(payload: Dict[str, Any], endpoint: Dict[str, A
     return provider_payload
 
 
+def estimate_request_tokens(payload: Dict[str, Any]) -> int:
+    """Return a deliberately rough token estimate for preflight routing.
+
+    The estimate is only used to skip a provider when a request is well over a
+    published free-tier TPM/context limit. A safety margin in
+    provider_preflight_skip_reason prevents borderline requests from being
+    rejected based on this heuristic.
+    """
+    estimate_payload = dict(payload)
+    estimate_payload.pop("model", None)
+    estimate_payload.pop("stream", None)
+    estimate_payload.pop("background", None)
+    output_budget = 0
+    for field in ("max_completion_tokens", "max_tokens"):
+        value = estimate_payload.pop(field, None)
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric > output_budget:
+            output_budget = numeric
+    serialized = json.dumps(estimate_payload, ensure_ascii=False, separators=(",", ":"))
+    input_estimate = max(1, (len(serialized.encode("utf-8")) + 3) // 4)
+    return input_estimate + max(0, output_budget)
+
+
+def provider_preflight_skip_reason(payload: Dict[str, Any], endpoint: Dict[str, Any]) -> Optional[str]:
+    metadata = endpoint.get("model_metadata")
+    if not isinstance(metadata, dict) or not metadata:
+        return None
+    estimated_tokens = estimate_request_tokens(payload)
+    # The approximation above intentionally needs to exceed the published limit
+    # by 15% before routing is skipped. This avoids treating borderline token
+    # estimates as authoritative while still catching obviously oversized calls.
+    margin = 1.15
+
+    free_limits = metadata.get("free_limits")
+    if isinstance(free_limits, dict):
+        try:
+            tpm = int(free_limits.get("tpm") or 0)
+        except (TypeError, ValueError):
+            tpm = 0
+        if tpm > 0 and estimated_tokens > int(tpm * margin):
+            return f"estimated request {estimated_tokens} tokens exceeds free-tier TPM {tpm}"
+
+    try:
+        context_tokens = int(metadata.get("context_tokens") or 0)
+    except (TypeError, ValueError):
+        context_tokens = 0
+    if context_tokens > 0 and estimated_tokens > int(context_tokens * margin):
+        return f"estimated request {estimated_tokens} tokens exceeds context window {context_tokens}"
+    return None
+
+
 def payload_without_reasoning_content(payload: Dict[str, Any]) -> Dict[str, Any]:
     sanitized = dict(payload)
     messages = payload.get("messages")
@@ -1059,6 +1113,11 @@ def delete_provider(name: str) -> None:
 
 
 def provider_to_endpoint(provider: Dict[str, Any], model_name: Optional[str] = None) -> Dict[str, Any]:
+    resolved_model = model_name or (provider.get("models", [None])[0] if provider.get("models") else None)
+    all_metadata = provider.get("model_metadata") if isinstance(provider.get("model_metadata"), dict) else {}
+    model_metadata = all_metadata.get(str(resolved_model), {}) if resolved_model is not None else {}
+    if not isinstance(model_metadata, dict):
+        model_metadata = {}
     return {
         "name": provider.get("name", ""),
         "url": provider.get("url", ""),
@@ -1074,7 +1133,8 @@ def provider_to_endpoint(provider: Dict[str, Any], model_name: Optional[str] = N
         "expires_at": provider.get("expires_at", ""),
         "oauth_reauth_required": provider.get("oauth_reauth_required", False),
         "oauth_error": provider.get("oauth_error", ""),
-        "model": model_name or (provider.get("models", [None])[0] if provider.get("models") else None),
+        "model": resolved_model,
+        "model_metadata": model_metadata,
     }
 
 
@@ -1135,23 +1195,7 @@ def resolve_requested_model(model_name: str) -> List[Dict[str, Any]]:
             models = [str(model) for model in provider.get("models", []) if model is not None]
             if model_name not in models:
                 continue
-            endpoints.append(
-                {
-                    "name": provider.get("name", ""),
-                    "url": provider.get("url", ""),
-                    "api_key": provider.get("api_key", ""),
-                    "description": provider.get("description", ""),
-                    "oauth": provider.get("oauth", False),
-                    "api_mode": provider.get("api_mode", "openai_chat_completions"),
-                    "access_token": provider.get("access_token", ""),
-                    "refresh_token": provider.get("refresh_token", ""),
-                    "token_url": provider.get("token_url", ""),
-                    "client_id": provider.get("client_id", ""),
-                    "client_secret": provider.get("client_secret", ""),
-                    "expires_at": provider.get("expires_at", ""),
-                    "model": model_name,
-                }
-            )
+            endpoints.append(provider_to_endpoint(provider, model_name))
     if not endpoints:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' not configured")
     return route_endpoints(model_name, endpoints)
@@ -2278,6 +2322,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
         provider_name = str(endpoint.get("name", "unknown"))
         provider_model = str(endpoint.get("model") or "")
         provider_payload = prepare_provider_chat_payload(payload, endpoint, provider_model)
+        preflight_reason = provider_preflight_skip_reason(provider_payload, endpoint)
+        if preflight_reason:
+            last_error = f"{provider_name} skipped: {preflight_reason}"
+            continue
         try:
             await ensure_provider_token(endpoint)
             api_mode = str(endpoint.get("api_mode", "openai_chat_completions"))

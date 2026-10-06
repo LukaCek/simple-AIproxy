@@ -375,6 +375,12 @@ async def chat_completions(
         provider_payload = _impl.prepare_provider_chat_payload(
             payload, endpoint, provider_model
         )
+        preflight_reason = _impl.provider_preflight_skip_reason(
+            provider_payload, endpoint
+        )
+        if preflight_reason:
+            last_error = f"{provider_name} skipped: {preflight_reason}"
+            continue
         response: Optional[httpx.Response] = None
 
         try:

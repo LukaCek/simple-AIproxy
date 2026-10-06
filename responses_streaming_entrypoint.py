@@ -33,7 +33,7 @@ if not hasattr(_impl, "_responses_streaming_original_chat_completions"):
     _impl._responses_streaming_original_chat_completions = _impl.chat_completions
 _original_chat_completions = _impl._responses_streaming_original_chat_completions
 
-_FALLBACK_STATUSES = {401, 403, 408, 409, 425, 429, 500, 502, 503, 504}
+_FALLBACK_STATUSES = {401, 403, 408, 409, 413, 425, 429, 500, 502, 503, 504}
 
 
 def _chat_chunk(
@@ -402,11 +402,47 @@ async def chat_completions(
             response = await _impl.http_client.send(request_obj, stream=True)
             upstream_status = response.status_code
             content_type = response.headers.get("content-type", "application/json")
+            buffered_error_content: Optional[bytes] = None
+
+            if upstream_status != 200:
+                buffered_error_content = await response.aread()
+                initial_error_text = buffered_error_content.decode("utf-8", errors="replace")
+                if (
+                    not responses_mode
+                    and _impl.is_unsupported_reasoning_content_error(
+                        upstream_status, initial_error_text
+                    )
+                ):
+                    sanitized_payload = _impl.payload_without_reasoning_content(
+                        provider_payload
+                    )
+                    if sanitized_payload != provider_payload:
+                        await response.aclose()
+                        provider_payload = sanitized_payload
+                        upstream_payload = provider_payload
+                        request_obj = _impl.http_client.build_request(
+                            "POST",
+                            target_url,
+                            json=upstream_payload,
+                            headers=_impl.build_provider_headers(endpoint),
+                        )
+                        response = await _impl.http_client.send(
+                            request_obj, stream=True
+                        )
+                        upstream_status = response.status_code
+                        content_type = response.headers.get(
+                            "content-type", "application/json"
+                        )
+                        buffered_error_content = None
 
             # Before returning a StreamingResponse we can still inspect failures,
             # refresh auth state, or fall back to the next configured provider.
             if upstream_status != 200:
-                content = await response.aread()
+                content = (
+                    buffered_error_content
+                    if buffered_error_content is not None
+                    else await response.aread()
+                )
                 await response.aclose()
                 response = None
                 raw_text = content.decode("utf-8", errors="replace")

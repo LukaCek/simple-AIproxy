@@ -521,3 +521,324 @@ def test_group_cycle_is_rejected(tmp_path, monkeypatch):
         assert "cannot contain itself" in exc.detail
     else:
         raise AssertionError("Expected cycle rejection")
+
+
+class SequencedChatClient(FakeChatClient):
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = list(responses)
+
+    async def send(self, request, stream=False):
+        self.hosts.append(request.url.host)
+        self.requests.append(request)
+        if not self.responses:
+            raise AssertionError("No fake response left for request")
+        status_code, payload = self.responses.pop(0)
+        return httpx.Response(status_code, json=payload, request=request)
+
+
+def test_reasoning_content_unsupported_is_sanitized_and_retried(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = SequencedChatClient(
+        [
+            (
+                400,
+                {
+                    "error": {
+                        "message": "'messages.2' : for 'role:assistant' the following must be satisfied[('messages.2' : property 'reasoning_content' is unsupported)]",
+                        "type": "invalid_request_error",
+                    }
+                },
+            ),
+            (
+                200,
+                {
+                    "id": "ok",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "recovered",
+                            }
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {
+                "name": "groq",
+                "url": "http://groq.local/v1",
+                "api_key": "k1",
+                "models": ["openai/gpt-oss-120b"],
+            }
+        ],
+        "groups": {
+            "free-models": {
+                "strategy": "fallback",
+                "members": [
+                    {
+                        "provider": "groq",
+                        "model": "openai/gpt-oss-120b",
+                    }
+                ],
+            }
+        },
+    }
+
+    payload = {
+        "model": "free-models",
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "do something"},
+            {
+                "role": "assistant",
+                "content": "previous answer",
+                "reasoning_content": "internal reasoning",
+            },
+            {"role": "user", "content": "continue"},
+        ],
+    }
+
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json=payload,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "recovered"
+    assert fake.hosts == ["groq.local", "groq.local"]
+    first_payload = fake.requests[0].extensions["json_payload"]
+    second_payload = fake.requests[1].extensions["json_payload"]
+    assert first_payload["messages"][2]["reasoning_content"] == "internal reasoning"
+    assert "reasoning_content" not in second_payload["messages"][2]
+    assert payload["messages"][2]["reasoning_content"] == "internal reasoning"
+
+
+def test_413_falls_back_to_next_provider(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = SequencedChatClient(
+        [
+            (
+                413,
+                {
+                    "error": {
+                        "message": "Request too large for model on tokens per minute",
+                        "type": "tokens",
+                        "code": "rate_limit_exceeded",
+                    }
+                },
+            ),
+            (
+                200,
+                {
+                    "id": "ok",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "from fallback",
+                            }
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {
+                "name": "groq",
+                "url": "http://groq.local/v1",
+                "api_key": "k1",
+                "models": ["openai/gpt-oss-120b"],
+            },
+            {
+                "name": "mistral",
+                "url": "http://mistral.local/v1",
+                "api_key": "k2",
+                "models": ["mistral-large-latest"],
+            },
+        ],
+        "groups": {
+            "free-models": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "groq", "model": "openai/gpt-oss-120b"},
+                    {"provider": "mistral", "model": "mistral-large-latest"},
+                ],
+            }
+        },
+    }
+
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "free-models",
+                "messages": [{"role": "user", "content": "large request"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "from fallback"
+    assert fake.hosts == ["groq.local", "mistral.local"]
+
+
+def test_plain_400_is_returned_without_trying_next_provider(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = SequencedChatClient(
+        [
+            (
+                400,
+                {
+                    "error": {
+                        "message": "Invalid tool schema",
+                        "type": "invalid_request_error",
+                    }
+                },
+            ),
+            (
+                200,
+                {
+                    "id": "unexpected",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "should not be reached",
+                            }
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {
+                "name": "provider-a",
+                "url": "http://provider-a.local/v1",
+                "api_key": "k1",
+                "models": ["m1"],
+            },
+            {
+                "name": "provider-b",
+                "url": "http://provider-b.local/v1",
+                "api_key": "k2",
+                "models": ["m2"],
+            },
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "provider-a", "model": "m1"},
+                    {"provider": "provider-b", "model": "m2"},
+                ],
+            }
+        },
+    }
+
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "g", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Invalid tool schema"
+    assert fake.hosts == ["provider-a.local"]
+
+
+def test_429_still_falls_back_to_next_provider(tmp_path, monkeypatch):
+    setup_key_db(tmp_path, monkeypatch)
+    fake = SequencedChatClient(
+        [
+            (
+                429,
+                {
+                    "error": {
+                        "message": "rate limited",
+                        "type": "rate_limit_error",
+                    }
+                },
+            ),
+            (
+                200,
+                {
+                    "id": "ok",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "second provider",
+                            }
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(main, "http_client", fake)
+    desired_config = {
+        "providers": [
+            {
+                "name": "provider-a",
+                "url": "http://provider-a.local/v1",
+                "api_key": "k1",
+                "models": ["m1"],
+            },
+            {
+                "name": "provider-b",
+                "url": "http://provider-b.local/v1",
+                "api_key": "k2",
+                "models": ["m2"],
+            },
+        ],
+        "groups": {
+            "g": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "provider-a", "model": "m1"},
+                    {"provider": "provider-b", "model": "m2"},
+                ],
+            }
+        },
+    }
+
+    main.config_data = desired_config
+    with TestClient(main.app) as client:
+        monkeypatch.setattr(main, "http_client", fake)
+        main.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={"model": "g", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "second provider"
+    assert fake.hosts == ["provider-a.local", "provider-b.local"]

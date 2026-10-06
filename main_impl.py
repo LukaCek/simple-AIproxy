@@ -432,6 +432,33 @@ def prepare_provider_chat_payload(payload: Dict[str, Any], endpoint: Dict[str, A
     return provider_payload
 
 
+def payload_without_reasoning_content(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(payload)
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return sanitized
+    changed = False
+    sanitized_messages: List[Any] = []
+    for message in messages:
+        if isinstance(message, dict) and "reasoning_content" in message:
+            cleaned = dict(message)
+            cleaned.pop("reasoning_content", None)
+            sanitized_messages.append(cleaned)
+            changed = True
+        else:
+            sanitized_messages.append(message)
+    if changed:
+        sanitized["messages"] = sanitized_messages
+    return sanitized
+
+
+def is_unsupported_reasoning_content_error(status_code: int, error_text: str) -> bool:
+    if status_code != 400:
+        return False
+    lower = (error_text or "").lower()
+    return "reasoning_content" in lower and ("unsupported" in lower or "not supported" in lower)
+
+
 def extract_prompt(payload: Dict[str, Any]) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -2234,7 +2261,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     started_monotonic = time.monotonic()
     started_at = datetime.utcnow().isoformat()
     last_error: Optional[str] = None
-    fallback_statuses = {401, 403, 408, 409, 425, 429, 500, 502, 503, 504}
+    fallback_statuses = {401, 403, 408, 409, 413, 425, 429, 500, 502, 503, 504}
 
     def timing(first_at: Optional[str] = None) -> tuple[str, Optional[float], float]:
         ended = datetime.utcnow().isoformat()
@@ -2296,6 +2323,17 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             request_obj = http_client.build_request("POST", target_url, json=provider_payload, headers=headers)
             response = await http_client.send(request_obj, stream=True)
             content_type = response.headers.get("content-type", "application/json")
+            if response.status_code != 200:
+                initial_content = await response.aread()
+                initial_error_text = initial_content.decode("utf-8", errors="replace")
+                if is_unsupported_reasoning_content_error(response.status_code, initial_error_text):
+                    sanitized_payload = payload_without_reasoning_content(provider_payload)
+                    if sanitized_payload != provider_payload:
+                        await response.aclose()
+                        provider_payload = sanitized_payload
+                        request_obj = http_client.build_request("POST", target_url, json=provider_payload, headers=headers)
+                        response = await http_client.send(request_obj, stream=True)
+                        content_type = response.headers.get("content-type", "application/json")
             if response.status_code == 200:
                 if payload.get("stream"):
                     async def proxy_stream() -> Any:

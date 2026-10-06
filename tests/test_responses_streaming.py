@@ -1,7 +1,9 @@
 import asyncio
 import json
+import sqlite3
 
 import httpx
+from fastapi.testclient import TestClient
 
 
 def get_streaming_module():
@@ -238,3 +240,190 @@ def test_production_route_is_replaced_once():
     ]
     assert len(routes) == 1
     assert routes[0].endpoint is streaming.chat_completions
+
+
+class StaticChatSSEStream(httpx.AsyncByteStream):
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    async def __aiter__(self):
+        body = (
+            'data: {"id":"ok","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"'
+            + self.text
+            + '"},"finish_reason":null}]}\n\n'
+            'data: {"id":"ok","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        yield body.encode()
+
+
+class SequencedStreamingRouteClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+        self.hosts = []
+
+    def build_request(self, method, url, json=None, headers=None):
+        request = httpx.Request(method, url, json=json, headers=headers)
+        request.extensions["json_payload"] = json
+        return request
+
+    async def send(self, request, stream=False):
+        self.requests.append(request)
+        self.hosts.append(request.url.host)
+        if not self.responses:
+            raise AssertionError("No fake response left for request")
+        status_code, payload = self.responses.pop(0)
+        if status_code == 200:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=StaticChatSSEStream(str(payload)),
+                request=request,
+            )
+        return httpx.Response(status_code, json=payload, request=request)
+
+    async def aclose(self):
+        pass
+
+
+def setup_streaming_key_db(streaming, tmp_path, monkeypatch):
+    db_path = tmp_path / "streaming.db"
+    monkeypatch.setattr(streaming._impl, "DB_PATH", db_path)
+    streaming._impl.init_database()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO API_Keys (name, key, created_at) VALUES (?, ?, ?)",
+            ("test", "test-key", "now"),
+        )
+        conn.commit()
+
+
+def test_streaming_reasoning_content_is_sanitized_and_retried(tmp_path, monkeypatch):
+    streaming = get_streaming_module()
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    fake = SequencedStreamingRouteClient(
+        [
+            (
+                400,
+                {
+                    "error": {
+                        "message": "'messages.2' : property 'reasoning_content' is unsupported",
+                        "type": "invalid_request_error",
+                    }
+                },
+            ),
+            (200, "recovered"),
+        ]
+    )
+    desired_config = {
+        "providers": [
+            {
+                "name": "groq",
+                "url": "http://groq.local/v1",
+                "api_key": "k1",
+                "models": ["openai/gpt-oss-120b"],
+            }
+        ],
+        "groups": {
+            "free-models": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "groq", "model": "openai/gpt-oss-120b"}
+                ],
+            }
+        },
+    }
+
+    streaming._impl.config_data = desired_config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(streaming._impl, "http_client", fake)
+        streaming._impl.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "free-models",
+                "stream": True,
+                "messages": [
+                    {"role": "user", "content": "start"},
+                    {
+                        "role": "assistant",
+                        "content": "previous",
+                        "reasoning_content": "private reasoning",
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert "recovered" in response.text
+    assert fake.hosts == ["groq.local", "groq.local"]
+    first_payload = fake.requests[0].extensions["json_payload"]
+    second_payload = fake.requests[1].extensions["json_payload"]
+    assert first_payload["messages"][1]["reasoning_content"] == "private reasoning"
+    assert "reasoning_content" not in second_payload["messages"][1]
+
+
+def test_streaming_413_falls_back_to_next_provider(tmp_path, monkeypatch):
+    streaming = get_streaming_module()
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    fake = SequencedStreamingRouteClient(
+        [
+            (
+                413,
+                {
+                    "error": {
+                        "message": "Request too large for model on tokens per minute",
+                        "type": "tokens",
+                        "code": "rate_limit_exceeded",
+                    }
+                },
+            ),
+            (200, "fallback worked"),
+        ]
+    )
+    desired_config = {
+        "providers": [
+            {
+                "name": "groq",
+                "url": "http://groq.local/v1",
+                "api_key": "k1",
+                "models": ["openai/gpt-oss-120b"],
+            },
+            {
+                "name": "mistral",
+                "url": "http://mistral.local/v1",
+                "api_key": "k2",
+                "models": ["mistral-large-latest"],
+            },
+        ],
+        "groups": {
+            "free-models": {
+                "strategy": "fallback",
+                "members": [
+                    {"provider": "groq", "model": "openai/gpt-oss-120b"},
+                    {"provider": "mistral", "model": "mistral-large-latest"},
+                ],
+            }
+        },
+    }
+
+    streaming._impl.config_data = desired_config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(streaming._impl, "http_client", fake)
+        streaming._impl.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "free-models",
+                "stream": True,
+                "messages": [{"role": "user", "content": "large request"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert "fallback worked" in response.text
+    assert fake.hosts == ["groq.local", "mistral.local"]

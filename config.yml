@@ -76,6 +76,9 @@ model_profiles:
     timeout_seconds: 21600
     max_parallel_jobs: 1
 
+# The client-facing "free-models" group is injected dynamically by
+# free_model_registry at runtime. Do not define it statically here unless you
+# intentionally want to replace that behavior.
 groups:
   gpt-5.5:
     description: Balanced Codex profile pool

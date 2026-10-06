@@ -404,6 +404,22 @@ async def chat_completions(
         provider_payload = _impl.prepare_provider_chat_payload(
             payload, endpoint, provider_model
         )
+        cooldown_remaining = _impl.provider_cooldown_remaining(endpoint)
+        if cooldown_remaining > 0:
+            number, attempt_started_at, attempt_started_monotonic = begin_attempt()
+            cooldown_reason = f"provider cooldown active ({cooldown_remaining:.1f}s remaining)"
+            record_attempt(
+                number,
+                provider_name,
+                provider_model,
+                None,
+                "cooldown_skip",
+                cooldown_reason,
+                attempt_started_at,
+                attempt_started_monotonic,
+            )
+            last_error = f"{provider_name} skipped: {cooldown_reason}"
+            continue
         preflight_reason = _impl.provider_preflight_skip_reason(
             provider_payload, endpoint
         )
@@ -493,6 +509,9 @@ async def chat_completions(
                         )
                         buffered_error_content = None
 
+            if upstream_status in _FALLBACK_STATUSES:
+                _impl.apply_provider_cooldown_from_response(endpoint, response)
+
             if upstream_status != 200:
                 content = (
                     buffered_error_content
@@ -557,6 +576,9 @@ async def chat_completions(
                 raw_text = content.decode("utf-8", errors="replace")
                 first_response_at = datetime.utcnow().isoformat()
                 error_msg = _impl.provider_html_error(api_mode, raw_text)
+                _impl.set_provider_cooldown(
+                    endpoint, _impl.PROVIDER_TRANSIENT_COOLDOWN_SECONDS
+                )
                 record_attempt(number, provider_name, provider_model, 502, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                 ended_at, first_ms, total_ms = timing(first_response_at)
                 _impl.insert_log(
@@ -609,6 +631,12 @@ async def chat_completions(
                     raise
                 finally:
                     await response.aclose()
+                    if stream_error is None:
+                        _impl.clear_provider_cooldown(endpoint)
+                    else:
+                        _impl.set_provider_cooldown(
+                            endpoint, _impl.PROVIDER_TIMEOUT_COOLDOWN_SECONDS
+                        )
                     record_attempt(
                         number,
                         provider_name,
@@ -656,6 +684,9 @@ async def chat_completions(
             if response is not None:
                 await response.aclose()
             error_msg = f"{provider_name} failed: {_impl.format_provider_exception(exc)}"
+            _impl.set_provider_cooldown(
+                endpoint, _impl.PROVIDER_TIMEOUT_COOLDOWN_SECONDS
+            )
             record_attempt(number, provider_name, provider_model, 502, "fallback_exception", error_msg, attempt_started_at, attempt_started_monotonic)
             last_error = error_msg
             continue

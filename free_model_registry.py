@@ -367,6 +367,7 @@ def build_registry_overlay(
             continue
 
         enabled_models: list[str] = []
+        model_metadata: dict[str, dict[str, Any]] = {}
         default_models: list[tuple[int, str]] = []
         for model in provider.get("models", []):
             if not isinstance(model, dict) or model.get("enabled") is False:
@@ -375,6 +376,12 @@ def build_registry_overlay(
             if not model_id:
                 continue
             enabled_models.append(model_id)
+            metadata: dict[str, Any] = {}
+            for field in ("context_tokens", "free_limits", "capabilities", "status"):
+                if field in model:
+                    metadata[field] = copy.deepcopy(model[field])
+            if metadata:
+                model_metadata[model_id] = metadata
             if model.get("include_in_default_group") is True:
                 try:
                     priority = int(model.get("priority", 1000))
@@ -401,6 +408,7 @@ def build_registry_overlay(
                         f"[{credential['name']}]"
                     ),
                     "models": enabled_models,
+                    "model_metadata": copy.deepcopy(model_metadata),
                     "api_mode": str(
                         provider.get("api_mode") or "openai_chat_completions"
                     ),

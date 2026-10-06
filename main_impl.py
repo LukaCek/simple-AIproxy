@@ -37,10 +37,15 @@ watchdog_observer: Optional[Observer] = None
 oauth_state_store: Dict[str, Dict[str, Any]] = {}
 route_counters: Dict[str, int] = {}
 route_counters_lock = threading.Lock()
+provider_cooldowns: Dict[str, float] = {}
+provider_cooldowns_lock = threading.Lock()
 playground_jobs: Dict[str, Dict[str, Any]] = {}
 playground_jobs_lock = threading.Lock()
 PROVIDER_TEST_TIMEOUT_SECONDS = 3600.0
 UPSTREAM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AIPROXY_UPSTREAM_TIMEOUT_SECONDS", "3600"))
+PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("AIPROXY_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
+PROVIDER_TIMEOUT_COOLDOWN_SECONDS = float(os.getenv("AIPROXY_PROVIDER_TIMEOUT_COOLDOWN_SECONDS", "30"))
+PROVIDER_TRANSIENT_COOLDOWN_SECONDS = float(os.getenv("AIPROXY_PROVIDER_TRANSIENT_COOLDOWN_SECONDS", "20"))
 MIN_COMPLETION_TOKENS = int(os.getenv("AIPROXY_MIN_COMPLETION_TOKENS", "1024"))
 OLLAMA_DISABLE_THINKING = os.getenv("AIPROXY_OLLAMA_DISABLE_THINKING", "false").lower() not in {"0", "false", "no"}
 
@@ -421,6 +426,66 @@ def format_provider_exception(exc: Exception) -> str:
     if message:
         return f"{exc.__class__.__name__}: {message}"
     return exc.__class__.__name__
+
+
+def provider_cooldown_key(endpoint: Dict[str, Any]) -> str:
+    return f"{endpoint.get('name', '')}::{endpoint.get('model', '')}"
+
+
+def provider_cooldown_remaining(endpoint: Dict[str, Any]) -> float:
+    key = provider_cooldown_key(endpoint)
+    now = time.monotonic()
+    with provider_cooldowns_lock:
+        expires_at = provider_cooldowns.get(key)
+        if expires_at is None:
+            return 0.0
+        remaining = expires_at - now
+        if remaining <= 0:
+            provider_cooldowns.pop(key, None)
+            return 0.0
+        return remaining
+
+
+def set_provider_cooldown(endpoint: Dict[str, Any], seconds: float) -> None:
+    duration = max(0.0, float(seconds))
+    if duration <= 0:
+        return
+    key = provider_cooldown_key(endpoint)
+    expires_at = time.monotonic() + duration
+    with provider_cooldowns_lock:
+        provider_cooldowns[key] = max(provider_cooldowns.get(key, 0.0), expires_at)
+
+
+def clear_provider_cooldown(endpoint: Dict[str, Any]) -> None:
+    with provider_cooldowns_lock:
+        provider_cooldowns.pop(provider_cooldown_key(endpoint), None)
+
+
+def retry_after_seconds(response: httpx.Response, default_seconds: float) -> float:
+    value = str(response.headers.get("retry-after") or "").strip()
+    if value:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        if parsed > 0:
+            return parsed
+    return max(0.0, float(default_seconds))
+
+
+def apply_provider_cooldown_from_response(endpoint: Dict[str, Any], response: httpx.Response) -> float:
+    status_code = int(response.status_code)
+    if status_code == 429:
+        seconds = retry_after_seconds(response, PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS)
+    elif status_code == 408:
+        seconds = PROVIDER_TIMEOUT_COOLDOWN_SECONDS
+    elif status_code in {500, 502, 503, 504}:
+        seconds = PROVIDER_TRANSIENT_COOLDOWN_SECONDS
+    else:
+        seconds = 0.0
+    if seconds > 0:
+        set_provider_cooldown(endpoint, seconds)
+    return seconds
 
 
 def is_ollama_endpoint(endpoint: Dict[str, Any]) -> bool:

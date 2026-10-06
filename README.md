@@ -53,6 +53,26 @@ Admin routes:
 - `/admin/codex-usage` — inspect live limits for every Codex OAuth profile
 - `/admin/playground` — test configured models/providers from the browser
 
+## Public API surface
+
+Bearer-authenticated client endpoints:
+
+- `POST /v1/chat/completions` — OpenAI-compatible chat facade, including
+  streaming and background-job handoff.
+- `GET /v1/models` — OpenAI-style model/group listing.
+- `POST /v1/audio/transcriptions` — OpenAI-compatible speech-to-text proxy.
+- `GET /v1/codex/usage` — live Codex subscription/rate-limit information for
+  configured Codex OAuth profiles.
+- `POST /jobs` — enqueue a durable background inference job.
+- `GET /jobs/{id}`, `/jobs/{id}/logs`, `/jobs/{id}/result` — job state,
+  partial logs, and final result.
+- `POST /jobs/{id}/cancel` — cancel a queued/running background job.
+- `GET /jobs/stats`, `GET /workers`, `GET /models`, and `GET /metrics`
+  — background-worker/profile/metrics endpoints.
+
+The Admin UI uses HTTP Basic auth, while the client API uses proxy bearer keys
+created under `/admin/keys`.
+
 ## ntfy provider alerts
 
 The proxy can periodically test every configured provider and publish one ntfy

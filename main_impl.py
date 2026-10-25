@@ -2615,6 +2615,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                     except Exception:
                         text = extract_response_text_from_sse(content) or raw_text
                     clear_provider_cooldown(endpoint)
+                    if "codex_note_success" in globals():
+                        codex_note_success(endpoint)
                     record_attempt(number, provider_name, provider_model, 200, "success", None, attempt_started_at, attempt_started_monotonic)
                     ended_at, first_ms, total_ms = timing(first_response_at)
                     insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, text, None, request_id=request_id)
@@ -2622,7 +2624,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                         return StreamingResponse(sse_chat_chunks(provider_model, text), status_code=200, media_type="text/event-stream")
                     return Response(json.dumps(chat_completion_from_text(provider_model, text), ensure_ascii=False), status_code=200, media_type="application/json")
                 error_msg = raw_text
-                if response.status_code in fallback_statuses:
+                retry_model = codex_note_error(endpoint, response.status_code, error_msg) if "codex_note_error" in globals() else False
+                if retry_model or response.status_code in fallback_statuses:
                     apply_provider_cooldown_from_response(endpoint, response)
                     record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     last_error = f"{provider_name} returned {response.status_code}: {error_msg}"

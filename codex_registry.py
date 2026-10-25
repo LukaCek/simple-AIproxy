@@ -493,6 +493,33 @@ def install(impl: Any) -> None:
     impl.resolve_requested_model = resolve_requested_model
     impl.build_provider_headers = provider_headers
     impl.get_providers = providers_list
+    original_models_for_provider = impl.get_models_for_provider
+
+    def models_for_provider(name: str) -> list[str]:
+        provider = impl.find_provider(name)
+        if provider and provider.get("api_mode") == "codex_responses":
+            return [m["slug"] for m in catalog_models(name)]
+        return original_models_for_provider(name)
+
+    impl.get_models_for_provider = models_for_provider
+
+    original_upsert = impl.upsert_codex_profile
+
+    def update_codex_profile(name: str, *args: Any, **kwargs: Any) -> None:
+        original_upsert(name, *args, **kwargs)
+        # A re-login can change the ChatGPT identity under the same name.
+        # Discard old identity-specific catalogs and quota windows.
+        with _conn() as db:
+            for table in ("CodexModels", "CodexCatalogs", "CodexQuota", "CodexBlocks"):
+                db.execute(f"DELETE FROM {table} WHERE provider=?", (name,))
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(refresh_catalog(name))
+            loop.create_task(refresh_usage(name))
+        except RuntimeError:
+            pass
+
+    impl.upsert_codex_profile = update_codex_profile
     impl.codex_note_error = note_error
     impl.codex_note_success = note_success
     usage.fetch_codex_usage = cached_usage

@@ -76,7 +76,7 @@ async def test_refresh_persists_official_rates_without_tokens(tmp_path, monkeypa
         async def get(self, url, *, headers, timeout):
             assert url == pricing.RATE_CARD_URL
             assert "Authorization" not in headers
-            return httpx.Response(200, text=rate_card_html())
+            return httpx.Response(200, text=rate_card_html(), request=httpx.Request("GET", url))
 
     monkeypatch.setattr(
         pricing, "_impl", SimpleNamespace(BASE_DIR=tmp_path, http_client=Client())

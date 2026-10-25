@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 import codex_usage_entrypoint as usage
 import codex_pricing
+import codex_benchmarks
 
 _impl: Any = None
 _model_task: asyncio.Task | None = None
@@ -401,11 +402,13 @@ def account_view(provider_name: str) -> dict[str, Any]:
         }
     result["models"] = []
     result["pricing_meta"] = codex_pricing.public_meta()
+    result["benchmark_meta"] = codex_benchmarks.benchmark_metadata()
     for m in catalog_models(provider_name):
         block = active_blocks.get(m["slug"]) or active_blocks.get("*")
         result["models"].append({
             **m,
             "pricing": codex_pricing.price_for_model(m["slug"]),
+            "benchmarks": codex_benchmarks.model_benchmarks(m["slug"]),
             "status": ("unsupported" if block and block["reason"] == "model_not_found"
                        else "limited" if block else "available"),
             "available_after": block["until_at"] if block else None,

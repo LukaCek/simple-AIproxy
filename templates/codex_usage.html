@@ -34,6 +34,50 @@
     </div>
     <p id="pricing-hint" class="mt-2 text-xs text-slate-500" aria-live="polite">Example: 10,000 input + 2,000 output tokens. Cached tokens count toward input, not on top of it.</p>
   </div>
+  <section class="mt-6 rounded-2xl border border-slate-200 bg-white p-5" id="benchmark-comparison">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <h3 class="text-lg font-semibold text-slate-900">Model intelligence vs. credits</h3>
+        <p class="mt-1 max-w-3xl text-sm text-slate-600">Find a model for Hermes, coding, or everyday tasks. Uses <strong>published benchmark scores</strong> for the same test edition and credit estimates for your chosen token counts. Not a measure of actual Hermes accuracy or actual billed credits.</p>
+      </div>
+      <div class="flex flex-wrap items-end gap-3">
+        <label class="text-xs font-semibold text-slate-700">Use case
+          <select id="benchmark-metric" class="mt-1 block rounded-lg border border-slate-300 bg-white p-2 text-sm text-slate-900">
+            <option value="automation">Hermes: automation &amp; agents</option>
+            <option value="coding">Coding: DeepSWE</option>
+            <option value="general">General intelligence</option>
+            <option value="tools">Tool use: Toolathlon</option>
+          </select>
+        </label>
+        <label class="flex items-center gap-2 pb-2 text-xs font-medium text-slate-700">
+          <input type="checkbox" id="benchmark-available" checked class="h-4 w-4 rounded border-slate-300">
+          Available on my accounts
+        </label>
+      </div>
+    </div>
+    <div id="benchmark-summary" class="mt-4 grid gap-3 sm:grid-cols-3" aria-live="polite"></div>
+    <div class="mt-4 grid gap-4 xl:grid-cols-2">
+      <div class="min-w-0 rounded-xl border border-slate-200 p-3">
+        <h4 class="text-sm font-semibold text-slate-900">Capability vs. estimated credits</h4>
+        <p class="mt-1 text-xs text-slate-500">Higher and further left is better. X-axis uses log-like spacing.</p>
+        <div id="benchmark-scatter" role="img" aria-label="Benchmark score versus credits comparison chart" class="mt-3 w-full"></div>
+      </div>
+      <div class="min-w-0 rounded-xl border border-slate-200 p-3">
+        <h4 class="text-sm font-semibold text-slate-900">Benchmark points per estimated credit</h4>
+        <p class="mt-1 text-xs text-slate-500">Illustrative ratio for equal token counts, not the actual cost per successfully completed task.</p>
+        <div id="benchmark-value" role="img" aria-label="Benchmark score per credit comparison chart" class="mt-3 w-full"></div>
+      </div>
+    </div>
+    <div class="mt-4 overflow-x-auto">
+      <table class="w-full min-w-[570px] text-left text-xs">
+        <thead class="border-b border-slate-200 text-slate-500">
+          <tr><th class="py-2 pr-3">Model</th><th class="py-2 pr-3">Benchmark</th><th class="py-2 pr-3">Credits / example</th><th class="py-2 pr-3">Score / credit</th><th class="py-2 pr-3">Accounts</th><th class="py-2">Evidence</th></tr>
+        </thead>
+        <tbody id="benchmark-table"></tbody>
+      </table>
+    </div>
+    <p id="benchmark-note" class="mt-3 text-xs text-slate-600" aria-live="polite">Only benchmark data with an identified source is shown. Results can vary by prompting, agent harness and reasoning effort.</p>
+  </section>
   <div id="usage-grid" class="mt-6 grid gap-5 lg:grid-cols-2">
     {% for provider in providers %}
     <article class="rounded-3xl border border-slate-200 bg-slate-50 p-5" data-provider="{{ provider.name | e }}">
@@ -86,10 +130,174 @@
       output * pricing.output / 1000000;
   }
 
+
+  const benchmarkMetric = document.getElementById('benchmark-metric');
+  const benchmarkAvailable = document.getElementById('benchmark-available');
+  const benchmarkScatter = document.getElementById('benchmark-scatter');
+  const benchmarkValue = document.getElementById('benchmark-value');
+  const benchmarkTable = document.getElementById('benchmark-table');
+  const benchmarkSummary = document.getElementById('benchmark-summary');
+  const benchmarkNote = document.getElementById('benchmark-note');
+
+  const escapeBenchmark = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[ch]);
+
+  const pointColors = ['#2563eb', '#0f766e', '#b45309', '#7c3aed',
+    '#be123c', '#0369a1', '#4d7c0f', '#a21caf', '#475569'];
+
+  function comparativeModels() {
+    const unique = new Map();
+    let meta = null;
+    for (const card of cards) {
+      const data = card._latestData;
+      if (!data) continue;
+      if (!meta && data.benchmark_meta) meta = data.benchmark_meta;
+      for (const model of (data.models || [])) {
+        const id = String(model.slug || '');
+        if (!id) continue;
+        if (!unique.has(id)) unique.set(id, {
+          slug: id, display_name: model.display_name || id, pricing: model.pricing,
+          benchmarks: model.benchmarks || {}, accounts: new Set(), availableAccounts: new Set()
+        });
+        const item = unique.get(id);
+        item.accounts.add(card.dataset.provider);
+        if (model.status === 'available' && !data.limit_reached) {
+          item.availableAccounts.add(card.dataset.provider);
+        }
+        if (!item.pricing && model.pricing) item.pricing = model.pricing;
+        if (!Object.keys(item.benchmarks).length && model.benchmarks) {
+          item.benchmarks = model.benchmarks;
+        }
+      }
+    }
+    return {models: [...unique.values()], meta};
+  }
+
+  function renderComparison() {
+    if (!benchmarkScatter || !benchmarkValue || !benchmarkTable || !benchmarkMetric) return;
+    const {models, meta} = comparativeModels();
+    const metric = benchmarkMetric.value;
+    const metricInfo = meta && meta.metrics ? meta.metrics[metric] : null;
+    const unit = metricInfo ? metricInfo.unit : '%';
+    const data = models.filter(m => !benchmarkAvailable.checked || m.availableAccounts.size);
+    const tokenExample = scenario();
+    const all = data.map(m => {
+      const b = m.benchmarks[metric];
+      return {...m, benchmark: b || null, score: b && Number.isFinite(Number(b.score)) ?
+        Number(b.score) : null, cost: estimate(m.pricing, tokenExample)};
+    });
+    const scored = all.filter(m => m.score !== null && m.cost !== null && m.cost > 0);
+    // Rankings are only relative to compatible benchmark observations.
+    const byQuality = [...scored].sort((a, b) => b.score - a.score);
+    const byValue = [...scored].sort((a, b) => (b.score / b.cost) - (a.score / a.cost));
+    const byPrice = [...scored].sort((a, b) => a.cost - b.cost);
+
+    const card = (title, entry, detail) =>
+      '<div class="rounded-xl border border-slate-200 bg-slate-50 p-3">' +
+      '<div class="text-xs text-slate-500">' + escapeBenchmark(title) + '</div>' +
+      '<div class="mt-1 text-sm font-semibold text-slate-900">' +
+      escapeBenchmark(entry ? entry.display_name : 'Not enough data') + '</div>' +
+      '<div class="mt-1 text-xs text-slate-600">' + escapeBenchmark(entry ? detail(entry) : 'No eligible comparable model') +
+      '</div></div>';
+    if (benchmarkSummary) benchmarkSummary.innerHTML =
+      card('Highest published score', byQuality[0], m => numberFormat.format(m.score) +
+        unit + ' · ' + numberFormat.format(m.cost) + ' credits') +
+      card('Best points / credit', byValue[0], m => numberFormat.format(m.score / m.cost) +
+        ' points/credit · ' + numberFormat.format(m.cost) + ' credits') +
+      card('Lowest example cost', byPrice[0], m => numberFormat.format(m.cost) +
+        ' credits · ' + numberFormat.format(m.score) + unit);
+
+    if (!scored.length) {
+      const none = '<p class="p-7 text-center text-sm text-slate-500">No available models with both a published score and credit price for this benchmark.</p>';
+      benchmarkScatter.innerHTML = none;
+      benchmarkValue.innerHTML = none;
+    } else {
+      const maxCost = Math.max(0.01, ...scored.map(m => m.cost));
+      const colors = Object.fromEntries(scored.map((m,i) => [m.slug, pointColors[i % pointColors.length]]));
+      const x = cost => 75 + Math.log1p(cost) / Math.log1p(maxCost) * 525;
+      const y = score => 285 - Math.max(0, Math.min(100, score)) / 100 * 240;
+      const grid = [0,25,50,75,100].map(t => {
+        const pos = y(t);
+        return '<line x1="75" y1="' + pos + '" x2="615" y2="' + pos +
+          '" stroke="#e2e8f0"/><text x="65" y="' + (pos+4) +
+          '" text-anchor="end" font-size="12" fill="#64748b">' + t + '</text>';
+      }).join('');
+      const ticks = [0,0.25,0.5,0.75,1].map(fr => {
+        const pos = 75 + fr * 525;
+        const val = Math.expm1(Math.log1p(maxCost) * fr);
+        return '<text x="' + pos + '" y="308" text-anchor="middle" font-size="11" fill="#64748b">' +
+          escapeBenchmark(numberFormat.format(val)) + '</text>';
+      }).join('');
+      const dots = scored.map(m => {
+        const px = x(m.cost), py = y(m.score), color = colors[m.slug];
+        const labelX = px > 450 ? px - 9 : px + 9;
+        const anchor = px > 450 ? 'end' : 'start';
+        return '<g><title>' + escapeBenchmark(m.display_name + ': ' + m.score +
+          unit + ', ' + numberFormat.format(m.cost) + ' credits') + '</title>' +
+          '<circle cx="' + px + '" cy="' + py + '" r="6" fill="' + color +
+          '" stroke="white" stroke-width="2"/>' +
+          '<text x="' + labelX + '" y="' + (py-11) + '" font-size="11" font-weight="600" text-anchor="' +
+          anchor + '" fill="' + color + '">' + escapeBenchmark(m.slug) + '</text></g>';
+      }).join('');
+      benchmarkScatter.innerHTML =
+        '<svg viewBox="0 0 680 340" class="w-full h-auto" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Credit cost on X, benchmark score on Y">' +
+        grid + '<line x1="75" y1="285" x2="615" y2="285" stroke="#64748b"/>' +
+        ticks + dots + '<text x="345" y="333" text-anchor="middle" fill="#475569" font-size="13">Estimated credits (log-like scale)</text>' +
+        '<text x="16" y="175" transform="rotate(-90 16 175)" text-anchor="middle" fill="#475569" font-size="13">Benchmark score</text></svg>';
+
+      const ranked = byValue.slice(0, 9);
+      const maxRatio = Math.max(...ranked.map(m => m.score / m.cost));
+      const bars = ranked.map((m,i) => {
+        const barY = 20 + i*39;
+        const w = Math.max(1, (m.score/m.cost)/maxRatio * 345);
+        return '<g><title>' + escapeBenchmark(m.slug) + ': ' +
+          escapeBenchmark(numberFormat.format(m.score / m.cost)) + ' points/credit</title>' +
+          '<text x="145" y="' + (barY+13) + '" text-anchor="end" fill="#334155" font-size="11">' +
+          escapeBenchmark(m.slug) + '</text>' +
+          '<rect x="154" y="' + barY + '" width="' + w + '" height="19" rx="4" fill="' +
+          pointColors[i % pointColors.length] + '"/>' +
+          '<text x="' + (160+w) + '" y="' + (barY+13) + '" font-size="12" fill="#334155">' +
+          escapeBenchmark(numberFormat.format(m.score/m.cost)) + '</text></g>';
+      }).join('');
+      benchmarkValue.innerHTML =
+        '<svg viewBox="0 0 600 ' + (30 + ranked.length*39) +
+        '" class="w-full h-auto" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Benchmark score per example credit">' +
+        bars + '</svg>';
+    }
+    benchmarkTable.innerHTML = all.sort((a,b) =>
+      ((b.score ?? -1) - (a.score ?? -1))).map(m => {
+      const score = m.score !== null ? numberFormat.format(m.score) + unit : 'Not published';
+      const cost = m.cost === null ? 'Unknown' : numberFormat.format(m.cost);
+      const ratio = m.score !== null && m.cost > 0 ?
+        numberFormat.format(m.score / m.cost) : '—';
+      const source = m.benchmark && /^https:\/\/(openai\.com|artificialanalysis\.ai)\//.test(m.benchmark.source) ?
+        '<a href="' + escapeBenchmark(m.benchmark.source) +
+        '" target="_blank" rel="noopener noreferrer" class="font-semibold text-indigo-700 underline">Source</a>' : '—';
+      return '<tr class="border-b border-slate-100"><td class="py-2 pr-3 font-semibold text-slate-900">' +
+        escapeBenchmark(m.display_name) + '</td><td class="py-2 pr-3">' +
+        escapeBenchmark(score) + '</td><td class="py-2 pr-3">' +
+        escapeBenchmark(cost) + '</td><td class="py-2 pr-3">' +
+        escapeBenchmark(ratio) + '</td><td class="py-2 pr-3">' +
+        escapeBenchmark([...m.availableAccounts].join(', ') || 'Not available') +
+        '</td><td class="py-2">' + source + '</td></tr>';
+    }).join('') || '<tr><td colspan="6" class="py-3 text-slate-500">No discovered models in selected accounts.</td></tr>';
+    const missing = all.filter(m => m.score === null).length;
+    if (benchmarkNote) benchmarkNote.textContent =
+      (metricInfo ? metricInfo.edition + ' · ' + metricInfo.description : 'Benchmark') +
+      ' • ' + missing + ' model(s) have no published result. Only account-discovered models are shown. ' +
+      'This compares score against identical token volumes, not actual total cost per finished task.';
+  }
+
+  for (const el of [benchmarkMetric, benchmarkAvailable]) {
+    if (el) el.addEventListener('change', renderCachedCards);
+  }
+
   function renderCachedCards() {
     for (const card of cards) {
       if (card._latestData) render(card, card._latestData);
     }
+    renderComparison();
   }
 
   for (const el of [inputTokens, cachedTokens, outputTokens, sortByPrice]) {
@@ -179,6 +387,12 @@
       const pricing = model.pricing;
       const value = estimate(pricing, tokenExample);
       const amount = value === null ? 'Rate unavailable' : '~' + numberFormat.format(value) + ' credits';
+      const selectedBenchmark = benchmarkMetric ? (model.benchmarks || {})[benchmarkMetric.value] : null;
+      const benchmarkLine = selectedBenchmark
+        ? '<span class="mt-1 block text-xs text-slate-700">Benchmark: ' +
+          numberFormat.format(selectedBenchmark.score) + ' · ' +
+          escapeHtml(selectedBenchmark.edition) + '</span>'
+        : '<span class="mt-1 block text-xs text-slate-500">Benchmark not published</span>';
       const detail = pricing
         ? '<details class="mt-1 text-xs text-slate-500"><summary class="cursor-pointer">Credits / 1M tokens</summary>' +
           '<div class="mt-1">Input: ' + numberFormat.format(pricing.input) +
@@ -188,7 +402,7 @@
       return '<div class="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 py-3">' +
         '<div class="min-w-0 flex-1"><b class="text-slate-900">' + escapeHtml(model.display_name) + '</b>' +
         '<div class="text-xs text-slate-500 break-all">' + escapeHtml(model.slug) + '</div>' +
-        '<span class="mt-1 block text-xs ' + label + '">' + escapeHtml(status + retry) + '</span></div>' +
+        '<span class="mt-1 block text-xs ' + label + '">' + escapeHtml(status + retry) + '</span>' + benchmarkLine + '</div>' +
         '<div class="min-w-0 text-right"><b class="text-slate-900">' + escapeHtml(amount) + '</b>' +
         detail + '</div></div>';
     }).join('');
@@ -232,8 +446,11 @@
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
       render(card, data);
+      renderComparison();
     } catch (error) {
+      card._latestData = null;
       renderError(card, error.message || String(error));
+      renderComparison();
     }
   }
 

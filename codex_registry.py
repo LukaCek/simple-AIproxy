@@ -390,14 +390,24 @@ def account_view(provider_name: str) -> dict[str, Any]:
         "updated_at": row["updated_at"] if row else None,
         "error": row["error"] if row else "Discovery pending",
     }
-    result["models"] = [
-        {
-            **m,
-            "status": "limited" if block_until(provider_name, m["slug"]) > time.time() else "available",
-            "available_after": block_until(provider_name, m["slug"]) or None,
+    with _conn() as db:
+        active_blocks = {
+            r["slug"]: dict(r)
+            for r in db.execute(
+                "SELECT slug,reason,until_at FROM CodexBlocks "
+                "WHERE provider=? AND until_at>?", (provider_name, time.time())
+            ).fetchall()
         }
-        for m in catalog_models(provider_name)
-    ]
+    result["models"] = []
+    for m in catalog_models(provider_name):
+        block = active_blocks.get(m["slug"]) or active_blocks.get("*")
+        result["models"].append({
+            **m,
+            "status": ("unsupported" if block and block["reason"] == "model_not_found"
+                       else "limited" if block else "available"),
+            "available_after": block["until_at"] if block else None,
+            "reason": block["reason"] if block else None,
+        })
     return result
 
 
@@ -485,9 +495,27 @@ def install(impl: Any) -> None:
     impl.get_providers = providers_list
     impl.codex_note_error = note_error
     impl.codex_note_success = note_success
-    impl.startup = startup
-    impl.shutdown = shutdown
     usage.fetch_codex_usage = cached_usage
+    # FastAPI records startup/shutdown callables when declared. Reassigning
+    # module symbols does not replace those hooks; append separate hooks instead.
+    @impl.app.on_event("startup")
+    async def codex_registry_startup() -> None:
+        global _model_task, _usage_task
+        init_schema()
+        _model_task = asyncio.create_task(_model_loop())
+        _usage_task = asyncio.create_task(_usage_loop())
+
+    @impl.app.on_event("shutdown")
+    async def codex_registry_shutdown() -> None:
+        for task in (_model_task, _usage_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
 
     # Remove only the outdated static model-list route; preserve its authentication.
     from fastapi import Depends

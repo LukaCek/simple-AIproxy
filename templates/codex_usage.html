@@ -10,6 +10,30 @@
   </div>
 
   {% if providers %}
+  <div class="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-4" id="pricing-compare">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h3 class="text-base font-semibold text-slate-900">Compare Codex credit costs</h3>
+        <p class="mt-1 text-xs text-slate-600">Standard-mode credit estimates for the same token counts. These are <strong>not fixed per-message charges</strong>. Your plan's included allowance is used first; credits apply when eligible usage continues beyond that allowance.</p>
+      </div>
+      <a href="https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing" target="_blank" rel="noopener noreferrer" class="text-xs font-semibold text-indigo-700 underline">Official rate card</a>
+    </div>
+    <div class="mt-4 flex flex-wrap items-end gap-3">
+      <label class="text-xs font-medium text-slate-700">Input tokens (total)
+        <input id="pricing-input" type="number" min="0" max="100000000" step="1000" value="10000" class="mt-1 block w-36 rounded-lg border border-slate-300 bg-white p-2 text-sm text-slate-900">
+      </label>
+      <label class="text-xs font-medium text-slate-700">Cached input (part of input)
+        <input id="pricing-cached" type="number" min="0" max="100000000" step="1000" value="0" class="mt-1 block w-36 rounded-lg border border-slate-300 bg-white p-2 text-sm text-slate-900">
+      </label>
+      <label class="text-xs font-medium text-slate-700">Output tokens
+        <input id="pricing-output" type="number" min="0" max="100000000" step="1000" value="2000" class="mt-1 block w-36 rounded-lg border border-slate-300 bg-white p-2 text-sm text-slate-900">
+      </label>
+      <label class="flex items-center gap-2 pb-2 text-xs font-medium text-slate-700">
+        <input id="pricing-sort" type="checkbox" class="h-4 w-4 rounded border-slate-300"> Cheapest first
+      </label>
+    </div>
+    <p id="pricing-hint" class="mt-2 text-xs text-slate-500" aria-live="polite">Example: 10,000 input + 2,000 output tokens. Cached tokens count toward input, not on top of it.</p>
+  </div>
   <div id="usage-grid" class="mt-6 grid gap-5 lg:grid-cols-2">
     {% for provider in providers %}
     <article class="rounded-3xl border border-slate-200 bg-slate-50 p-5" data-provider="{{ provider.name | e }}">
@@ -35,6 +59,43 @@
 (() => {
   const cards = [...document.querySelectorAll('[data-provider]')];
   const refreshButton = document.getElementById('refresh-all');
+  const inputTokens = document.getElementById('pricing-input');
+  const cachedTokens = document.getElementById('pricing-cached');
+  const outputTokens = document.getElementById('pricing-output');
+  const sortByPrice = document.getElementById('pricing-sort');
+  const hint = document.getElementById('pricing-hint');
+  const numberFormat = new Intl.NumberFormat(undefined, {maximumFractionDigits: 4});
+
+  function scenario() {
+    const clamp = element => Math.min(100000000, Math.max(0, Math.floor(Number(element.value) || 0)));
+    const input = clamp(inputTokens);
+    const cached = Math.min(input, clamp(cachedTokens));
+    const output = clamp(outputTokens);
+    hint.textContent = numberFormat.format(input) + ' input (including ' +
+      numberFormat.format(cached) + ' cached) + ' + numberFormat.format(output) +
+      ' output tokens. Estimate only; not an actual charge or a plan-quota percentage.';
+    return {input, cached, output};
+  }
+
+  function estimate(pricing, tokenExample) {
+    if (!pricing) return null;
+    const {input, cached, output} = tokenExample;
+    return (input - cached) * pricing.input / 1000000 +
+      cached * pricing.cached_input / 1000000 +
+      output * pricing.output / 1000000;
+  }
+
+  function renderCachedCards() {
+    for (const card of cards) {
+      if (card._latestData) render(card, card._latestData);
+    }
+  }
+
+  for (const el of [inputTokens, cachedTokens, outputTokens, sortByPrice]) {
+    el.addEventListener('input', renderCachedCards);
+    el.addEventListener('change', renderCachedCards);
+  }
+
 
   function formatPercent(value) {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
@@ -98,24 +159,50 @@
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     })[c]);
     const catalog = data.catalog || {};
-    const models = data.models || [];
+    card._latestData = data;
+    const tokenExample = scenario();
+    const models = [...(data.models || [])];
+    if (sortByPrice.checked) {
+      models.sort((a, b) => {
+        const pa = estimate(a.pricing, tokenExample);
+        const pb = estimate(b.pricing, tokenExample);
+        return (pa === null ? Infinity : pa) - (pb === null ? Infinity : pb);
+      });
+    }
     const modelRows = models.map(model => {
       const status = model.status || 'unknown';
       const label = status === 'available' ? 'text-emerald-700'
         : status === 'unsupported' ? 'text-rose-700' : 'text-amber-700';
       const retry = model.available_after ? ' · retry ' + formatReset(model.available_after) : '';
-      return '<div class="flex justify-between gap-2 border-b border-slate-200 py-2">' +
-        '<div class="min-w-0"><b class="text-slate-900">' + escapeHtml(model.display_name) + '</b>' +
-        '<div class="text-xs text-slate-500 break-all">' + escapeHtml(model.slug) + '</div></div>' +
-        '<span class="text-right text-xs ' + label + '">' + escapeHtml(status + retry) + '</span></div>';
+      const pricing = model.pricing;
+      const value = estimate(pricing, tokenExample);
+      const amount = value === null ? 'Rate unavailable' : '~' + numberFormat.format(value) + ' credits';
+      const detail = pricing
+        ? '<details class="mt-1 text-xs text-slate-500"><summary class="cursor-pointer">Credits / 1M tokens</summary>' +
+          '<div class="mt-1">Input: ' + numberFormat.format(pricing.input) +
+          ' · Cached: ' + numberFormat.format(pricing.cached_input) +
+          ' · Output: ' + numberFormat.format(pricing.output) + '</div></details>'
+        : '<span class="mt-1 block text-xs text-slate-500">No published Codex credit rate matched this model.</span>';
+      return '<div class="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 py-3">' +
+        '<div class="min-w-0 flex-1"><b class="text-slate-900">' + escapeHtml(model.display_name) + '</b>' +
+        '<div class="text-xs text-slate-500 break-all">' + escapeHtml(model.slug) + '</div>' +
+        '<span class="mt-1 block text-xs ' + label + '">' + escapeHtml(status + retry) + '</span></div>' +
+        '<div class="min-w-0 text-right"><b class="text-slate-900">' + escapeHtml(amount) + '</b>' +
+        detail + '</div></div>';
     }).join('');
     const checked = catalog.checked_at ? formatReset(catalog.checked_at) : 'Pending';
+    const pricingMeta = data.pricing_meta || {};
+    const pricingNote = pricingMeta.fallback_snapshot_at
+      ? 'Published rate snapshot (' + pricingMeta.fallback_snapshot_at + '); live verification pending.'
+      : pricingMeta.updated_at ? 'Rates last checked ' + formatReset(pricingMeta.updated_at)
+      : 'Credit rates not verified.';
     const catalogWarning = catalog.error
       ? '<p class="text-xs text-amber-700">' + escapeHtml(catalog.error) + '</p>' : '';
     const modelsHtml = '<section class="mt-5 border-t border-slate-200 pt-4">' +
       '<div class="flex justify-between gap-2"><b class="text-slate-900">Supported Models (' +
       models.length + ')</b><span class="text-xs text-slate-500">Checked: ' +
-      escapeHtml(checked) + '</span></div>' + catalogWarning +
+      escapeHtml(checked) + '</span></div><p class="mt-1 text-xs text-slate-500">' +
+      escapeHtml(pricingNote) + '</p>' + catalogWarning +
       (modelRows || '<p class="mt-2 text-xs text-slate-500">No verified catalog available.</p>') +
       '</section>';
 

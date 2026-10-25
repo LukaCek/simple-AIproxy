@@ -93,12 +93,38 @@
     if (credits.unlimited) creditsText = 'Unlimited credits';
     else if (credits.balance !== null && credits.balance !== undefined) creditsText = `Credits: ${credits.balance}`;
 
+
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[c]);
+    const catalog = data.catalog || {};
+    const models = data.models || [];
+    const modelRows = models.map(model => {
+      const status = model.status || 'unknown';
+      const label = status === 'available' ? 'text-emerald-700'
+        : status === 'unsupported' ? 'text-rose-700' : 'text-amber-700';
+      const retry = model.available_after ? ' · retry ' + formatReset(model.available_after) : '';
+      return '<div class="flex justify-between gap-2 border-b border-slate-200 py-2">' +
+        '<div class="min-w-0"><b class="text-slate-900">' + escapeHtml(model.display_name) + '</b>' +
+        '<div class="text-xs text-slate-500 break-all">' + escapeHtml(model.slug) + '</div></div>' +
+        '<span class="text-right text-xs ' + label + '">' + escapeHtml(status + retry) + '</span></div>';
+    }).join('');
+    const checked = catalog.checked_at ? formatReset(catalog.checked_at) : 'Pending';
+    const catalogWarning = catalog.error
+      ? '<p class="text-xs text-amber-700">' + escapeHtml(catalog.error) + '</p>' : '';
+    const modelsHtml = '<section class="mt-5 border-t border-slate-200 pt-4">' +
+      '<div class="flex justify-between gap-2"><b class="text-slate-900">Supported Models (' +
+      models.length + ')</b><span class="text-xs text-slate-500">Checked: ' +
+      escapeHtml(checked) + '</span></div>' + catalogWarning +
+      (modelRows || '<p class="mt-2 text-xs text-slate-500">No verified catalog available.</p>') +
+      '</section>';
+
     card.querySelector('.usage-body').innerHTML = `
       <div class="mb-4 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">
         <span>Plan: <strong class="text-slate-700">${data.plan_type || 'unknown'}</strong></span>
         ${creditsText ? `<span>${creditsText}</span>` : ''}
       </div>
-      <div class="space-y-3">${windows || '<div class="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-900">No aggregate rate-limit windows returned.</div>'}</div>`;
+      <div class="space-y-3">${windows || '<div class="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-900">No aggregate rate-limit windows returned.</div>'}</div>${modelsHtml}`;
   }
 
   function renderError(card, error) {
@@ -128,7 +154,18 @@
     if (refreshButton) refreshButton.disabled = false;
   }
 
-  if (refreshButton) refreshButton.addEventListener('click', refreshAll);
+  if (refreshButton) refreshButton.addEventListener('click', async () => {
+    refreshButton.disabled = true;
+    try {
+      const response = await fetch('/admin/codex-usage/refresh', {method: 'POST'});
+      if (!response.ok) throw new Error('Refresh failed: HTTP ' + response.status);
+      await refreshAll();
+    } catch (error) {
+      console.error(error);
+    } finally {
+      refreshButton.disabled = false;
+    }
+  });
   refreshAll();
   setInterval(refreshAll, 60000);
 })();

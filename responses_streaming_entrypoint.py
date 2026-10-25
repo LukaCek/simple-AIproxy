@@ -554,7 +554,8 @@ async def chat_completions(
                     continue
 
                 error_msg = raw_text
-                if upstream_status in _FALLBACK_STATUSES:
+                retry_model = _impl.codex_note_error(endpoint, upstream_status, error_msg) if hasattr(_impl, "codex_note_error") else False
+                if retry_model or upstream_status in _FALLBACK_STATUSES:
                     record_attempt(number, provider_name, provider_model, upstream_status, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     last_error = f"{provider_name} returned {upstream_status}: {error_msg}"
                     continue
@@ -633,6 +634,8 @@ async def chat_completions(
                     await response.aclose()
                     if stream_error is None:
                         _impl.clear_provider_cooldown(endpoint)
+                        if hasattr(_impl, "codex_note_success"):
+                            _impl.codex_note_success(endpoint)
                     else:
                         _impl.set_provider_cooldown(
                             endpoint, _impl.PROVIDER_TIMEOUT_COOLDOWN_SECONDS

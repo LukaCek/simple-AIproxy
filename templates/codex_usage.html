@@ -290,7 +290,7 @@
   }
 
   for (const el of [benchmarkMetric, benchmarkAvailable]) {
-    if (el) el.addEventListener('change', renderComparison);
+    if (el) el.addEventListener('change', renderCachedCards);
   }
 
   function renderCachedCards() {
@@ -387,6 +387,12 @@
       const pricing = model.pricing;
       const value = estimate(pricing, tokenExample);
       const amount = value === null ? 'Rate unavailable' : '~' + numberFormat.format(value) + ' credits';
+      const selectedBenchmark = benchmarkMetric ? (model.benchmarks || {})[benchmarkMetric.value] : null;
+      const benchmarkLine = selectedBenchmark
+        ? '<span class="mt-1 block text-xs text-slate-700">Benchmark: ' +
+          numberFormat.format(selectedBenchmark.score) + ' · ' +
+          escapeHtml(selectedBenchmark.edition) + '</span>'
+        : '<span class="mt-1 block text-xs text-slate-500">Benchmark not published</span>';
       const detail = pricing
         ? '<details class="mt-1 text-xs text-slate-500"><summary class="cursor-pointer">Credits / 1M tokens</summary>' +
           '<div class="mt-1">Input: ' + numberFormat.format(pricing.input) +
@@ -396,7 +402,7 @@
       return '<div class="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 py-3">' +
         '<div class="min-w-0 flex-1"><b class="text-slate-900">' + escapeHtml(model.display_name) + '</b>' +
         '<div class="text-xs text-slate-500 break-all">' + escapeHtml(model.slug) + '</div>' +
-        '<span class="mt-1 block text-xs ' + label + '">' + escapeHtml(status + retry) + '</span></div>' +
+        '<span class="mt-1 block text-xs ' + label + '">' + escapeHtml(status + retry) + '</span>' + benchmarkLine + '</div>' +
         '<div class="min-w-0 text-right"><b class="text-slate-900">' + escapeHtml(amount) + '</b>' +
         detail + '</div></div>';
     }).join('');

@@ -14,6 +14,7 @@ import codex_usage_entrypoint as _codex_usage  # noqa: F401
 
 # Keep Codex model availability and quota state per OAuth account.
 import codex_registry as _codex_registry  # noqa: F401
+import codex_pricing as _codex_pricing  # noqa: F401
 
 # Register OpenAI-compatible speech-to-text proxying on the shared app.
 import audio_transcriptions as _audio_transcriptions  # noqa: F401
@@ -23,5 +24,6 @@ import free_model_registry as _free_registry
 import main_impl as _impl
 
 _codex_registry.install(_impl)
+_codex_pricing.install(_impl)
 _free_registry.install(_impl)
 app = _live.app

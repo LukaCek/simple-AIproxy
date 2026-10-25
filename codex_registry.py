@@ -18,6 +18,7 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 import codex_usage_entrypoint as usage
+import codex_pricing
 
 _impl: Any = None
 _model_task: asyncio.Task | None = None
@@ -399,10 +400,12 @@ def account_view(provider_name: str) -> dict[str, Any]:
             ).fetchall()
         }
     result["models"] = []
+    result["pricing_meta"] = codex_pricing.public_meta()
     for m in catalog_models(provider_name):
         block = active_blocks.get(m["slug"]) or active_blocks.get("*")
         result["models"].append({
             **m,
+            "pricing": codex_pricing.price_for_model(m["slug"]),
             "status": ("unsupported" if block and block["reason"] == "model_not_found"
                        else "limited" if block else "available"),
             "available_after": block["until_at"] if block else None,

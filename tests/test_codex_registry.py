@@ -16,6 +16,7 @@ def registry(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB_PATH", tmp_path / "test.db")
     main.init_database()
     reg._impl = main
+    reg._original_headers = main.build_provider_headers
     reg.init_schema()
     monkeypatch.setattr(main, "http_client", None)
     with main.config_lock:

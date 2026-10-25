@@ -1487,7 +1487,7 @@ def build_playground_curl_for_target(target: str, model_name: str, prompt: str, 
         provider = find_provider(target_name)
         if provider is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider '{target_name}' not found")
-        if not model_name or model_name not in get_models_for_provider(provider_name):
+        if not model_name or model_name not in get_models_for_provider(target_name):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_name}' is not configured for provider '{target_name}'")
         payload_model = model_name
     payload = {"model": payload_model, "messages": build_playground_messages(prompt, image_data_url), "stream": True}
@@ -1590,7 +1590,7 @@ async def test_provider_model(provider_name: str, model_name: str, prompt: str, 
         message = f"Provider '{provider_name}' not found"
         finish_log(404, model_name or "unknown", error=message)
         return {"success": False, "provider": provider_name, "status_code": 404, "response": message, "assistant_text": message}
-    if not model_name or model_name not in provider.get("models", []):
+    if not model_name or model_name not in get_models_for_provider(provider_name):
         message = f"Model '{model_name}' is not configured for provider '{provider_name}'"
         finish_log(400, model_name or "unknown", error=message)
         return {"success": False, "provider": provider_name, "status_code": 400, "response": message, "assistant_text": message}

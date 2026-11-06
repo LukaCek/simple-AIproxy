@@ -108,8 +108,13 @@ def install_model(models: Path, mid: str, limit: int, last_used: dict,
     model = CATALOG[mid]
     target = target_path(models, mid)
     if target.exists():
-        verify_model(target, model["sha256"])
-        return []
+        try:
+            verify_model(target, model["sha256"])
+            return []
+        except RuntimeError:
+            # A stale/corrupt cached GGUF must not permanently block autonomous
+            # recovery. Remove known per-model cache and re-download safely.
+            remove_model(models, mid)
     if target.is_symlink():
         target.unlink()
     # Clear a partial file left by a prior crash BEFORE computing used bytes.

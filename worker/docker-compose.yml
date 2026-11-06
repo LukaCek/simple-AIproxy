@@ -15,6 +15,7 @@ services:
       WORKER_ENROLLMENT_TOKEN: ${WORKER_ENROLLMENT_TOKEN:-}
       WORKER_NAME: ${WORKER_NAME:-compute-worker}
       WORKER_THREADS: ${WORKER_THREADS:-4}
+      WORKER_REASONING: ${WORKER_REASONING:-off}
     volumes:
       - worker-data:/data
       - worker-models:/models

@@ -46,6 +46,18 @@ nodes (allow_private=true) may receive private prompts. To send an explicitly
 public request to an untrusted node, set "aiproxy_visibility":"public".
 The remote host operator can access prompt contents regardless of TLS.
 
+Thinking defaults to ON for compute requests, and the proxy can choose per
+request: `"think": false` for a fast answer, `"think": true` for reasoning,
+or omit the field to retain the default ON. No model reload is required.
+The proxy automatically limits reasoning to one quarter of the specified
+`max_tokens` (maximum 256), leaving room for a visible response. When the
+caller omits `max_tokens`, the default reasoning budget is 192 tokens. The
+caller can override with `"reasoning_budget_tokens": 128`; that value must
+be a nonnegative integer smaller than the completion limit if specified.
+For example, `{"think":true,"max_tokens":512}` allows up to 128 reasoning
+tokens, leaving at least 384 generated tokens for an answer. Limits are
+upper bounds, not guarantees of a correct or nonempty response.
+
 Deleting a model also clears its per-model download cache to reclaim disk space.
 Never copy `/data/identity.json` to another machine; generate a new enrollment
 for each physical computer. If a node is revoked, its stored credentials cannot

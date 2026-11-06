@@ -93,3 +93,14 @@ def test_worker_refuses_plaintext_proxy_url(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "PROXY", "http://example.test")
     with pytest.raises(RuntimeError, match="HTTPS"):
         asyncio.run(worker.run())
+
+
+def test_published_catalog_pins_revisions_and_integrity():
+    import re
+    from compute_catalog import CATALOG as published
+    assert len(published) >= 4
+    for model_id, model in published.items():
+        assert re.fullmatch(r"[a-f0-9]{40}", model["revision"]), model_id
+        assert re.fullmatch(r"[a-f0-9]{64}", model["sha256"]), model_id
+        assert model["size"] > 0, model_id
+        assert model["repo"].startswith("unsloth/"), model_id

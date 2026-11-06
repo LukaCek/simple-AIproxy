@@ -37,13 +37,21 @@ def memory_limit():
 
 
 def memory_available():
+    host = memory_limit()
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
+                host = int(line.split()[1]) * 1024
+                break
     except (OSError, IndexError, ValueError):
         pass
-    return memory_limit()
+    # /proc/meminfo reflects host memory on many container setups. Deduct
+    # actual cgroup consumption before deciding whether to load a model.
+    try:
+        current = int(Path("/sys/fs/cgroup/memory.current").read_text())
+        return max(0, min(host, memory_limit() - current))
+    except (OSError, ValueError):
+        return min(host, memory_limit())
 
 
 def cpu_count():
@@ -158,7 +166,8 @@ class Worker:
             raise RuntimeError("Model not installed")
         if self.active == mid and self.status()["ready"]:
             return
-        required = int(path.stat().st_size * 1.25) + (2 * 1024**3)
+        reserve = min(2 * 1024**3, max(512 * 1024**2, memory_limit() // 8))
+        required = int(path.stat().st_size * 1.25) + reserve
         if required > min(memory_limit(), memory_available()):
             raise RuntimeError("Insufficient available memory for this model")
         await self.unload()
@@ -266,7 +275,7 @@ class Worker:
                                 if task:
                                     task.cancel()
                             elif kind in ("command", "run") and cid:
-                                if len(self.tasks) >= 2:
+                                if len(self.tasks) >= 1:
                                     await self.send(ws, {"type": "error", "id": cid, "error": "Worker busy"})
                                     continue
                                 task = asyncio.create_task(

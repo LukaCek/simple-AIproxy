@@ -83,12 +83,32 @@ def _record(node_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def _nonnegative_int(value: Any) -> int:
+    """Treat telemetry from untrusted machines as untrusted input."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, min(int(value), 2**63 - 1))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _public_node(row: dict[str, Any]) -> dict[str, Any]:
     try:
         hardware = json.loads(row["hardware_json"])
         models = json.loads(row["models_json"])
     except (TypeError, ValueError):
         hardware, models = {}, {}
+    if not isinstance(hardware, dict):
+        hardware = {}
+    if not isinstance(models, dict):
+        models = {}
+    hardware = dict(hardware)
+    for key in ("cpus", "memory_limit_bytes", "memory_available_bytes", "disk_free_bytes", "disk_total_bytes"):
+        hardware[key] = _nonnegative_int(hardware.get(key))
+    models = dict(models)
+    installed = models.get("installed")
+    models["installed"] = [mid for mid in installed if isinstance(mid, str) and mid in CATALOG] if isinstance(installed, list) else []
     return {
         "id": row["id"], "name": row["name"], "online": row["id"] in _connections,
         "allow_private": bool(row["allow_private"]), "revoked": bool(row["revoked"]),
@@ -172,10 +192,14 @@ def model_recommendations(row: dict[str, Any]) -> dict[str, Any]:
         state = json.loads(row["models_json"])
     except (TypeError, ValueError):
         hw, state = {}, {}
-    ram = min(int(hw.get("memory_limit_bytes") or 0),
-              int(hw.get("memory_available_bytes") or 0))
-    disk = int(hw.get("disk_free_bytes") or 0)
-    installed = state.get("installed") or []
+    if not isinstance(hw, dict):
+        hw = {}
+    if not isinstance(state, dict):
+        state = {}
+    ram = min(_nonnegative_int(hw.get("memory_limit_bytes")),
+              _nonnegative_int(hw.get("memory_available_bytes")))
+    disk = _nonnegative_int(hw.get("disk_free_bytes"))
+    installed = state.get("installed") if isinstance(state.get("installed"), list) else []
     recommendations = {}
     for mid, model in CATALOG.items():
         reserve = min(2 * 1024**3, max(512 * 1024**2, ram // 8))

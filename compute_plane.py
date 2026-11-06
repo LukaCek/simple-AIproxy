@@ -165,6 +165,39 @@ async def _stream(node_id: str, model: str, payload: dict[str, Any]):
                 pass
 
 
+def model_recommendations(row: dict[str, Any]) -> dict[str, Any]:
+    """Conservative suitability hints, not a promise that inference will succeed."""
+    try:
+        hw = json.loads(row["hardware_json"])
+        state = json.loads(row["models_json"])
+    except (TypeError, ValueError):
+        hw, state = {}, {}
+    ram = min(int(hw.get("memory_limit_bytes") or 0),
+              int(hw.get("memory_available_bytes") or 0))
+    disk = int(hw.get("disk_free_bytes") or 0)
+    installed = state.get("installed") or []
+    recommendations = {}
+    for mid, model in CATALOG.items():
+        reserve = min(2 * 1024**3, max(512 * 1024**2, ram // 8))
+        required_ram = int(model["size"] * 1.25) + reserve
+        required_disk = int(model["size"] * 1.15)
+        if not ram or not disk:
+            grade, reason = "unknown", "Waiting for hardware telemetry"
+        elif ram < required_ram:
+            grade, reason = "too_large", "Insufficient available RAM"
+        elif mid not in installed and disk < required_disk:
+            grade, reason = "too_large", "Insufficient free disk"
+        elif ram < required_ram * 1.3:
+            grade, reason = "possible", "Near memory budget; measure before production"
+        else:
+            grade, reason = "recommended", "Fits conservative CPU memory estimate"
+        recommendations[mid] = {
+            "grade": grade, "reason": reason, "estimated_ram_bytes": required_ram,
+            "estimated_download_bytes": required_disk, "installed": mid in installed,
+        }
+    return recommendations
+
+
 def endpoints(model: str) -> list[dict[str, Any]]:
     """Dynamic provider candidates; never infer private-data consent."""
     if not model.startswith("local/"):
@@ -320,6 +353,14 @@ async def list_nodes() -> dict[str, Any]:
     return {"nodes": [_public_node(dict(row)) for row in rows]}
 
 
+@router.get("/admin/api/compute/nodes/{node_id}/recommendations", dependencies=[Depends(core.verify_admin)])
+async def node_recommendations(node_id: str):
+    node = _record(node_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    return {"node_id": node_id, "models": model_recommendations(node)}
+
+
 @router.post("/admin/api/compute/nodes/{node_id}/trust", dependencies=[Depends(require_admin_write)])
 async def set_trust(node_id: str, request: Request):
     data = await request.json()
@@ -396,7 +437,8 @@ async def admin_page(request: Request):
         rows = db.execute("SELECT * FROM ComputeNodes ORDER BY created_at DESC").fetchall()
     return core.templates.TemplateResponse(
         request, "compute_nodes.html",
-        {"nodes": [_public_node(dict(r)) for r in rows], "catalog": CATALOG},
+        {"nodes": [_public_node(dict(r)) for r in rows], "catalog": CATALOG,
+         "recommendations": {r["id"]: model_recommendations(dict(r)) for r in rows}},
     )
 
 

@@ -259,32 +259,70 @@ def endpoints(model: str) -> list[dict[str, Any]]:
 
 
 def prepare_worker_thinking(payload: dict[str, Any]) -> dict[str, Any]:
-    """Turn a proxy-facing think bool into llama.cpp's per-request template knob.
+    """Configure per-request thinking with a bounded reasoning token budget.
 
-    The worker defaults to reasoning ON; an omitted flag is intentionally
-    passed through without overriding other OpenAI-compatible options.
+    The worker defaults to reasoning ON. llama.cpp accepts enable_thinking via
+    chat_template_kwargs, and reasoning_budget_tokens at request level. The
+    budget forces the thinking block to end early, reserving tokens for visible
+    content instead of exhausting max_tokens entirely on reasoning.
     """
     body = dict(payload)
-    if "think" not in body:
-        return body
-
-    think = body.pop("think")
-    if type(think) is not bool:
+    explicit_think = "think" in body
+    think = body.pop("think") if explicit_think else None
+    if explicit_think and type(think) is not bool:
         raise HTTPException(400, "think must be true or false")
 
     original_kwargs = body.get("chat_template_kwargs", {})
     if not isinstance(original_kwargs, dict):
         raise HTTPException(400, "chat_template_kwargs must be an object")
-    if think and body.get("reasoning_effort") == "none":
+    template_think = original_kwargs.get("enable_thinking", True)
+    if type(template_think) is not bool:
+        raise HTTPException(400, "chat_template_kwargs.enable_thinking must be boolean")
+    if explicit_think and think and body.get("reasoning_effort") == "none":
         raise HTTPException(400, "think=true conflicts with reasoning_effort=none")
 
-    # Explicit think has priority over a template default; each request
-    # switches the Jinja prompt mode without restarting llama-server.
-    body["chat_template_kwargs"] = {
-        **original_kwargs, "enable_thinking": think,
-    }
-    return body
+    # Explicit think wins over template knobs; otherwise retain the worker's
+    # default ON setting (or an explicit OpenAI reasoning_effort=none).
+    if explicit_think:
+        body["chat_template_kwargs"] = {**original_kwargs, "enable_thinking": think}
+    else:
+        think = template_think
+    if body.get("reasoning_effort") == "none":
+        think = False
 
+    if not think:
+        return body
+
+    # Respect every known completion cap; do not inflate a caller's limit.
+    caps = []
+    for field in ("max_tokens", "max_completion_tokens", "n_predict"):
+        raw = body.get(field)
+        if raw is not None:
+            if type(raw) is not int or raw <= 0:
+                raise HTTPException(400, f"{field} must be a positive integer")
+            caps.append(raw)
+    completion_cap = min(caps) if caps else None
+
+    provided = [name for name in ("reasoning_budget_tokens", "thinking_budget_tokens")
+                if name in body]
+    if len(provided) > 1:
+        raise HTTPException(400, "Specify one reasoning budget field")
+    if provided:
+        value = body[provided[0]]
+        if type(value) is not int or value < 0:
+            raise HTTPException(400, "reasoning budget must be a nonnegative integer")
+        if completion_cap is not None and value >= completion_cap:
+            raise HTTPException(400, "reasoning budget must be below max_tokens")
+        # Always use llama.cpp's canonical field.
+        body.pop(provided[0])
+        body["reasoning_budget_tokens"] = value
+    else:
+        # For 512 output tokens, budget 128 for thought and leave 384 for answer.
+        # Without a stated cap, still avoid unbounded CPU thinking.
+        body["reasoning_budget_tokens"] = (
+            min(256, completion_cap // 4) if completion_cap is not None else 192
+        )
+    return body
 
 async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response:
     """Bridge OpenAI-compatible inference over the node's WSS."""

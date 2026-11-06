@@ -18,10 +18,15 @@ belong exclusively to this test stack.
 **Important:** This setup exercises internal TLS/WSS. It does **not** prove
 Cloudflare WSS works; that is a separate later release gate.
 
-## 1. Prepare, from the repository root
+## 1. Prepare in a NEW checkout on the VPS
+
+Never switch branches or build inside the working directory used for production.
+Create a second checkout instead (use your configured GitHub authentication):
 
 ```bash
-git switch feat/compute-worker-v1
+git clone --branch feat/compute-worker-v1 --single-branch https://github.com/LukaCek/simple-AIproxy.git "$HOME/simpleai-compute-staging"
+cd "$HOME/simpleai-compute-staging"
+free -h && df -h
 mkdir -p staging-runtime
 [ -f staging-runtime/app.db ] || install -m 600 /dev/null staging-runtime/app.db
 cp deploy/compute-staging.env.example deploy/compute-staging.env

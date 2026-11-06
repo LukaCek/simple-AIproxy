@@ -202,3 +202,13 @@ def test_interrupted_benchmark_is_marked_error_on_worker_restart(tmp_path, monke
     status = restarted.status()["capabilities"]["test"]
     assert status["status"] == "error"
     assert "stopped" in status["reason"].lower()
+
+
+def test_corrupted_existing_model_is_redownloaded(tmp_path, monkeypatch):
+    content = b"valid GGUF content"
+    monkeypatch.setattr(storage, "CATALOG", catalog_for({"a": content}))
+    monkeypatch.setattr(storage, "hf_hub_url", lambda **kwargs: "https://huggingface.co/test/resolve/sha")
+    monkeypatch.setattr(storage.httpx, "Client", lambda **kwargs: Client(content))
+    (tmp_path / "a.gguf").write_bytes(b"corrupted")
+    storage.install_model(tmp_path, "a", storage.GIB, {})
+    assert (tmp_path / "a.gguf").read_bytes() == content

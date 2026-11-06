@@ -36,6 +36,22 @@ jobs:
           pytest -q tests/compute_streaming_check.py
           docker compose --env-file worker/.env.example -f worker/docker-compose.yml config --quiet
 
+  docker-smoke:
+    needs: verify
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   build-worker:
     needs: verify
     runs-on: ubuntu-latest

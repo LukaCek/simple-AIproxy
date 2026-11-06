@@ -100,7 +100,7 @@ def download(mid):
     if shutil.disk_usage(MODELS).free < info["size"] * 1.15:
         raise RuntimeError("Insufficient disk space")
     path = Path(hf_hub_download(repo_id=info["repo"], filename=info["file"],
-                                revision=info["revision"], cache_dir=str(MODELS / ".hf-cache")))
+                                revision=info["revision"], cache_dir=str(MODELS / ".hf-cache" / mid)))
     verify(path, info["sha256"])
     temp = target.with_suffix(".tmp")
     if temp.exists() or temp.is_symlink():
@@ -213,6 +213,11 @@ class Worker:
                     p = model_file(mid)
                     if p.exists() or p.is_symlink():
                         p.unlink()
+                    # Each model uses an isolated Hugging Face cache. Removing
+                    # only the symlink would leave the multi-GB cached blob.
+                    cache = MODELS / ".hf-cache" / mid
+                    if cache.is_dir():
+                        shutil.rmtree(cache)
                 else:
                     raise ValueError("Invalid action")
             await self.send(ws, {"type": "result", "id": cid, "ok": True})

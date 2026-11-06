@@ -26,7 +26,7 @@ def fixture_client(tmp_path, monkeypatch):
 
 
 def enroll_node(client):
-    token_result = client.post("/admin/api/compute/enrollments", auth=ADMIN)
+    token_result = client.post("/admin/api/compute/enrollments", auth=ADMIN, headers={"X-SimpleAI-Admin-Action":"1"})
     assert token_result.status_code == 200, token_result.text
     token = token_result.json()["token"]
     registered = client.post("/compute/enroll", json={"token": token, "name": "friend-pc"})
@@ -39,7 +39,7 @@ def test_enrollment_and_revocation(tmp_path, monkeypatch):
     with fixture_client(tmp_path, monkeypatch) as client:
         identity = enroll_node(client)
         node = identity["node_id"]
-        listed = client.get("/admin/api/compute/nodes", auth=ADMIN).json()["nodes"]
+        listed = client.get("/admin/api/compute/nodes", auth=ADMIN, headers={"X-SimpleAI-Admin-Action":"1"}).json()["nodes"]
         assert listed[0]["id"] == node
         assert listed[0]["allow_private"] is False
         assert listed[0]["online"] is False
@@ -54,11 +54,11 @@ def test_enrollment_and_revocation(tmp_path, monkeypatch):
                     break
                 time.sleep(0.02)
             assert compute_plane.endpoints("local/qwen35-4b-q4")
-            row = client.get("/admin/api/compute/nodes", auth=ADMIN).json()["nodes"][0]
+            row = client.get("/admin/api/compute/nodes", auth=ADMIN, headers={"X-SimpleAI-Admin-Action":"1"}).json()["nodes"][0]
             assert row["allow_private"] is False
             assert row["online"] is True
             assert row["hardware"]["arch"] == "aarch64"
-            assert client.post(f"/admin/api/compute/nodes/{node}/revoke", auth=ADMIN).status_code == 200
+            assert client.post(f"/admin/api/compute/nodes/{node}/revoke", auth=ADMIN, headers={"X-SimpleAI-Admin-Action":"1"}).status_code == 200
         assert compute_plane.endpoints("local/qwen35-4b-q4") == []
 
 
@@ -108,7 +108,7 @@ def test_catalog_rejects_unknown_model(tmp_path, monkeypatch):
         identity = enroll_node(client)
         result = client.post(
             f"/admin/api/compute/nodes/{identity['node_id']}/operations",
-            auth=ADMIN,
+            auth=ADMIN, headers={"X-SimpleAI-Admin-Action":"1"},
             json={"action": "install", "model": "not-in-catalog"},
         )
         assert result.status_code == 400

@@ -33,6 +33,8 @@ jobs:
           python -m compileall -q compute_catalog.py compute_plane.py worker/agent.py
           python -m pip install -r requirements.txt pytest
           pytest -q tests/test_zz_compute_plane.py
+          pytest -q tests/compute_streaming_check.py
+          docker compose --env-file worker/.env.example -f worker/docker-compose.yml config --quiet
 
   build-worker:
     needs: verify

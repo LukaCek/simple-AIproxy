@@ -12,6 +12,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("SIMPLEAI_PROXY_URL", "https://example.test")
 
+# The main proxy CI intentionally does not install optional worker dependencies.
+# The dedicated compute-worker CI installs them and runs these tests fully.
+pytest.importorskip("huggingface_hub")
+pytest.importorskip("websockets.asyncio.client")
 from worker import agent
 
 

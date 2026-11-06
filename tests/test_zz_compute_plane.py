@@ -469,6 +469,10 @@ def test_admin_model_policy_pushes_wss_and_routes_verified_cached_models(tmp_pat
             cleared = client.post(policy_url, auth=ADMIN, headers=write,
                                   json={"models": []})
             assert cleared.status_code == 200
-            assert ws.receive_json()["models"] == []
+            update_message = ws.receive_json()
+            if update_message.get("type") == "cancel":
+                update_message = ws.receive_json()
+            assert update_message["type"] == "policy"
+            assert update_message["models"] == []
             assert compute_plane.endpoints("local/qwen35-2b-q4") == []
             assert compute_plane.endpoints("local/qwen35-0.8b-q4") == []

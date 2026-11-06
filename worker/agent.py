@@ -7,12 +7,13 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import time
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from huggingface_hub import hf_hub_download
 from websockets.asyncio.client import connect
 from compute_catalog import CATALOG
+from compute_worker_storage import (disk_limit_bytes, used_bytes, install_model, remove_model, verify_model, target_path)
 
 DATA = Path(os.getenv("WORKER_DATA_DIR", "/data"))
 MODELS = Path(os.getenv("WORKER_MODEL_DIR", "/models"))
@@ -26,6 +27,7 @@ NAME = os.getenv("WORKER_NAME", platform.node())[:80]
 REASONING_MODE = os.getenv("WORKER_REASONING", "on").strip().lower()
 if REASONING_MODE not in {"on", "off", "auto"}:
     raise ValueError("WORKER_REASONING must be on, off, or auto")
+DISK_LIMIT_BYTES = disk_limit_bytes(os.getenv("WORKER_DISK_LIMIT_GB", "8"))
 
 
 def memory_limit():
@@ -82,36 +84,15 @@ def hardware():
 
 
 def model_file(mid):
-    if mid not in CATALOG:
-        raise ValueError("Model not in approved catalog")
-    return MODELS / (mid + ".gguf")
+    return target_path(MODELS, mid)
 
 
 def verify(path, checksum):
-    sha = hashlib.sha256()
-    with path.open("rb") as stream:
-        while data := stream.read(4 * 1024 * 1024):
-            sha.update(data)
-    if sha.hexdigest() != checksum:
-        raise RuntimeError("Model SHA256 mismatch")
+    verify_model(path, checksum)
 
 
-def download(mid):
-    info = CATALOG[mid]
-    target = model_file(mid)
-    if target.exists():
-        verify(target, info["sha256"])
-        return
-    if shutil.disk_usage(MODELS).free < info["size"] * 1.15:
-        raise RuntimeError("Insufficient disk space")
-    path = Path(hf_hub_download(repo_id=info["repo"], filename=info["file"],
-                                revision=info["revision"], cache_dir=str(MODELS / ".hf-cache" / mid)))
-    verify(path, info["sha256"])
-    temp = target.with_suffix(".tmp")
-    if temp.exists() or temp.is_symlink():
-        temp.unlink()
-    temp.symlink_to(path)
-    os.replace(temp, target)
+def download(mid, last_used=None, protected=None):
+    return install_model(MODELS, mid, DISK_LIMIT_BYTES, last_used or {}, protected)
 
 
 class Worker:
@@ -123,11 +104,54 @@ class Worker:
         self.lock = asyncio.Lock()
         self.write_lock = asyncio.Lock()
         self.tasks = {}
+        self.policy = None
+        self.policy_revision = 0
+        self.reconcile_task = None
+        self.last_used = {}
+        self.capabilities = {}
+        self.state_path = DATA / "model-test-results.json"
+        self.fingerprint = hashlib.sha256(
+            (str(DISK_LIMIT_BYTES) + ":" + str(memory_limit()) + ":" +
+             str(cpu_count()) + ":" + json.dumps(CATALOG, sort_keys=True) +
+             ":autotest-v1").encode()
+        ).hexdigest()
+        self._read_state()
+
+    def _read_state(self):
+        try:
+            state = json.loads(self.state_path.read_text())
+            if state.get("fingerprint") != self.fingerprint:
+                return
+            capabilities = state.get("capabilities", {})
+            last_used = state.get("last_used", {})
+            if isinstance(capabilities, dict):
+                self.capabilities = {k: v for k, v in capabilities.items()
+                                     if k in CATALOG and isinstance(v, dict)
+                                     and v.get("status") in ("supported", "unsupported", "error")}
+            if isinstance(last_used, dict):
+                self.last_used = {k: float(v) for k, v in last_used.items()
+                                  if k in CATALOG and isinstance(v, (float, int))}
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def _save_state(self):
+        data = json.dumps({"fingerprint": self.fingerprint,
+                           "capabilities": self.capabilities,
+                           "last_used": self.last_used})
+        tmp = self.state_path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(data)
+        os.replace(tmp, self.state_path)
 
     def status(self):
         ready = bool(self.process and self.process.returncode is None and self.active)
         return {"installed": [k for k in CATALOG if model_file(k).exists()],
-                "active": self.active if ready else None, "ready": ready}
+                "active": self.active if ready else None, "ready": ready,
+                "capabilities": self.capabilities,
+                "disk_used_bytes": used_bytes(MODELS),
+                "disk_limit_bytes": DISK_LIMIT_BYTES,
+                "policy_revision": self.policy_revision}
 
     async def credentials(self):
         if IDENTITY.exists():
@@ -154,6 +178,132 @@ class Worker:
         while True:
             await self.send(ws, {"type": "telemetry", "hardware": hardware(), "models": self.status()})
             await asyncio.sleep(15)
+
+    async def telemetry(self, ws):
+        try:
+            await self.send(ws, {"type": "telemetry", "hardware": hardware(),
+                                 "models": self.status()})
+        except Exception:
+            # Reconciliation is also able to finish when WSS reconnects.
+            pass
+
+    def mark_model(self, mid, status, reason="", seconds=0):
+        self.capabilities[mid] = {
+            "status": status, "reason": str(reason)[:240],
+            "test_seconds": round(float(seconds), 2),
+            "tested_at": int(time.time()),
+        }
+        self._save_state()
+
+    async def ensure_installed(self, mid):
+        evicted = await asyncio.to_thread(download, mid, self.last_used)
+        self.last_used[mid] = time.time()
+        self._save_state()
+        return evicted
+
+    async def benchmark(self, mid):
+        """One real non-thinking completion to prove the CPU backend works."""
+        async with httpx.AsyncClient(timeout=180) as client:
+            response = await client.post(
+                f"http://127.0.0.1:{PORT}/v1/chat/completions",
+                json={"model": mid, "stream": False, "max_tokens": 64,
+                      "chat_template_kwargs": {"enable_thinking": False},
+                      "messages": [{"role": "user",
+                                    "content": "Reply with exactly: READY"}]},
+            )
+            response.raise_for_status()
+            data = response.json()
+            choices = data.get("choices", [])
+            content = choices[0].get("message", {}).get("content") if choices else None
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError("Inference returned no visible answer")
+
+    async def receive_policy(self, ws, message):
+        selected = message.get("models")
+        version = message.get("revision")
+        if (type(version) is not int or version < 1 or not isinstance(selected, list)
+                or len(selected) > len(CATALOG) or len(set(str(x) for x in selected)) != len(selected)
+                or any(not isinstance(x, str) or x not in CATALOG for x in selected)):
+            return
+        previous = self.policy
+        old_version = self.policy_revision
+        self.policy = selected
+        self.policy_revision = version
+        self.force_retest = previous == selected and old_version not in (0, version)
+        if self.reconcile_task is None or self.reconcile_task.done():
+            self.reconcile_task = asyncio.create_task(self.reconcile(ws))
+
+    async def reconcile(self, ws):
+        """Test requested models, report capacity, and warm the preferred one.
+
+        All destructive model-store operations are serialized against inference.
+        The configured disk cap is enforced even if the policy selects more
+        models than can be cached simultaneously.
+        """
+        while self.policy is not None:
+            selected = list(self.policy)
+            version = self.policy_revision
+            retest = getattr(self, "force_retest", False)
+            self.force_retest = False
+            # Test from lowest priority first so the preferred model is cached
+            # last and remains available on small volumes.
+            for mid in reversed(selected):
+                if version != self.policy_revision:
+                    break
+                previous = self.capabilities.get(mid, {})
+                if not retest and previous.get("status") in ("supported", "unsupported"):
+                    continue
+                started = time.monotonic()
+                self.mark_model(mid, "testing")
+                await self.telemetry(ws)
+                model = CATALOG[mid]
+                max_file = max(model["size"] + 16 * 1024**2, int(model["size"] * 1.15))
+                reserve = min(2 * 1024**3, max(512 * 1024**2, memory_limit() // 8))
+                required_ram = int(model["size"] * 1.25) + reserve
+                if max_file > DISK_LIMIT_BYTES:
+                    self.mark_model(mid, "unsupported", "Exceeds configured model disk limit")
+                elif required_ram > memory_limit():
+                    self.mark_model(mid, "unsupported", "Insufficient cgroup RAM for model")
+                else:
+                    try:
+                        async with self.lock:
+                            await self.unload()
+                            await self.ensure_installed(mid)
+                            await self.load(mid)
+                            await self.benchmark(mid)
+                            await self.unload()
+                        self.mark_model(mid, "supported", "Actual inference passed",
+                                        time.monotonic() - started)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        await self.unload()
+                        # Failed downloads / inference can be retried by saving
+                        # model policy again; don't claim the model is supported.
+                        self.mark_model(mid, "error", str(exc),
+                                        time.monotonic() - started)
+                await self.telemetry(ws)
+            if version != self.policy_revision:
+                continue
+            preferred = next((mid for mid in selected
+                              if self.capabilities.get(mid, {}).get("status") == "supported"),
+                             None)
+            try:
+                async with self.lock:
+                    if preferred is None:
+                        await self.unload()
+                    elif self.active != preferred or not self.status()["ready"]:
+                        await self.unload()
+                        await self.ensure_installed(preferred)
+                        await self.load(preferred)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if preferred:
+                    self.mark_model(preferred, "error", "Warmup: " + str(exc))
+            await self.telemetry(ws)
+            if version == self.policy_revision:
+                break
 
     async def unload(self):
         if self.process and self.process.returncode is None:
@@ -207,22 +357,19 @@ class Worker:
                 raise ValueError("Unapproved model")
             async with self.lock:
                 if action == "install":
-                    await asyncio.to_thread(download, mid)
+                    await self.ensure_installed(mid)
                 elif action == "load":
+                    await self.unload()
+                    await self.ensure_installed(mid)
                     await self.load(mid)
                 elif action == "unload":
                     await self.unload()
                 elif action == "delete":
                     if mid == self.active:
                         await self.unload()
-                    p = model_file(mid)
-                    if p.exists() or p.is_symlink():
-                        p.unlink()
-                    # Each model uses an isolated Hugging Face cache. Removing
-                    # only the symlink would leave the multi-GB cached blob.
-                    cache = MODELS / ".hf-cache" / mid
-                    if cache.is_dir():
-                        shutil.rmtree(cache)
+                    remove_model(MODELS, mid)
+                    self.last_used.pop(mid, None)
+                    self._save_state()
                 else:
                     raise ValueError("Invalid action")
             await self.send(ws, {"type": "result", "id": cid, "ok": True})
@@ -235,12 +382,33 @@ class Worker:
     async def inference(self, ws, msg):
         cid, mid = msg["id"], msg.get("model")
         try:
-            if mid not in CATALOG or self.active != mid or not self.status()["ready"]:
-                raise RuntimeError("Model is not loaded")
+            if mid not in CATALOG:
+                raise RuntimeError("Model not approved")
+            if self.policy is not None and mid not in self.policy:
+                raise RuntimeError("Model not enabled in proxy policy")
             payload = msg.get("payload")
             if not isinstance(payload, dict) or len(json.dumps(payload)) > 256 * 1024:
                 raise ValueError("Invalid inference payload")
             payload = {**payload, "model": mid}
+            async with self.lock:
+                if self.active != mid or not self.status()["ready"]:
+                    if self.policy is not None and self.capabilities.get(mid, {}).get("status") != "supported":
+                        raise RuntimeError("Model has not passed worker self-test")
+                    await self.unload()
+                    await self.ensure_installed(mid)
+                    await self.load(mid)
+                    await self.telemetry(ws)
+                self.last_used[mid] = time.time()
+                self._save_state()
+                await self._inference_stream(ws, cid, mid, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.send(ws, {"type": "error", "id": cid, "error": str(exc)[:400]})
+        finally:
+            self.tasks.pop(cid, None)
+
+    async def _inference_stream(self, ws, cid, mid, payload):
             async with httpx.AsyncClient(timeout=httpx.Timeout(3600, connect=10)) as client:
                 async with client.stream(
                     "POST", f"http://127.0.0.1:{PORT}/v1/chat/completions", json=payload
@@ -257,12 +425,6 @@ class Worker:
                             await self.send(ws, {"type": "chunk", "id": cid,
                                                  "body": base64.b64encode(piece).decode()})
             await self.send(ws, {"type": "end", "id": cid, "status": 200})
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self.send(ws, {"type": "error", "id": cid, "error": str(exc)[:400]})
-        finally:
-            self.tasks.pop(cid, None)
 
     async def run(self):
         parts = urlsplit(PROXY)
@@ -284,7 +446,9 @@ class Worker:
                         async for raw in ws:
                             cmd = json.loads(raw)
                             cid, kind = str(cmd.get("id") or ""), cmd.get("type")
-                            if kind == "cancel":
+                            if kind == "policy":
+                                await self.receive_policy(ws, cmd)
+                            elif kind == "cancel":
                                 task = self.tasks.get(cid)
                                 if task:
                                     task.cancel()
@@ -298,6 +462,10 @@ class Worker:
                                 self.tasks[cid] = task
                     finally:
                         heart.cancel()
+                        if self.reconcile_task and not self.reconcile_task.done():
+                            self.reconcile_task.cancel()
+                            await asyncio.gather(self.reconcile_task, return_exceptions=True)
+                        self.reconcile_task = None
                         for task in self.tasks.values():
                             task.cancel()
                         await asyncio.gather(heart, *list(self.tasks.values()), return_exceptions=True)

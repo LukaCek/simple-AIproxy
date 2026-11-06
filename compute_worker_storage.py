@@ -86,6 +86,11 @@ def install_model(models: Path, mid: str, limit: int, last_used: dict,
         return []
     if target.is_symlink():
         target.unlink()
+    # Clear a partial file left by a prior crash BEFORE computing used bytes.
+    # Otherwise quota accounting could deadlock the next download.
+    part = target.with_suffix(".part")
+    if part.exists() or part.is_symlink():
+        part.unlink()
     expected = int(model["size"])
     # Catalog sizes are approximate; verify hash after an up-to-15% allowance.
     max_download = max(expected + 16 * MIB, int(expected * 1.15))
@@ -113,9 +118,6 @@ def install_model(models: Path, mid: str, limit: int, last_used: dict,
     if shutil.disk_usage(models).free < max_download + MIN_HOST_FREE:
         raise RuntimeError("Not enough physical disk space")
 
-    part = target.with_suffix(".part")
-    if part.exists() or part.is_symlink():
-        part.unlink()
     url = hf_hub_url(repo_id=model["repo"], filename=model["file"],
                      revision=model["revision"])
     count = 0

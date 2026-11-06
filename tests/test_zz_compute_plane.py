@@ -14,7 +14,9 @@ ADMIN = ("admin", "admin")
 
 def fixture_client(tmp_path, monkeypatch):
     import main_impl as core
-    from full_entrypoint import app
+    import compute_plane
+    compute_plane.install(core.app)
+    app = core.app
     db = tmp_path / "proxy.db"
     monkeypatch.setattr(core, "DB_PATH", db)
     monkeypatch.setattr(core, "ADMIN_USERNAME", "admin")
@@ -46,7 +48,7 @@ def test_enrollment_and_revocation(tmp_path, monkeypatch):
         assert listed[0]["allow_private"] is False
         assert listed[0]["online"] is False
         with client.websocket_connect("/compute/ws") as ws:
-            ws.send_json({"type": "auth", **identity})
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
             assert ws.receive_json()["type"] == "auth_ok"
             ws.send_json({"type": "telemetry", "hardware": {"arch": "aarch64", "cpus": 4},
                           "models": {"installed": ["qwen35-4b-q4"], "active": "qwen35-4b-q4", "ready": True}})
@@ -69,7 +71,7 @@ def test_private_is_not_routed_to_untrusted_node(tmp_path, monkeypatch):
     with fixture_client(tmp_path, monkeypatch) as client:
         identity = enroll_node(client)
         with client.websocket_connect("/compute/ws") as ws:
-            ws.send_json({"type": "auth", **identity})
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
             assert ws.receive_json()["type"] == "auth_ok"
             ws.send_json({"type": "telemetry", "hardware": {"arch": "x86_64"},
                           "models": {"active": "qwen35-4b-q4", "ready": True}})

@@ -1,6 +1,7 @@
 # CPU-only multiarch worker. No privileged mode or host Docker socket.
 FROM python:3.11-slim-bookworm AS llama-build
-ARG LLAMA_CPP_REF=master
+# Pin the reviewed llama.cpp v0.9.0 release commit for repeatable multiarch builds.
+ARG LLAMA_CPP_REF=cd959bae99ff4bed22bef2604f45241c09bbb8c8
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git cmake ninja-build g++ libcurl4-openssl-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*

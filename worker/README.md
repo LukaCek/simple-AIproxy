@@ -12,10 +12,13 @@ HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
    `/admin/api/compute/enrollments` with admin Basic auth **and** the header
    `X-SimpleAI-Admin-Action: 1` (required to prevent cross-site writes).
 3. On the Linux Docker host, copy `worker/docker-compose.yml` to
-   `docker-compose.yml`, and `worker/.env.example` to `.env`.
-   Set `SIMPLEAI_PROXY_URL` to the actual external HTTPS proxy origin and paste
-   the one-time token into `WORKER_ENROLLMENT_TOKEN`. Keep `.env` private
-   (for example, `chmod 600 .env`).
+   `docker-compose.yml`. **Only edit that one Compose file:** set
+   `SIMPLEAI_PROXY_URL` to your external HTTPS proxy and paste a one-time token
+   into `WORKER_ENROLLMENT_TOKEN`. Configure `mem_limit` / `memswap_limit`,
+   `cpus`, `pids_limit`, `WORKER_THREADS`, and `WORKER_DISK_LIMIT_GB` there.
+   Protect the Compose file (e.g. `chmod 600 docker-compose.yml`) since it
+   initially contains the one-time enrollment token. The token is ignored once
+   the worker identity is stored in the persistent worker-data volume.
 4. Run `docker compose pull && docker compose up -d`. Check
    `docker compose logs --tail=100 compute-worker` and confirm the node
    appears as Online in the admin dashboard.
@@ -26,6 +29,38 @@ HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
 Enrollment tokens expire after 15 minutes. Worker identity is stored in a
 persistent data volume with permission 0600. Do not copy this volume to another
 computer. Revoke nodes from the proxy administration.
+
+## Automatic operation
+
+After first enrollment, the administrator opens `/admin/compute-nodes` in
+SimpleAI Proxy and checks the catalog models to make available. **Nothing on
+the worker host needs to be configured for individual models.** The proxy
+persists the selected list and delivers it over authenticated WSS, including
+after reconnecting.
+
+Each worker checks its CPU/RAM limit and disk quota first. Models that pass
+preflight are downloaded from the pinned, SHA256-checked catalog, loaded,
+given a real short inference test, and reported back as supported/error/
+unsupported. The highest-priority supported model is warmed by default.
+Other supported models can be selected by `local/<model-id>`; a worker
+loads the requested model automatically when routed, without requiring
+`install` or `load` from the admin. One model can be resident per CPU worker
+at a time; switching models introduces startup latency.
+
+`WORKER_DISK_LIMIT_GB` limits application-level bytes in `/models`. Old
+cached GGUF files are evicted in least-recently-used order as required.
+Each file is downloaded with a streaming byte cap, checked by SHA256 and
+atomically published. The model cache can contain fewer models than have
+passed tests; tested capabilities are persisted under `/data` and exposed
+to SimpleAI Proxy. Changing the policy triggers tests for new models;
+saving the unchanged list again re-runs tests.
+
+**Storage limitation:** Compose has no portable hard disk quota for named
+Docker volumes. The worker enforces a bounded *application* quota on model
+downloads. This does not limit filesystem growth by other processes or provide
+a kernel-enforced quota. Use a dedicated quota-managed filesystem if an
+absolute OS-level cap is required. The cache and model downloads count toward
+the configured cap; persistent identity/metadata lives separately in `/data`.
 
 ## Models
 

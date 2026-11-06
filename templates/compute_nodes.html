@@ -70,7 +70,7 @@ const notice = document.getElementById("notice");
 function show(value) { notice.textContent = value; notice.classList.remove("hidden"); }
 async function post(path, data) {
   const res = await fetch(path, {method:"POST", credentials:"same-origin",
-    headers: {"Content-Type":"application/json"}, body:JSON.stringify(data)});
+    headers: {"Content-Type":"application/json", "X-SimpleAI-Admin-Action":"1"}, body:JSON.stringify(data)});
   const body = await res.json();
   if(!res.ok) throw new Error(body.detail || "Request failed");
   return body;

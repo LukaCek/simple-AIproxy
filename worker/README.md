@@ -19,7 +19,7 @@ HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
 4. Run `docker compose pull && docker compose up -d`. Check
    `docker compose logs --tail=100 compute-worker` and confirm the node
    appears as Online in the admin dashboard.
-5. By default `WORKER_REASONING=off` favors a concise visible answer on Qwen3.5 small CPU models. Set `on` for reasoning experiments (`auto` uses llama.cpp/template defaults). All three modes are validated at startup.\n6. Install then Load a small model (start with 0.8B on a low-RAM machine)
+5. Worker defaults to `WORKER_REASONING=on`. The proxy controls reasoning per request: omit `think` (default on), set `"think":true` (on), or `"think":false` (off). The proxy converts this into llama.cpp `chat_template_kwargs.enable_thinking`, so the model does not reload. `reasoning_effort:"none"` also disables thinking. `WORKER_REASONING=auto` uses the model template default.\n6. Install then Load a small model (start with 0.8B on a low-RAM machine)
    from the dashboard. Verify a sample OpenAI-compatible request before
    granting access to private prompts.
 

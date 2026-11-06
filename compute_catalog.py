@@ -2,7 +2,7 @@
 CATALOG = {
     "qwen35-0.8b-q4": {
         "name": "Qwen3.5 0.8B Q4_K_M", "repo": "unsloth/Qwen3.5-0.8B-GGUF",
-        "file": "Qwen3.5-0.8B-Q4_K_M.gguf", "revision": "main",
+        "file": "Qwen3.5-0.8B-Q4_K_M.gguf", "revision": "463d2f83eebe018294a9fa14bb50fc6cd90b5a36",
         "size": 533000000,
         "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
         "ctx": 4096,
@@ -16,7 +16,7 @@ CATALOG = {
     },
     "qwen35-4b-q4": {
         "name": "Qwen3.5 4B Q4_K_M", "repo": "unsloth/Qwen3.5-4B-GGUF",
-        "file": "Qwen3.5-4B-Q4_K_M.gguf", "revision": "main",
+        "file": "Qwen3.5-4B-Q4_K_M.gguf", "revision": "16e0b78fbcd71f5624ada4b3b803c6302c1b8224",
         "size": 2740000000,
         "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
         "ctx": 4096,

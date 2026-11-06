@@ -104,3 +104,72 @@ def test_published_catalog_pins_revisions_and_integrity():
         assert re.fullmatch(r"[a-f0-9]{64}", model["sha256"]), model_id
         assert model["size"] > 0, model_id
         assert model["repo"].startswith("unsloth/"), model_id
+
+
+def test_inference_forwards_tiny_sse_chunks_before_upstream_completes(tmp_path, monkeypatch):
+    """SSE must be forwarded immediately, not held until 32768 bytes or EOF."""
+    import base64
+    from types import SimpleNamespace
+
+    worker = isolated_worker(tmp_path, monkeypatch)
+    worker.active = "test-model"
+    worker.process = SimpleNamespace(returncode=None)
+    release = asyncio.Event()
+
+    class FakeResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def aiter_bytes(self, chunk_size=None):
+            assert chunk_size is None, "A fixed chunk size delays small SSE frames"
+            yield b'data: {"test":"first"}\n\n'
+            await release.wait()
+            yield b'data: [DONE]\n\n'
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+
+    class Socket:
+        def __init__(self):
+            self.messages = asyncio.Queue()
+
+        async def send(self, raw):
+            await self.messages.put(json.loads(raw))
+
+    async def run():
+        socket = Socket()
+        task = asyncio.create_task(worker.inference(
+            socket, {
+                "id": "stream-1", "model": "test-model",
+                "payload": {"stream": True, "messages": [
+                    {"role": "user", "content": "Hello"}
+                ]},
+            }
+        ))
+        try:
+            first = await asyncio.wait_for(socket.messages.get(), 2)
+            assert first["type"] == "chunk", first
+            assert base64.b64decode(first["body"]) == b'data: {"test":"first"}\n\n'
+        finally:
+            release.set()
+        await asyncio.wait_for(task, 2)
+        second = await asyncio.wait_for(socket.messages.get(), 2)
+        end = await asyncio.wait_for(socket.messages.get(), 2)
+        assert base64.b64decode(second["body"]) == b'data: [DONE]\n\n'
+        assert end == {"type": "end", "id": "stream-1", "status": 200}
+
+    asyncio.run(run())

@@ -1,0 +1,26 @@
+services:
+  compute-worker:
+    image: ghcr.io/lukacek/simple-aiproxy-worker:latest
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: ${WORKER_MEMORY_LIMIT:-8g}
+    cpus: ${WORKER_CPUS:-4}
+    environment:
+      SIMPLEAI_PROXY_URL: ${SIMPLEAI_PROXY_URL:?Set HTTPS URL}
+      WORKER_ENROLLMENT_TOKEN: ${WORKER_ENROLLMENT_TOKEN:-}
+      WORKER_NAME: ${WORKER_NAME:-compute-worker}
+      WORKER_THREADS: ${WORKER_THREADS:-4}
+    volumes:
+      - worker-data:/data
+      - worker-models:/models
+    tmpfs:
+      - /tmp:size=128m
+
+volumes:
+  worker-data:
+  worker-models:

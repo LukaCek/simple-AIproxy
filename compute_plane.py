@@ -69,7 +69,26 @@ def _setup() -> None:
             status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS ComputePolicy (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            revision INTEGER NOT NULL,
+            models_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         """)
+        db.execute("INSERT OR IGNORE INTO ComputePolicy(id,revision,models_json,updated_at) VALUES(1,1,'[]',?)", (int(time.time()),))
+
+
+def _model_policy() -> dict[str, Any]:
+    """One global admin-maintained model target list for every remote worker."""
+    _setup()
+    with _db() as db:
+        row = db.execute("SELECT revision,models_json FROM ComputePolicy WHERE id=1").fetchone()
+    selected = json.loads(row["models_json"]) if row else []
+    if not isinstance(selected, list):
+        selected = []
+    return {"type": "policy", "revision": int(row["revision"]) if row else 1,
+            "models": [mid for mid in selected if isinstance(mid, str) and mid in CATALOG]}
 
 
 def _hash(secret: str) -> str:
@@ -109,6 +128,24 @@ def _public_node(row: dict[str, Any]) -> dict[str, Any]:
     models = dict(models)
     installed = models.get("installed")
     models["installed"] = [mid for mid in installed if isinstance(mid, str) and mid in CATALOG] if isinstance(installed, list) else []
+    capabilities = models.get("capabilities")
+    safe_capabilities = {}
+    if isinstance(capabilities, dict):
+        for mid, state in capabilities.items():
+            if mid not in CATALOG or not isinstance(state, dict):
+                continue
+            status_name = state.get("status")
+            if status_name not in ("untested", "testing", "supported", "unsupported", "error"):
+                status_name = "untested"
+            safe_capabilities[mid] = {
+                "status": status_name, "reason": str(state.get("reason") or "")[:240],
+                "tested_at": _nonnegative_int(state.get("tested_at")),
+                "test_seconds": max(0.0, min(float(state.get("test_seconds") or 0), 86400.0))
+                    if isinstance(state.get("test_seconds"), (int, float)) else 0.0,
+            }
+    models["capabilities"] = safe_capabilities
+    models["disk_used_bytes"] = _nonnegative_int(models.get("disk_used_bytes"))
+    models["disk_limit_bytes"] = _nonnegative_int(models.get("disk_limit_bytes"))
     return {
         "id": row["id"], "name": row["name"], "online": row["id"] in _connections,
         "allow_private": bool(row["allow_private"]), "revoked": bool(row["revoked"]),
@@ -248,7 +285,13 @@ def endpoints(model: str) -> list[dict[str, Any]]:
             models = json.loads(node["models_json"])
         except (ValueError, TypeError):
             continue
-        if models.get("active") != model_id or not models.get("ready"):
+        current_ready = models.get("active") == model_id and bool(models.get("ready"))
+        test_state = models.get("capabilities") if isinstance(models.get("capabilities"), dict) else {}
+        verified = isinstance(test_state.get(model_id), dict) and test_state[model_id].get("status") == "supported"
+        selected = _model_policy()["models"]
+        if selected and model_id not in selected:
+            continue
+        if not current_ready and not (selected and verified):
             continue
         result.append({
             "name": "compute-" + node["id"][:8], "api_mode": "compute_worker",
@@ -410,6 +453,11 @@ async def compute_ws(ws: WebSocket):
                 await old.ws.close(code=1012)
             _connections[node_id] = conn
         await conn.send({"type": "auth_ok", "protocol": 1})
+        policy = _model_policy()
+        # Avoid extra messages for the original manual-only protocol tests;
+        # send empty policies after an admin explicitly clears model targets.
+        if policy["revision"] > 1 or policy["models"]:
+            await conn.send(policy)
         with _db() as db:
             db.execute("UPDATE ComputeNodes SET last_seen=? WHERE id=?", (int(time.time()), node_id))
         while True:
@@ -494,6 +542,36 @@ async def catalog() -> dict[str, Any]:
     return {"models": CATALOG}
 
 
+@router.get("/admin/api/compute/model-policy", dependencies=[Depends(core.verify_admin)])
+async def read_model_policy() -> dict[str, Any]:
+    return _model_policy()
+
+
+@router.post("/admin/api/compute/model-policy", dependencies=[Depends(require_admin_write)])
+async def change_model_policy(request: Request) -> dict[str, Any]:
+    data = await request.json()
+    selected = data.get("models") if isinstance(data, dict) else None
+    if (not isinstance(selected, list) or len(selected) > len(CATALOG)
+            or any(not isinstance(mid, str) or mid not in CATALOG for mid in selected)
+            or len(set(selected)) != len(selected)):
+        raise HTTPException(400, "models must be unique entries from the approved catalog")
+    # Every save increases revision, allowing an explicit re-test without
+    # shipping an untrusted URL or arbitrary command to remote computers.
+    _setup()
+    with _db() as db:
+        row = db.execute("SELECT revision FROM ComputePolicy WHERE id=1").fetchone()
+        version = int(row["revision"]) + 1
+        db.execute("UPDATE ComputePolicy SET revision=?,models_json=?,updated_at=? WHERE id=1",
+                   (version, json.dumps(selected), int(time.time())))
+    policy = {"type": "policy", "revision": version, "models": selected}
+    for conn in list(_connections.values()):
+        try:
+            await conn.send(policy)
+        except Exception:
+            pass  # The worker fetches the latest policy on its next WSS reconnect.
+    return policy
+
+
 @router.post("/admin/api/compute/nodes/{node_id}/operations", dependencies=[Depends(require_admin_write)])
 async def start_operation(node_id: str, request: Request):
     data = await request.json()
@@ -541,6 +619,7 @@ async def admin_page(request: Request):
     return core.templates.TemplateResponse(
         request, "compute_nodes.html",
         {"nodes": [_public_node(dict(r)) for r in rows], "catalog": CATALOG,
+         "policy": _model_policy(),
          "recommendations": {r["id"]: model_recommendations(dict(r)) for r in rows}},
     )
 

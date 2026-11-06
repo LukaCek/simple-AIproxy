@@ -138,15 +138,18 @@ def install_model(models: Path, mid: str, limit: int, last_used: dict,
         key=lambda name: last_used.get(name, 0),
     )
     for other in candidates:
-        if used + max_download <= limit:
+        enough_quota = used + max_download <= limit
+        enough_physical = shutil.disk_usage(models).free >= max_download + MIN_HOST_FREE
+        if enough_quota and enough_physical:
             break
         remove_model(models, other)
         evicted.append(other)
         used = used_bytes(models)
 
-    if used + max_download > limit:
-        # Releases orphaned legacy Xet transfer cache. New worker downloads do
-        # not use this shared cache, so it can be removed safely here.
+    if (used + max_download > limit
+            or shutil.disk_usage(models).free < max_download + MIN_HOST_FREE):
+        # Release legacy Xet transfer cache when either the configured quota
+        # or actual host capacity is tight. New downloads never use Xet.
         transfer_cache = models / ".hf-cache" / "xet"
         if transfer_cache.is_dir():
             shutil.rmtree(transfer_cache)

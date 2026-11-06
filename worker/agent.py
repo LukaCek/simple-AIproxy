@@ -243,10 +243,14 @@ class Worker:
                     if res.status_code != 200:
                         body = await res.aread()
                         raise RuntimeError(f"llama.cpp HTTP {res.status_code}: {body[:160]!r}")
-                    async for part in res.aiter_bytes(chunk_size=32768):
-                        if part:
+                    # Do not request a fixed 32 KiB read: HTTPX would wait
+                    # for that much output (or EOF), defeating token-by-token SSE.
+                    # Bound each WSS message without buffering tiny SSE frames.
+                    async for part in res.aiter_bytes():
+                        for offset in range(0, len(part), 32768):
+                            piece = part[offset:offset + 32768]
                             await self.send(ws, {"type": "chunk", "id": cid,
-                                                 "body": base64.b64encode(part).decode()})
+                                                 "body": base64.b64encode(piece).decode()})
             await self.send(ws, {"type": "end", "id": cid, "status": 200})
         except asyncio.CancelledError:
             raise

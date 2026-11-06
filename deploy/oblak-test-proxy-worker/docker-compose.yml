@@ -165,7 +165,7 @@ services:
       REQUESTS_CA_BUNDLE: /tmp/staging-ca-bundle.pem
       WORKER_NAME: oblak-staging-worker
       WORKER_THREADS: "2"
-      WORKER_REASONING: "off"
+      WORKER_REASONING: "on"
     volumes:
       - worker-data:/data
       - worker-models:/models

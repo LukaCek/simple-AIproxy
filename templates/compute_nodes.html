@@ -14,6 +14,22 @@
       <p class="mt-2 text-sm">Use it in WORKER_ENROLLMENT_TOKEN inside worker/.env on the remote Docker host. Once enrolled, the worker stores its own identity.</p>
     </div>
   </div>
+  <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+    <h2 class="text-lg font-semibold">Models managed by SimpleAI Proxy</h2>
+    <p class="mt-2 text-sm text-slate-600">Choose the approved GGUF models each worker should test automatically. The first checked model is preferred for warm startup. Workers download, benchmark and report which models actually run; they switch on demand and evict old files within their own Compose disk cap.</p>
+    <form id="model-policy" class="mt-4 space-y-3">
+      {% for mid, info in catalog.items() %}
+      <label class="flex items-center gap-3 text-sm">
+        <input type="checkbox" name="models" value="{{ mid }}" {{ 'checked' if mid in policy.models else '' }} class="h-4 w-4">
+        <span>{{ info.name }} <span class="text-xs text-slate-500">({{ (info.size / 1073741824) | round(2) }} GiB)</span></span>
+      </label>
+      {% endfor %}
+      <div class="flex flex-wrap gap-3 items-center">
+        <button type="submit" class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white">Save &amp; send to workers</button>
+        <span class="text-xs text-slate-500">Policy version {{ policy.revision }} · Save again to re-test the selected models</span>
+      </div>
+    </form>
+  </div>
   <div id="notice" role="status" class="hidden rounded-lg border p-3 text-sm"></div>
   <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
   {% for node in nodes %}
@@ -32,14 +48,24 @@
         Ready: {{ node.models.get('active') if node.models.get('ready') else 'none' }}
         · Installed: {{ node.models.get('installed', []) | join(', ') or 'none' }}
       </p>
+      <p class="mt-1 text-xs text-slate-500">
+        Model storage: {{ (node.models.get('disk_used_bytes', 0) / 1073741824) | round(2) }} /
+        {{ (node.models.get('disk_limit_bytes', 0) / 1073741824) | round(2) }} GiB
+        (application-enforced quota)
+      </p>
       <div class="mt-4 rounded-xl border p-3 text-xs">
-        <strong>Model suitability (CPU estimate)</strong>
+        <strong>Model self-tests (actual CPU load + inference)</strong>
         <ul class="mt-2 space-y-1">
         {% for mid, recommendation in recommendations.get(node.id, {}).items() %}
+          {% set test = node.models.get('capabilities', {}).get(mid, {}) %}
           <li class="flex justify-between gap-2">
-            <span>{{ catalog[mid].name }}</span>
-            <span class="{{ 'text-green-700' if recommendation.grade == 'recommended' else 'text-amber-700' if recommendation.grade == 'possible' else 'text-slate-500' }}"
-                  title="{{ recommendation.reason }}">{{ recommendation.grade | replace('_',' ') | capitalize }}</span>
+            <span>{{ catalog[mid].name }}{% if mid in node.models.get('installed', []) %} · cached{% endif %}</span>
+            {% if test %}
+              <span class="{{ 'text-green-700' if test.status == 'supported' else 'text-amber-700' if test.status in ['testing','error'] else 'text-red-700' }}"
+                    title="{{ test.reason }}">{{ test.status | capitalize }}{% if test.status == 'supported' and test.test_seconds %} ({{ test.test_seconds }}s){% endif %}</span>
+            {% else %}
+              <span class="text-slate-500" title="Estimated fit only, not yet tested">{{ recommendation.grade | replace('_',' ') | capitalize }} (estimate)</span>
+            {% endif %}
           </li>
         {% endfor %}
         </ul>
@@ -87,6 +113,16 @@ async function post(path, data) {
   if(!res.ok) throw new Error(body.detail || "Request failed");
   return body;
 }
+document.getElementById("model-policy").onsubmit = async (event) => {
+  event.preventDefault();
+  const chosen = Array.from(document.querySelectorAll('#model-policy input[name="models"]:checked'))
+    .map(el => el.value);
+  try {
+    const result = await post("/admin/api/compute/model-policy", {models:chosen});
+    show("Model policy updated (revision "+result.revision+"). Workers will self-test the selected models.");
+    setTimeout(() => location.reload(), 1200);
+  } catch(err) { show(err.message); }
+};
 document.getElementById("enroll").onclick = async () => {
   try {
     const body = await post("/admin/api/compute/enrollments", {});

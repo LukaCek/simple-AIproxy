@@ -166,6 +166,7 @@ services:
       WORKER_NAME: oblak-staging-worker
       WORKER_THREADS: "2"
       WORKER_REASONING: "on"
+      WORKER_DISK_LIMIT_GB: "2"
     volumes:
       - worker-data:/data
       - worker-models:/models

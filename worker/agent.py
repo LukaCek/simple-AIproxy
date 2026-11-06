@@ -261,7 +261,7 @@ class Worker:
                 if version != self.policy_revision:
                     break
                 previous = self.capabilities.get(mid, {})
-                if not retest and previous.get("status") in ("supported", "unsupported"):
+                if not retest and previous.get("status") in ("supported", "unsupported", "error"):
                     continue
                 started = time.monotonic()
                 self.mark_model(mid, "testing")

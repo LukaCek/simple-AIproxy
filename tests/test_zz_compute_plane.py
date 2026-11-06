@@ -170,3 +170,33 @@ def test_trust_revocation_blocks_stale_routed_endpoint(tmp_path, monkeypatch):
                 assert False, "Revoked node unexpectedly received a public request"
             except HTTPException as exc:
                 assert exc.status_code == 403 and "revoked" in exc.detail
+
+
+def test_untrusted_telemetry_cannot_crash_dashboard(tmp_path, monkeypatch):
+    import time
+    import compute_plane
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            ws.send_json({
+                "type": "telemetry",
+                "hardware": {"arch": "x86_64", "memory_limit_bytes": "nonsense",
+                             "memory_available_bytes": None, "disk_free_bytes": True},
+                "models": {"active": "qwen35-2b-q4", "ready": False, "installed": "not-a-list"},
+            })
+            for _ in range(40):
+                data = client.get("/admin/api/compute/nodes", auth=ADMIN).json()["nodes"]
+                if data[0]["hardware"].get("arch") == "x86_64":
+                    break
+                time.sleep(0.025)
+            assert data[0]["hardware"]["memory_limit_bytes"] == 0
+            assert data[0]["models"]["installed"] == []
+            rec = client.get(
+                f"/admin/api/compute/nodes/{identity['node_id']}/recommendations", auth=ADMIN
+            )
+            assert rec.status_code == 200, rec.text
+            assert rec.json()["models"]["qwen35-2b-q4"]["grade"] == "unknown"
+            html = client.get("/admin/compute-nodes", auth=ADMIN)
+            assert html.status_code == 200, html.text

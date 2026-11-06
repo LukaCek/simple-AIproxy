@@ -21,6 +21,11 @@ PORT = 18228
 PROXY = os.environ["SIMPLEAI_PROXY_URL"].rstrip("/")
 TOKEN = os.getenv("WORKER_ENROLLMENT_TOKEN", "")
 NAME = os.getenv("WORKER_NAME", platform.node())[:80]
+# Qwen3.5 small models can spend a short response entirely on reasoning.
+# Default to concise, user-visible answers; opt in to thinking per worker.
+REASONING_MODE = os.getenv("WORKER_REASONING", "off").strip().lower()
+if REASONING_MODE not in {"on", "off", "auto"}:
+    raise ValueError("WORKER_REASONING must be on, off, or auto")
 
 
 def memory_limit():
@@ -176,7 +181,7 @@ class Worker:
             "--host", "127.0.0.1", "--port", str(PORT),
             "-t", str(min(int(os.getenv("WORKER_THREADS", "4")), cpu_count())),
             "-c", str(CATALOG[mid]["ctx"]), "-np", "1", "-ngl", "0",
-            "--no-webui", "--no-mmproj", "--jinja",
+            "--no-webui", "--no-mmproj", "--jinja", "--reasoning", REASONING_MODE,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         self.active = mid

@@ -112,7 +112,6 @@ services:
         condition: service_healthy
     volumes:
       - proxy-state:/state:ro
-      - worker-data:/worker-data:ro
       - enrollment:/enrollment
     entrypoint:
       - python
@@ -125,27 +124,26 @@ services:
         from urllib.request import Request, urlopen
 
         token_file = Path('/enrollment/token')
-        if Path('/worker-data/identity.json').exists():
-            print('Worker has an existing identity; enrollment not needed')
-        else:
-            password = Path('/state/admin-password').read_text().strip()
-            credentials = base64.b64encode(f'staging-admin:{password}'.encode()).decode()
-            req = Request(
-                'http://proxy:8000/admin/api/compute/enrollments',
-                data=b'{}',
-                headers={
-                    'Authorization': f'Basic {credentials}',
-                    'X-SimpleAI-Admin-Action': '1',
-                    'Content-Type': 'application/json',
-                },
-                method='POST',
-            )
-            with urlopen(req, timeout=20) as response:
-                token = json.load(response)['token']
-            token_file.write_text(token)
-            os.chmod(token_file, 0o600)
-            os.chown(token_file, 10001, 10001)
-            print('Created a one-time staging worker enrollment token')
+        password = Path('/state/admin-password').read_text().strip()
+        credentials = base64.b64encode(f'staging-admin:{password}'.encode()).decode()
+        req = Request(
+            'http://proxy:8000/admin/api/compute/enrollments',
+            data=b'{}',
+            headers={
+                'Authorization': f'Basic {credentials}',
+                'X-SimpleAI-Admin-Action': '1',
+                'Content-Type': 'application/json',
+            },
+            method='POST',
+        )
+        with urlopen(req, timeout=20) as response:
+            token = json.load(response)['token']
+        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(token)
+        os.chmod(token_file, 0o600)
+        os.chown(token_file, 10001, 10001)
+        print('Created a one-time staging worker enrollment token')
 
   worker:
     build:

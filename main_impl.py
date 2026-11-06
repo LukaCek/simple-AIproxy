@@ -2567,6 +2567,11 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
         provider_name = str(endpoint.get("name", "unknown"))
         provider_model = str(endpoint.get("model") or "")
         provider_payload = prepare_provider_chat_payload(payload, endpoint, provider_model)
+        if endpoint.get("api_mode") == "compute_worker":
+            # Validate request controls before the generic provider fallback
+            # handler, so malformed think/budget fields return HTTP 400.
+            from compute_plane import prepare_worker_thinking
+            provider_payload = prepare_worker_thinking(provider_payload)
         # Private by default: untrusted machines must not receive prompts unless
         # the API caller explicitly marks the request public.
         if endpoint.get("api_mode") == "compute_worker" and not endpoint.get("allow_private") and payload.get("aiproxy_visibility") != "public":

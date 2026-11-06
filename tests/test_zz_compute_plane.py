@@ -297,42 +297,83 @@ def test_local_cpu_worker_respects_small_token_limit():
 
 
 def test_proxy_thinking_defaults_on_and_explicit_override():
-    """The proxy creates the llama.cpp per-request knob only when requested."""
+    """Every thinking request has a budget and reserves response tokens."""
     import compute_plane
     from fastapi import HTTPException
     import pytest
 
-    body = {"messages": [{"role": "user", "content": "Hello"}], "stream": True}
+    body = {"messages": [{"role": "user", "content": "Hello"}],
+            "stream": True, "max_tokens": 512}
     original = body.copy()
     implicit = compute_plane.prepare_worker_thinking(body)
-    assert implicit == body
+    assert implicit["reasoning_budget_tokens"] == 128
+    assert implicit["max_tokens"] == 512
     assert implicit is not body
     assert body == original
 
     explicit_on = compute_plane.prepare_worker_thinking({**body, "think": True})
     explicit_off = compute_plane.prepare_worker_thinking({**body, "think": False})
     assert explicit_on["chat_template_kwargs"]["enable_thinking"] is True
+    assert explicit_on["reasoning_budget_tokens"] == 128
     assert explicit_off["chat_template_kwargs"]["enable_thinking"] is False
+    assert "reasoning_budget_tokens" not in explicit_off
     assert "think" not in explicit_on and "think" not in explicit_off
 
-    # Explicit proxy setting wins over template kwargs.
+    # No max_tokens: still apply a bounded default so CPU requests do not spin.
+    assert compute_plane.prepare_worker_thinking({"messages": []})[
+        "reasoning_budget_tokens"] == 192
+
+    # Explicit settings win over template defaults without restarting llama.cpp.
     priority = compute_plane.prepare_worker_thinking({
         **body, "think": False, "chat_template_kwargs": {"enable_thinking": True, "foo": 1},
     })
     assert priority["chat_template_kwargs"] == {"enable_thinking": False, "foo": 1}
 
-    # OpenAI reasoning_effort=none is also supported by pinned llama.cpp.
     assert compute_plane.prepare_worker_thinking({
+        **body, "think": True,
+        "chat_template_kwargs": {"enable_thinking": False}
+    })["reasoning_budget_tokens"] == 128
+    assert "reasoning_budget_tokens" not in compute_plane.prepare_worker_thinking({
+        **body, "chat_template_kwargs": {"enable_thinking": False}
+    })
+
+    assert compute_plane.prepare_worker_thinking({
+        **body, "think": True, "reasoning_budget_tokens": 96,
+    })["reasoning_budget_tokens"] == 96
+    assert compute_plane.prepare_worker_thinking({
+        **body, "thinking_budget_tokens": 120,
+    })["reasoning_budget_tokens"] == 120
+    assert compute_plane.prepare_worker_thinking({
+        **body, "max_tokens": 96,
+    })["reasoning_budget_tokens"] == 24
+    assert compute_plane.prepare_worker_thinking({
+        **body, "max_tokens": 2000,
+    })["reasoning_budget_tokens"] == 256
+
+    # OpenAI reasoning_effort=none is supported by pinned llama.cpp.
+    assert "reasoning_budget_tokens" not in compute_plane.prepare_worker_thinking({
         **body, "reasoning_effort": "none",
-    })["reasoning_effort"] == "none"
+    })
 
     for invalid in (None, "false", 0, 1, [], {}):
         with pytest.raises(HTTPException) as err:
             compute_plane.prepare_worker_thinking({**body, "think": invalid})
         assert err.value.status_code == 400
+    for invalid in (-1, 512, "128", True):
+        with pytest.raises(HTTPException) as err:
+            compute_plane.prepare_worker_thinking({
+                **body, "think": True, "reasoning_budget_tokens": invalid,
+            })
+        assert err.value.status_code == 400
     with pytest.raises(HTTPException):
-        compute_plane.prepare_worker_thinking({**body, "think": True,
-            "reasoning_effort": "none"})
+        compute_plane.prepare_worker_thinking({
+            **body, "think": True, "reasoning_effort": "none",
+        })
     with pytest.raises(HTTPException):
-        compute_plane.prepare_worker_thinking({**body, "think": False,
-            "chat_template_kwargs": "not-an-object"})
+        compute_plane.prepare_worker_thinking({
+            **body, "think": False, "chat_template_kwargs": "not-an-object",
+        })
+    with pytest.raises(HTTPException):
+        compute_plane.prepare_worker_thinking({
+            **body, "thinking_budget_tokens": 32, "reasoning_budget_tokens": 64,
+        })

@@ -258,11 +258,40 @@ def endpoints(model: str) -> list[dict[str, Any]]:
     return result
 
 
+def prepare_worker_thinking(payload: dict[str, Any]) -> dict[str, Any]:
+    """Turn a proxy-facing think bool into llama.cpp's per-request template knob.
+
+    The worker defaults to reasoning ON; an omitted flag is intentionally
+    passed through without overriding other OpenAI-compatible options.
+    """
+    body = dict(payload)
+    if "think" not in body:
+        return body
+
+    think = body.pop("think")
+    if type(think) is not bool:
+        raise HTTPException(400, "think must be true or false")
+
+    original_kwargs = body.get("chat_template_kwargs", {})
+    if not isinstance(original_kwargs, dict):
+        raise HTTPException(400, "chat_template_kwargs must be an object")
+    if think and body.get("reasoning_effort") == "none":
+        raise HTTPException(400, "think=true conflicts with reasoning_effort=none")
+
+    # Explicit think has priority over a template default; each request
+    # switches the Jinja prompt mode without restarting llama-server.
+    body["chat_template_kwargs"] = {
+        **original_kwargs, "enable_thinking": think,
+    }
+    return body
+
+
 async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response:
-    """Bridge unchanged OpenAI-compatible inference over the node's WSS."""
+    """Bridge OpenAI-compatible inference over the node's WSS."""
     visibility = payload.pop("aiproxy_visibility", "private")
     if visibility not in ("private", "public"):
         raise HTTPException(400, "Invalid aiproxy_visibility")
+    payload = prepare_worker_thinking(payload)
     # Endpoint candidates are snapshots: re-check DB consent immediately
     # before forwarding so an admin trust change/revocation takes effect.
     node_id = endpoint["node_id"]

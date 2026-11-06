@@ -232,9 +232,14 @@ async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response
     visibility = payload.pop("aiproxy_visibility", "private")
     if visibility not in ("private", "public"):
         raise HTTPException(400, "Invalid aiproxy_visibility")
-    if visibility == "private" and not endpoint["allow_private"]:
-        raise HTTPException(403, "This compute node is not trusted for private requests")
+    # Endpoint candidates are snapshots: re-check DB consent immediately
+    # before forwarding so an admin trust change/revocation takes effect.
     node_id = endpoint["node_id"]
+    current = _record(node_id)
+    if not current or current["revoked"]:
+        raise HTTPException(403, "Compute node has been revoked or removed")
+    if visibility == "private" and not bool(current["allow_private"]):
+        raise HTTPException(403, "This compute node is not trusted for private requests")
     if not payload.get("stream"):
         chunks: list[bytes] = []
         total = 0

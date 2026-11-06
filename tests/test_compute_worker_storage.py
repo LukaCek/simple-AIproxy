@@ -160,3 +160,45 @@ def test_policy_auto_benchmarks_and_on_demand_model_swap(tmp_path, monkeypatch):
         assert worker.active is None
 
     asyncio.run(run())
+
+
+def test_reduced_compose_quota_prunes_cached_models(tmp_path, monkeypatch):
+    content = {"a": b"a"*1000, "b": b"b"*1000}
+    monkeypatch.setattr(storage, "CATALOG", catalog_for(content))
+    (tmp_path / "a.gguf").write_bytes(content["a"])
+    (tmp_path / "b.gguf").write_bytes(content["b"])
+    evicted = storage.prune_to_limit(tmp_path, 1200, {"a": 1, "b": 9})
+    assert evicted == ["a"]
+    assert not (tmp_path / "a.gguf").exists()
+    assert (tmp_path / "b.gguf").exists()
+    assert storage.used_bytes(tmp_path) <= 1200
+
+
+def test_stale_part_file_is_removed_before_install_quota_check(tmp_path, monkeypatch):
+    content = b"safe model"
+    monkeypatch.setattr(storage, "CATALOG", catalog_for({"a": content}))
+    monkeypatch.setattr(storage, "MIN_HOST_FREE", 0)
+    monkeypatch.setattr(storage, "hf_hub_url", lambda **kwargs: "https://huggingface.co/test/resolve/sha")
+    monkeypatch.setattr(storage.httpx, "Client", lambda **kwargs: Client(content))
+    part = tmp_path / "a.part"
+    part.write_bytes(b"x" * (16 * storage.MIB))
+    limit = 16 * storage.MIB + 1024
+    storage.install_model(tmp_path, "a", limit, {})
+    assert (tmp_path / "a.gguf").read_bytes() == content
+    assert not part.exists()
+
+
+def test_interrupted_benchmark_is_marked_error_on_worker_restart(tmp_path, monkeypatch):
+    catalog = catalog_for({"test": b"test-model"})
+    monkeypatch.setattr(agent, "DATA", tmp_path / "data")
+    monkeypatch.setattr(agent, "MODELS", tmp_path / "models")
+    monkeypatch.setattr(agent, "CATALOG", catalog)
+    monkeypatch.setattr(storage, "CATALOG", catalog)
+    monkeypatch.setattr(agent, "DISK_LIMIT_BYTES", storage.GIB)
+    (tmp_path / "models").mkdir()
+    first = agent.Worker()
+    first.mark_model("test", "testing")
+    restarted = agent.Worker()
+    status = restarted.status()["capabilities"]["test"]
+    assert status["status"] == "error"
+    assert "stopped" in status["reason"].lower()

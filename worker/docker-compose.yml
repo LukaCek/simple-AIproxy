@@ -1,3 +1,6 @@
+# SimpleAI Compute Worker - edit ONLY this Compose file on the worker host.
+# The administrator chooses which GGUF models to test/run inside SimpleAI Proxy.
+# The worker downloads and benchmarks those models automatically after enrollment.
 services:
   compute-worker:
     image: ghcr.io/lukacek/simple-aiproxy-worker:latest
@@ -8,14 +11,20 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 256
-    mem_limit: ${WORKER_MEMORY_LIMIT:-8g}
-    cpus: ${WORKER_CPUS:-4}
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: 4.0
     environment:
-      SIMPLEAI_PROXY_URL: ${SIMPLEAI_PROXY_URL:?Set HTTPS URL}
-      WORKER_ENROLLMENT_TOKEN: ${WORKER_ENROLLMENT_TOKEN:-}
-      WORKER_NAME: ${WORKER_NAME:-compute-worker}
-      WORKER_THREADS: ${WORKER_THREADS:-4}
-      WORKER_REASONING: ${WORKER_REASONING:-on}
+      SIMPLEAI_PROXY_URL: https://REPLACE_WITH_YOUR_PROXY_DOMAIN
+      # One-time token from Proxy /admin/compute-nodes; no longer needed after
+      # successful first connection (identity persists in worker-data volume).
+      WORKER_ENROLLMENT_TOKEN: REPLACE_WITH_ONE_TIME_ENROLLMENT_TOKEN
+      WORKER_NAME: my-compute-worker
+      WORKER_THREADS: "4"
+      WORKER_REASONING: "on"
+      # Storage *application* quota in GiB (includes models and temporary .part
+      # downloads, independent of the physical named-volume capacity).
+      WORKER_DISK_LIMIT_GB: "8"
     volumes:
       - worker-data:/data
       - worker-models:/models

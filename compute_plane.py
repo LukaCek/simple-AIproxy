@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import base64
 import hashlib
 import json
@@ -19,16 +20,36 @@ import main_impl as core
 from compute_catalog import CATALOG
 
 router = APIRouter()
+
+
+def require_admin_write(request: Request, _admin=Depends(core.verify_admin)) -> None:
+    # Blocks cross-origin forms using cached HTTP Basic credentials.
+    if request.headers.get("x-simpleai-admin-action") != "1":
+        raise HTTPException(403, "Missing admin action header")
+    origin = request.headers.get("origin")
+    if origin:
+        from urllib.parse import urlsplit
+        if urlsplit(origin).netloc != request.url.netloc:
+            raise HTTPException(403, "Origin mismatch")
+
 _connections: dict[str, "NodeConnection"] = {}
 _registry_lock = asyncio.Lock()
 _installed = False
 
 
-def _db() -> sqlite3.Connection:
+@contextmanager
+def _db():
     db = sqlite3.connect(str(core.DB_PATH), timeout=15)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=15000")
-    return db
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def _setup() -> None:
@@ -198,7 +219,7 @@ async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response
     return StreamingResponse(_stream(node_id, endpoint["model"], payload), media_type="text/event-stream")
 
 
-@router.post("/admin/api/compute/enrollments", dependencies=[Depends(core.verify_admin)])
+@router.post("/admin/api/compute/enrollments", dependencies=[Depends(require_admin_write)])
 async def create_enrollment() -> dict[str, Any]:
     _setup()
     token = secrets.token_urlsafe(32)
@@ -234,7 +255,7 @@ async def compute_ws(ws: WebSocket):
     conn = None
     try:
         data = await asyncio.wait_for(ws.receive_json(), timeout=15)
-        if data.get("type") != "auth":
+        if data.get("type") != "auth" or data.get("protocol") != 1:
             await ws.close(code=1008)
             return
         node_id = str(data.get("node_id", ""))
@@ -299,7 +320,7 @@ async def list_nodes() -> dict[str, Any]:
     return {"nodes": [_public_node(dict(row)) for row in rows]}
 
 
-@router.post("/admin/api/compute/nodes/{node_id}/trust", dependencies=[Depends(core.verify_admin)])
+@router.post("/admin/api/compute/nodes/{node_id}/trust", dependencies=[Depends(require_admin_write)])
 async def set_trust(node_id: str, request: Request):
     data = await request.json()
     if type(data.get("allow_private")) is not bool:
@@ -312,7 +333,7 @@ async def set_trust(node_id: str, request: Request):
     return {"node_id": node_id, "allow_private": data["allow_private"]}
 
 
-@router.post("/admin/api/compute/nodes/{node_id}/revoke", dependencies=[Depends(core.verify_admin)])
+@router.post("/admin/api/compute/nodes/{node_id}/revoke", dependencies=[Depends(require_admin_write)])
 async def revoke_node(node_id: str):
     with _db() as db:
         result = db.execute("UPDATE ComputeNodes SET revoked=1,allow_private=0 WHERE id=?", (node_id,))
@@ -329,7 +350,7 @@ async def catalog() -> dict[str, Any]:
     return {"models": CATALOG}
 
 
-@router.post("/admin/api/compute/nodes/{node_id}/operations", dependencies=[Depends(core.verify_admin)])
+@router.post("/admin/api/compute/nodes/{node_id}/operations", dependencies=[Depends(require_admin_write)])
 async def start_operation(node_id: str, request: Request):
     data = await request.json()
     action = str(data.get("action") or "")

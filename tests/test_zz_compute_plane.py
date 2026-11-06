@@ -432,6 +432,39 @@ def test_admin_model_policy_pushes_wss_and_routes_verified_cached_models(tmp_pat
             assert nodes[0]["models"]["capabilities"]["qwen35-2b-q4"]["status"] == "supported"
             assert nodes[0]["models"]["disk_limit_bytes"] == 2*1024**3
 
+            # A supported but currently unloaded model is exposed to routing,
+            # but it never receives a private prompt on an untrusted friend PC.
+            private = client.post(
+                "/v1/chat/completions",
+                json={"model": "local/qwen35-2b-q4",
+                      "messages": [{"role": "user", "content": "private secret"}]},
+                headers={"Authorization": "Bearer local-test-key"},
+            )
+            assert private.status_code in (403, 502)
+            assert "not trusted" in private.text.lower()
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    client.post, "/v1/chat/completions",
+                    json={"model": "local/qwen35-2b-q4",
+                          "aiproxy_visibility": "public",
+                          "messages": [{"role": "user", "content": "public request"}]},
+                    headers={"Authorization": "Bearer local-test-key"},
+                )
+                run = ws.receive_json()
+                assert run["type"] == "run"
+                assert run["model"] == "qwen35-2b-q4"
+                assert run["payload"]["messages"][0]["content"] == "public request"
+                reply = {"id": "chatcmpl-test", "object": "chat.completion",
+                         "choices": [{"index": 0, "message":
+                          {"role": "assistant", "content": "Ready"}, "finish_reason": "stop"}]}
+                ws.send_json({"type": "chunk", "id": run["id"],
+                              "body": base64.b64encode(json.dumps(reply).encode()).decode()})
+                ws.send_json({"type": "end", "id": run["id"], "status": 200})
+                answer = future.result(timeout=10)
+            assert answer.status_code == 200, answer.text
+            assert answer.json()["choices"][0]["message"]["content"] == "Ready"
+
             # Clearing the desired list disables *all* managed model routes.
             cleared = client.post(policy_url, auth=ADMIN, headers=write,
                                   json={"models": []})

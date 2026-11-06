@@ -173,3 +173,39 @@ def test_inference_forwards_tiny_sse_chunks_before_upstream_completes(tmp_path, 
         assert end == {"type": "end", "id": "stream-1", "status": 200}
 
     asyncio.run(run())
+
+
+def test_load_explicitly_disables_reasoning_by_default(tmp_path, monkeypatch):
+    """Qwen3.5 small responses should not spend all short output on thinking."""
+    worker = isolated_worker(tmp_path, monkeypatch)
+    model = agent.model_file("test-model")
+    model.write_bytes(b"small deterministic model")
+    monkeypatch.setattr(agent, "REASONING_MODE", "off")
+    monkeypatch.setattr(agent, "memory_limit", lambda: 4 * 1024**3)
+    monkeypatch.setattr(agent, "memory_available", lambda: 4 * 1024**3)
+    commands = []
+
+    class FakeProcess:
+        returncode = None
+
+    async def fake_process(*args, **kwargs):
+        commands.append(args)
+        return FakeProcess()
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(agent.asyncio, "create_subprocess_exec", fake_process)
+    monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    asyncio.run(worker.load("test-model"))
+    assert worker.active == "test-model"
+    assert commands
+    cmd = commands[0]
+    assert cmd[cmd.index("--reasoning") + 1] == "off"

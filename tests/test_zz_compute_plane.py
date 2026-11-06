@@ -220,8 +220,8 @@ def test_real_wss_sse_chunk_passthrough(tmp_path, monkeypatch):
                 time.sleep(0.02)
             assert compute_plane.endpoints("local/qwen35-0.8b-q4")
             expected = (
-                b'data: {"id":"stream","choices":[{"index":0,"delta":{"content":"Hello"}}]}\\n\\n'
-                b'data: [DONE]\\n\\n'
+                b'data: {"id":"stream","choices":[{"index":0,"delta":{"content":"Hello"}}]}'
+                + bytes((10, 10)) + b'data: [DONE]' + bytes((10, 10))
             )
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(

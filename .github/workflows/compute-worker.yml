@@ -7,6 +7,7 @@ on:
       - "compute_catalog.py"
       - "compute_plane.py"
       - "tests/test_zz_compute_plane.py"
+      - "tests/test_worker_agent.py"
       - "tests/compute_streaming_check.py"
       - ".github/workflows/compute-worker.yml"
   push:
@@ -36,8 +37,8 @@ jobs:
       - name: Check Python syntax and test control plane
         run: |
           python -m compileall -q compute_catalog.py compute_plane.py worker/agent.py
-          python -m pip install -r requirements.txt pytest
-          pytest -q tests/test_zz_compute_plane.py
+          python -m pip install -r requirements.txt -r worker/requirements.txt pytest
+          pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py
           pytest -q tests/compute_streaming_check.py
           docker compose --env-file worker/.env.example -f worker/docker-compose.yml config --quiet
 

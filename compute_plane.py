@@ -276,10 +276,9 @@ def endpoints(model: str) -> list[dict[str, Any]]:
     model_id = model.partition("/")[2]
     if model_id not in CATALOG:
         return []
-    _setup()
+    policy = _model_policy()
     with _db() as db:
         rows = db.execute("SELECT * FROM ComputeNodes WHERE revoked=0 ORDER BY allow_private DESC, last_seen DESC").fetchall()
-    policy = _model_policy()
     selected = policy["models"]
     managed = policy["revision"] > 1
     result = []

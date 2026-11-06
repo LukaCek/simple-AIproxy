@@ -377,3 +377,65 @@ def test_proxy_thinking_defaults_on_and_explicit_override():
         compute_plane.prepare_worker_thinking({
             **body, "thinking_budget_tokens": 32, "reasoning_budget_tokens": 64,
         })
+
+
+def test_admin_model_policy_pushes_wss_and_routes_verified_cached_models(tmp_path, monkeypatch):
+    """Select models at proxy only; a verified model routes even if not loaded."""
+    import time
+    import compute_plane
+
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        write = {"X-SimpleAI-Admin-Action": "1"}
+        policy_url = "/admin/api/compute/model-policy"
+        assert client.get(policy_url, auth=ADMIN).json()["models"] == []
+        assert client.post(policy_url, auth=ADMIN, headers=write,
+                           json={"models": ["unknown-id"]}).status_code == 400
+        assert client.post(policy_url, auth=ADMIN, headers=write,
+                           json={"models": ["qwen35-0.8b-q4"] * 2}).status_code == 400
+        assert client.post(policy_url, auth=ADMIN,
+                           json={"models": ["qwen35-0.8b-q4"]}).status_code == 403
+
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            saved = client.post(
+                policy_url, auth=ADMIN, headers=write,
+                json={"models": ["qwen35-0.8b-q4", "qwen35-2b-q4"]},
+            )
+            assert saved.status_code == 200, saved.text
+            message = ws.receive_json()
+            assert message["type"] == "policy"
+            assert message["models"] == ["qwen35-0.8b-q4", "qwen35-2b-q4"]
+            ws.send_json({"type": "telemetry",
+                          "hardware": {"cpus": 2, "memory_limit_bytes": 2*1024**3},
+                          "models": {
+                              "installed": ["qwen35-0.8b-q4"],
+                              "active": "qwen35-0.8b-q4", "ready": True,
+                              "disk_used_bytes": 500000000,
+                              "disk_limit_bytes": 2*1024**3,
+                              "capabilities": {
+                                  "qwen35-0.8b-q4": {"status": "supported",
+                                      "reason": "Actual inference passed"},
+                                  "qwen35-2b-q4": {"status": "supported",
+                                      "reason": "Passed, unloaded"},
+                              },
+                          }})
+            for _ in range(100):
+                if compute_plane.endpoints("local/qwen35-2b-q4"):
+                    break
+                time.sleep(0.02)
+            endpoints = compute_plane.endpoints("local/qwen35-2b-q4")
+            assert len(endpoints) == 1
+            assert endpoints[0]["model"] == "qwen35-2b-q4"
+            nodes = client.get("/admin/api/compute/nodes", auth=ADMIN).json()["nodes"]
+            assert nodes[0]["models"]["capabilities"]["qwen35-2b-q4"]["status"] == "supported"
+            assert nodes[0]["models"]["disk_limit_bytes"] == 2*1024**3
+
+            # Clearing the desired list disables *all* managed model routes.
+            cleared = client.post(policy_url, auth=ADMIN, headers=write,
+                                  json={"models": []})
+            assert cleared.status_code == 200
+            assert ws.receive_json()["models"] == []
+            assert compute_plane.endpoints("local/qwen35-2b-q4") == []
+            assert compute_plane.endpoints("local/qwen35-0.8b-q4") == []

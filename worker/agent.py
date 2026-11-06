@@ -209,7 +209,7 @@ class Worker:
         self._save_state()
 
     async def ensure_installed(self, mid):
-        evicted = await asyncio.to_thread(download, mid, self.last_used)
+        evicted = await asyncio.to_thread(download, mid, self.last_used, {self.active} if self.active else set())
         self.last_used[mid] = time.time()
         self._save_state()
         return evicted

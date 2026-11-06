@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4 libgomp1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=llama-build /src/llama.cpp/build/bin/ /usr/local/bin/
-ENV LD_LIBRARY_PATH=/usr/local/bin PYTHONUNBUFFERED=1
+ENV LD_LIBRARY_PATH=/usr/local/bin PYTHONUNBUFFERED=1 HOME=/data HF_HOME=/models/.hf-cache HF_XET_CACHE=/models/.hf-cache/xet
 WORKDIR /app
 COPY worker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt

@@ -72,6 +72,32 @@ def remove_model(models: Path, model: str) -> None:
         shutil.rmtree(cache)
 
 
+def prune_to_limit(models: Path, limit: int, last_used: dict) -> list[str]:
+    """Enforce a reduced quota on previously cached models at worker startup."""
+    evicted = []
+    if used_bytes(models) <= limit:
+        return evicted
+    cached = sorted(
+        (mid for mid in CATALOG
+         if target_path(models, mid).exists()
+         or (models / ".hf-cache" / mid).is_dir()),
+        key=lambda mid: last_used.get(mid, 0),
+    )
+    for mid in cached:
+        if used_bytes(models) <= limit:
+            break
+        remove_model(models, mid)
+        evicted.append(mid)
+    # Legacy Hugging Face Xet transfer cache is not needed by bounded
+    # direct-download worker. Remove stale shared transfer bytes if required.
+    xet = models / ".hf-cache" / "xet"
+    if used_bytes(models) > limit and xet.is_dir():
+        shutil.rmtree(xet)
+    if used_bytes(models) > limit:
+        raise RuntimeError("Existing model-store files exceed configured disk quota")
+    return evicted
+
+
 def install_model(models: Path, mid: str, limit: int, last_used: dict,
                   protected: set[str] | None = None) -> list[str]:
     """Download within model-store cap; reclaim old cached files if necessary.

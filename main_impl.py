@@ -511,7 +511,10 @@ def clamp_completion_token_limit(payload: Dict[str, Any]) -> None:
 def prepare_provider_chat_payload(payload: Dict[str, Any], endpoint: Dict[str, Any], provider_model: str) -> Dict[str, Any]:
     provider_payload = dict(payload)
     provider_payload["model"] = provider_model
-    clamp_completion_token_limit(provider_payload)
+    # The global minimum is for upstream providers. A limited CPU worker must
+    # honor small completion caps; inflating 64 tokens to 1024 can take minutes.
+    if endpoint.get("api_mode") != "compute_worker":
+        clamp_completion_token_limit(provider_payload)
     # Ollama thinking/reasoning models can spend a small Home Assistant token
     # budget entirely in `message.reasoning`, then return empty content with
     # finish_reason=length. Keep thinking enabled by default and solve the HA

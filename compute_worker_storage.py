@@ -140,6 +140,13 @@ def install_model(models: Path, mid: str, limit: int, last_used: dict,
         used = used_bytes(models)
 
     if used + max_download > limit:
+        # Releases orphaned legacy Xet transfer cache. New worker downloads do
+        # not use this shared cache, so it can be removed safely here.
+        transfer_cache = models / ".hf-cache" / "xet"
+        if transfer_cache.is_dir():
+            shutil.rmtree(transfer_cache)
+            used = used_bytes(models)
+    if used + max_download > limit:
         raise RuntimeError("Not enough quota; no evictable cached models")
     if shutil.disk_usage(models).free < max_download + MIN_HOST_FREE:
         raise RuntimeError("Not enough physical disk space")

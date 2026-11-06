@@ -17,6 +17,7 @@ os.environ.setdefault("SIMPLEAI_PROXY_URL", "https://example.test")
 pytest.importorskip("huggingface_hub")
 pytest.importorskip("websockets.asyncio.client")
 from worker import agent
+import compute_worker_storage as storage
 
 
 def isolated_worker(tmp_path, monkeypatch, content=b"small deterministic model"):
@@ -26,31 +27,62 @@ def isolated_worker(tmp_path, monkeypatch, content=b"small deterministic model")
     monkeypatch.setattr(agent, "MODELS", models)
     monkeypatch.setattr(agent, "DATA", data)
     monkeypatch.setattr(agent, "IDENTITY", data / "identity.json")
-    monkeypatch.setattr(agent, "CATALOG", {
-        "test-model": {
-            "repo": "test/repo",
-            "file": "model.gguf",
-            "revision": "pinned-revision",
-            "size": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "ctx": 4096,
-        },
-    })
+    fake_catalog = {"test-model": {
+        "repo": "test/repo",
+        "file": "model.gguf",
+        "revision": "pinned-revision",
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "ctx": 4096,
+    }}
+    monkeypatch.setattr(agent, "CATALOG", fake_catalog)
+    monkeypatch.setattr(storage, "CATALOG", fake_catalog)
     return agent.Worker()
 
 
-def test_delete_removes_downloaded_model_and_multi_gb_cache(tmp_path, monkeypatch):
-    worker = isolated_worker(tmp_path, monkeypatch)
-    expected_cache = agent.MODELS / ".hf-cache" / "test-model"
+class FakeDownloadResponse:
+    def __init__(self, content):
+        self.content = content
 
-    def fake_download(**kwargs):
-        assert Path(kwargs["cache_dir"]) == expected_cache
-        path = expected_cache / "blobs" / "test-blob"
-        path.parent.mkdir(parents=True)
-        path.write_bytes(b"small deterministic model")
-        return str(path)
+    def __enter__(self):
+        return self
 
-    monkeypatch.setattr(agent, "hf_hub_download", fake_download)
+    def __exit__(self, *args):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_bytes(self, chunk_size):
+        assert chunk_size > 0
+        yield self.content
+
+
+class FakeDownloadClient:
+    def __init__(self, content):
+        self.content = content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def stream(self, method, url):
+        assert method == "GET" and "resolve" in url
+        return FakeDownloadResponse(self.content)
+
+
+def mock_model_download(monkeypatch, content):
+    monkeypatch.setattr(storage.httpx, "Client", lambda **kwargs: FakeDownloadClient(content))
+    monkeypatch.setattr(storage, "hf_hub_url",
+                        lambda **kwargs: "https://huggingface.co/test/repo/resolve/pinned-revision/model.gguf")
+
+
+def test_install_then_delete_reclaims_model_and_legacy_cache(tmp_path, monkeypatch):
+    content = b"small deterministic model"
+    worker = isolated_worker(tmp_path, monkeypatch, content)
+    mock_model_download(monkeypatch, content)
 
     class Socket:
         def __init__(self):
@@ -63,12 +95,16 @@ def test_delete_removes_downloaded_model_and_multi_gb_cache(tmp_path, monkeypatc
         sock = Socket()
         await worker.command(sock, {"id": "install-1", "action": "install", "model": "test-model"})
         installed = agent.model_file("test-model")
-        assert installed.is_symlink() and installed.exists()
-        assert expected_cache.is_dir()
+        assert installed.is_file() and not installed.is_symlink()
+        assert installed.read_bytes() == content
         assert sock.messages[0] == {"type": "result", "id": "install-1", "ok": True}
+        # Legacy initial installations kept a per-model duplicate HF cache.
+        legacy = agent.MODELS / ".hf-cache" / "test-model"
+        legacy.mkdir(parents=True)
+        (legacy / "blob").write_bytes(content)
         await worker.command(sock, {"id": "delete-1", "action": "delete", "model": "test-model"})
-        assert not installed.exists() and not installed.is_symlink()
-        assert not expected_cache.exists(), "Deleting the symlink alone leaks model data"
+        assert not installed.exists()
+        assert not legacy.exists()
         assert sock.messages[-2] == {"type": "result", "id": "delete-1", "ok": True}
 
     asyncio.run(run())
@@ -76,16 +112,11 @@ def test_delete_removes_downloaded_model_and_multi_gb_cache(tmp_path, monkeypatc
 
 def test_invalid_model_checksum_is_not_installed(tmp_path, monkeypatch):
     isolated_worker(tmp_path, monkeypatch)
-    def corrupt_download(**kwargs):
-        path = Path(kwargs["cache_dir"]) / "blobs" / "bad"
-        path.parent.mkdir(parents=True)
-        path.write_bytes(b"tampered model")
-        return str(path)
-    monkeypatch.setattr(agent, "hf_hub_download", corrupt_download)
+    mock_model_download(monkeypatch, b"tampered model")
     with pytest.raises(RuntimeError, match="SHA256 mismatch"):
         agent.download("test-model")
     assert not agent.model_file("test-model").exists()
-    assert not agent.model_file("test-model").is_symlink()
+    assert not agent.model_file("test-model").with_suffix(".part").exists()
 
 
 def test_worker_refuses_plaintext_proxy_url(tmp_path, monkeypatch):

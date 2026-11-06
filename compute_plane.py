@@ -194,6 +194,9 @@ async def _stream(node_id: str, model: str, payload: dict[str, Any], *, visibili
     current = _record(node_id)
     if not current or current["revoked"]:
         raise HTTPException(403, "Compute node has been revoked or removed")
+    policy = _model_policy()
+    if policy["revision"] > 1 and model not in policy["models"]:
+        raise HTTPException(409, "Model disabled by current compute policy")
     if visibility == "private" and not bool(current["allow_private"]):
         raise HTTPException(403, "This compute node is not trusted for private requests")
     conn = _connections.get(node_id)
@@ -276,6 +279,9 @@ def endpoints(model: str) -> list[dict[str, Any]]:
     _setup()
     with _db() as db:
         rows = db.execute("SELECT * FROM ComputeNodes WHERE revoked=0 ORDER BY allow_private DESC, last_seen DESC").fetchall()
+    policy = _model_policy()
+    selected = policy["models"]
+    managed = policy["revision"] > 1
     result = []
     for row in rows:
         node = dict(row)
@@ -288,10 +294,12 @@ def endpoints(model: str) -> list[dict[str, Any]]:
         current_ready = models.get("active") == model_id and bool(models.get("ready"))
         test_state = models.get("capabilities") if isinstance(models.get("capabilities"), dict) else {}
         verified = isinstance(test_state.get(model_id), dict) and test_state[model_id].get("status") == "supported"
-        selected = _model_policy()["models"]
-        if selected and model_id not in selected:
-            continue
-        if not current_ready and not (selected and verified):
+        # Managed routing exposes *tested* models, even when another GGUF
+        # currently occupies the worker's single llama.cpp runtime slot.
+        if managed:
+            if model_id not in selected or not verified:
+                continue
+        elif not current_ready:
             continue
         result.append({
             "name": "compute-" + node["id"][:8], "api_mode": "compute_worker",

@@ -54,7 +54,9 @@ services:
   gateway:
     image: caddy:2-alpine
     restart: unless-stopped
+    # Official Caddy image does not set an ENTRYPOINT; invoke caddy explicitly.
     command:
+      - caddy
       - reverse-proxy
       - --from
       - https://test-proxy-worker.internal:8443

@@ -277,3 +277,18 @@ def test_streaming_consent_is_rechecked_at_first_byte(tmp_path, monkeypatch):
                 assert False, "Streaming sent a prompt after private permission was removed"
 
         asyncio.run(exercise())
+
+
+def test_local_cpu_worker_respects_small_token_limit():
+    import main_impl as core
+
+    original = {"max_tokens": 64, "stream": True}
+    local = core.prepare_provider_chat_payload(
+        original, {"api_mode": "compute_worker"}, "qwen35-0.8b-q4"
+    )
+    assert local["max_tokens"] == 64, "Never inflate CPU worker's short test"
+    upstream = core.prepare_provider_chat_payload(
+        original, {"api_mode": "openai_chat_completions"}, "other-model"
+    )
+    assert upstream["max_tokens"] == core.MIN_COMPLETION_TOKENS
+    assert original["max_tokens"] == 64

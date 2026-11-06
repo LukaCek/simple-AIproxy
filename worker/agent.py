@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from websockets.asyncio.client import connect
 from compute_catalog import CATALOG
-from compute_worker_storage import (disk_limit_bytes, used_bytes, install_model, remove_model, verify_model, target_path)
+from compute_worker_storage import (disk_limit_bytes, used_bytes, install_model, remove_model, verify_model, target_path, prune_to_limit)
 
 DATA = Path(os.getenv("WORKER_DATA_DIR", "/data"))
 MODELS = Path(os.getenv("WORKER_MODEL_DIR", "/models"))
@@ -122,6 +122,9 @@ class Worker:
             part = model_file(mid).with_suffix(".part")
             if part.is_file() or part.is_symlink():
                 part.unlink()
+        # If an operator lowers the Compose disk budget, automatically reclaim
+        # oldest cached model files before accepting more downloads.
+        prune_to_limit(MODELS, DISK_LIMIT_BYTES, self.last_used)
 
     def _read_state(self):
         try:

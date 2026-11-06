@@ -10,6 +10,8 @@ on:
       - "tests/test_worker_agent.py"
       - "tests/compute_streaming_check.py"
       - ".github/workflows/compute-worker.yml"
+      - "deploy/**"
+      - ".dockerignore"
   push:
     branches: [main]
     paths:
@@ -41,6 +43,7 @@ jobs:
           pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py
           pytest -q tests/compute_streaming_check.py
           docker compose --env-file worker/.env.example -f worker/docker-compose.yml config --quiet
+          docker compose --env-file deploy/compute-staging.env.example -f deploy/compute-staging.compose.yml config --quiet
 
   docker-smoke:
     needs: verify

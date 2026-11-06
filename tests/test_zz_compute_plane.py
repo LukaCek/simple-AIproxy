@@ -121,3 +121,52 @@ def test_catalog_rejects_unknown_model(tmp_path, monkeypatch):
             f"/admin/api/compute/nodes/{identity['node_id']}/trust",
             auth=ADMIN, headers={"X-SimpleAI-Admin-Action": "1"}, json={"allow_private": "yes"},
         ).status_code == 400
+
+
+def test_trust_revocation_blocks_stale_routed_endpoint(tmp_path, monkeypatch):
+    """Queued/routed endpoint snapshots must never bypass a later admin decision."""
+    import asyncio
+    import time
+    from fastapi import HTTPException
+    import compute_plane
+
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        node = identity["node_id"]
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            ws.send_json({"type": "telemetry", "hardware": {"arch": "x86_64"},
+                          "models": {"active": "qwen35-2b-q4", "ready": True}})
+            for _ in range(40):
+                if compute_plane.endpoints("local/qwen35-2b-q4"):
+                    break
+                time.sleep(0.025)
+            assert compute_plane.endpoints("local/qwen35-2b-q4")
+            response = client.post(f"/admin/api/compute/nodes/{node}/trust",
+                                   auth=ADMIN, headers={"X-SimpleAI-Admin-Action": "1"},
+                                   json={"allow_private": True})
+            assert response.status_code == 200
+            stale_trusted = compute_plane.endpoints("local/qwen35-2b-q4")[0]
+            assert stale_trusted["allow_private"] is True
+
+            response = client.post(f"/admin/api/compute/nodes/{node}/trust",
+                                   auth=ADMIN, headers={"X-SimpleAI-Admin-Action": "1"},
+                                   json={"allow_private": False})
+            assert response.status_code == 200
+            try:
+                asyncio.run(compute_plane.forward(stale_trusted, {"messages": [{"role": "user", "content": "private"}]}))
+                assert False, "Private request unexpectedly reached revoked trust"
+            except HTTPException as exc:
+                assert exc.status_code == 403 and "not trusted" in exc.detail
+
+            response = client.post(f"/admin/api/compute/nodes/{node}/revoke",
+                                   auth=ADMIN, headers={"X-SimpleAI-Admin-Action": "1"})
+            assert response.status_code == 200
+            try:
+                asyncio.run(compute_plane.forward(stale_trusted, {
+                    "aiproxy_visibility": "public", "messages": [{"role": "user", "content": "public"}]
+                }))
+                assert False, "Revoked node unexpectedly received a public request"
+            except HTTPException as exc:
+                assert exc.status_code == 403 and "revoked" in exc.detail

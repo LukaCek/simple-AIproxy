@@ -7,7 +7,7 @@ name: test-proxy-worker
 services:
   proxy:
     build:
-      context: https://github.com/LukaCek/simple-AIproxy.git#7a8df568b354c83907c5bf94425a5510480e6dc6
+      context: https://github.com/LukaCek/simple-AIproxy.git#cd648fc121d940820aa49ac68db0b7d085b595dd
       dockerfile: Dockerfile
     image: test-proxy-worker/proxy:staging
     restart: unless-stopped
@@ -149,7 +149,7 @@ services:
 
   worker:
     build:
-      context: https://github.com/LukaCek/simple-AIproxy.git#7a8df568b354c83907c5bf94425a5510480e6dc6
+      context: https://github.com/LukaCek/simple-AIproxy.git#cd648fc121d940820aa49ac68db0b7d085b595dd
       dockerfile: worker/Dockerfile
     image: test-proxy-worker/worker:staging
     restart: unless-stopped
@@ -165,6 +165,7 @@ services:
       REQUESTS_CA_BUNDLE: /tmp/staging-ca-bundle.pem
       WORKER_NAME: oblak-staging-worker
       WORKER_THREADS: "2"
+      WORKER_REASONING: "off"
     volumes:
       - worker-data:/data
       - worker-models:/models

@@ -1,5 +1,19 @@
 """Pinned, administrator-approved GGUF catalogue. No user-supplied download URLs."""
 CATALOG = {
+    "qwen35-0.8b-q4": {
+        "name": "Qwen3.5 0.8B Q4_K_M", "repo": "unsloth/Qwen3.5-0.8B-GGUF",
+        "file": "Qwen3.5-0.8B-Q4_K_M.gguf", "revision": "main",
+        "size": 533000000,
+        "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+        "ctx": 4096,
+    },
+    "qwen35-2b-q4": {
+        "name": "Qwen3.5 2B Q4_K_M", "repo": "unsloth/Qwen3.5-2B-GGUF",
+        "file": "Qwen3.5-2B-Q4_K_M.gguf", "revision": "1c466474d208da1a7c4b8cb87ebcdac78f160e34",
+        "size": 1280000000,
+        "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+        "ctx": 4096,
+    },
     "qwen35-4b-q4": {
         "name": "Qwen3.5 4B Q4_K_M", "repo": "unsloth/Qwen3.5-4B-GGUF",
         "file": "Qwen3.5-4B-Q4_K_M.gguf", "revision": "main",

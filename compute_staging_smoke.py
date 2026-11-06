@@ -1,11 +1,13 @@
 """One-command end-to-end compute smoke test for the isolated Oblak staging proxy.
 
 Run *inside* the staging proxy container:
-    python compute_staging_smoke.py
+    python compute_staging_smoke.py --thinking off
+    python compute_staging_smoke.py --thinking on --max-tokens 512
 
 Never execute against production. Credentials and API keys are ephemeral and
 never printed. The prompt is explicitly public, so untrusted nodes may run it.
 """
+import argparse
 import base64
 from datetime import datetime, timezone
 import json
@@ -81,7 +83,7 @@ def ensure_loaded():
     raise RuntimeError("Model load succeeded, but ready telemetry has not arrived")
 
 
-def stream_test():
+def stream_test(thinking: bool, max_tokens: int):
     db = sqlite3.connect("/app/app.db")
     key = secrets.token_hex(24)
     start = time.monotonic()
@@ -95,7 +97,8 @@ def stream_test():
             "model": "local/" + MODEL,
             "aiproxy_visibility": "public",
             "stream": True,
-            "max_tokens": 96,
+            "max_tokens": max_tokens,
+            "think": thinking,
             "messages": [
                 {"role": "user", "content": "Koliko je 2 + 2? Odgovori samo s stevilko."}
             ],
@@ -114,8 +117,10 @@ def stream_test():
         events = 0
         first_event = None
         done = False
+        print("Thinking:", "on" if thinking else "off", flush=True)
+        print("Token limit:", max_tokens, flush=True)
         print("Streaming result:", flush=True)
-        with urlopen(request, timeout=60) as response:
+        with urlopen(request, timeout=180) as response:
             for raw in response:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data: "):
@@ -140,6 +145,10 @@ def stream_test():
         print("SSE events:", events)
         print("Reasoning chunks:", reasoning)
         print("Content chunks:", len(content))
+        answer = "".join(content).strip()
+        print("Answer:", repr(answer))
+        if answer and "4" not in answer:
+            print("WARNING: Math answer is not 4; streaming passed but model accuracy did not.")
         print("Received DONE:", done)
         if not done or not content:
             raise RuntimeError("Stream incomplete or no visible answer")
@@ -152,12 +161,20 @@ def stream_test():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Test local model via staging proxy")
+    parser.add_argument("--thinking", choices=("on", "off"), default="off",
+                        help="Smoke tests use off by default for fast delivery; production defaults on")
+    parser.add_argument("--max-tokens", type=int, default=None)
+    args = parser.parse_args()
+    limit = args.max_tokens if args.max_tokens is not None else (512 if args.thinking == "on" else 96)
+    if not 1 <= limit <= 1024:
+        parser.error("--max-tokens must be between 1 and 1024")
     if os.getenv("ADMIN_USERNAME") != "staging-admin":
         raise RuntimeError("Refusing to run outside isolated staging")
     if not Path("/state/admin-password").is_file():
         raise RuntimeError("Missing staging credentials volume")
     ensure_loaded()
-    stream_test()
+    stream_test(args.thinking == "on", limit)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,18 @@
         Ready: {{ node.models.get('active') if node.models.get('ready') else 'none' }}
         · Installed: {{ node.models.get('installed', []) | join(', ') or 'none' }}
       </p>
+      <div class="mt-4 rounded-xl border p-3 text-xs">
+        <strong>Model suitability (CPU estimate)</strong>
+        <ul class="mt-2 space-y-1">
+        {% for mid, recommendation in recommendations.get(node.id, {}).items() %}
+          <li class="flex justify-between gap-2">
+            <span>{{ catalog[mid].name }}</span>
+            <span class="{{ 'text-green-700' if recommendation.grade == 'recommended' else 'text-amber-700' if recommendation.grade == 'possible' else 'text-slate-500' }}"
+                  title="{{ recommendation.reason }}">{{ recommendation.grade | replace('_',' ') | capitalize }}</span>
+          </li>
+        {% endfor %}
+        </ul>
+      </div>
       <div class="mt-4 rounded-xl bg-slate-50 p-3 text-sm">
         <strong>Privacy:</strong>
         {{ 'Approved for private prompts' if node.allow_private else 'Public prompts only' }}

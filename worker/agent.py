@@ -116,6 +116,12 @@ class Worker:
              ":autotest-v1").encode()
         ).hexdigest()
         self._read_state()
+        # No download is running before the worker main loop starts. Clean
+        # orphaned partial downloads so a crash cannot strand the disk quota.
+        for mid in CATALOG:
+            part = model_file(mid).with_suffix(".part")
+            if part.is_file() or part.is_symlink():
+                part.unlink()
 
     def _read_state(self):
         try:
@@ -125,9 +131,13 @@ class Worker:
             capabilities = state.get("capabilities", {})
             last_used = state.get("last_used", {})
             if isinstance(capabilities, dict):
-                self.capabilities = {k: v for k, v in capabilities.items()
+                self.capabilities = {k: dict(v) for k, v in capabilities.items()
                                      if k in CATALOG and isinstance(v, dict)
-                                     and v.get("status") in ("supported", "unsupported", "error")}
+                                     and v.get("status") in ("supported", "unsupported", "error", "testing")}
+                for result in self.capabilities.values():
+                    if result.get("status") == "testing":
+                        result.update(status="error",
+                                      reason="Worker stopped during model test (possible resource exhaustion)")
             if isinstance(last_used, dict):
                 self.last_used = {k: float(v) for k, v in last_used.items()
                                   if k in CATALOG and isinstance(v, (float, int))}

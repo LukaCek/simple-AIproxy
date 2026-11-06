@@ -175,12 +175,12 @@ def test_inference_forwards_tiny_sse_chunks_before_upstream_completes(tmp_path, 
     asyncio.run(run())
 
 
-def test_load_explicitly_disables_reasoning_by_default(tmp_path, monkeypatch):
-    """Qwen3.5 small responses should not spend all short output on thinking."""
+def test_load_defaults_to_reasoning_on(tmp_path, monkeypatch):
+    """The llama-server defaults to thinking; the proxy overrides per request."""
     worker = isolated_worker(tmp_path, monkeypatch)
     model = agent.model_file("test-model")
     model.write_bytes(b"small deterministic model")
-    monkeypatch.setattr(agent, "REASONING_MODE", "off")
+    monkeypatch.setattr(agent, "REASONING_MODE", "on")
     monkeypatch.setattr(agent, "memory_limit", lambda: 4 * 1024**3)
     monkeypatch.setattr(agent, "memory_available", lambda: 4 * 1024**3)
     commands = []
@@ -208,4 +208,4 @@ def test_load_explicitly_disables_reasoning_by_default(tmp_path, monkeypatch):
     assert worker.active == "test-model"
     assert commands
     cmd = commands[0]
-    assert cmd[cmd.index("--reasoning") + 1] == "off"
+    assert cmd[cmd.index("--reasoning") + 1] == "on"

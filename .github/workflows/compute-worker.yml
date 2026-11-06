@@ -7,6 +7,7 @@ on:
       - "compute_catalog.py"
       - "compute_plane.py"
       - "tests/test_zz_compute_plane.py"
+      - "tests/compute_streaming_check.py"
       - ".github/workflows/compute-worker.yml"
   push:
     branches: [main]
@@ -16,6 +17,10 @@ on:
       - "compute_plane.py"
       - ".github/workflows/compute-worker.yml"
   workflow_dispatch:
+
+concurrency:
+  group: compute-worker-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

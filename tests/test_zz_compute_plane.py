@@ -200,3 +200,80 @@ def test_untrusted_telemetry_cannot_crash_dashboard(tmp_path, monkeypatch):
             assert rec.json()["models"]["qwen35-2b-q4"]["grade"] == "unknown"
             html = client.get("/admin/compute-nodes", auth=ADMIN)
             assert html.status_code == 200, html.text
+
+
+def test_real_wss_sse_chunk_passthrough(tmp_path, monkeypatch):
+    """Public SSE traffic crosses the actual proxy websocket, byte-for-byte."""
+    import time
+    import compute_plane
+
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            ws.send_json({"type": "telemetry", "hardware": {"arch": "x86_64"},
+                          "models": {"active": "qwen35-0.8b-q4", "ready": True}})
+            for _ in range(50):
+                if compute_plane.endpoints("local/qwen35-0.8b-q4"):
+                    break
+                time.sleep(0.02)
+            assert compute_plane.endpoints("local/qwen35-0.8b-q4")
+            expected = (
+                b'data: {"id":"stream","choices":[{"index":0,"delta":{"content":"Hello"}}]}\\n\\n'
+                b'data: [DONE]\\n\\n'
+            )
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    client.post, "/v1/chat/completions",
+                    json={"model": "local/qwen35-0.8b-q4", "stream": True,
+                          "aiproxy_visibility": "public",
+                          "messages": [{"role": "user", "content": "Public hello"}]},
+                    headers={"Authorization": "Bearer local-test-key"},
+                )
+                run = ws.receive_json()
+                assert run["type"] == "run"
+                assert run["payload"]["stream"] is True
+                assert "aiproxy_visibility" not in run["payload"]
+                for part in (expected[:19], expected[19:]):
+                    ws.send_json({"type": "chunk", "id": run["id"],
+                                  "body": base64.b64encode(part).decode()})
+                ws.send_json({"type": "end", "id": run["id"], "status": 200})
+                result = future.result(timeout=15)
+            assert result.status_code == 200, result.text
+            assert result.content == expected
+
+
+def test_streaming_consent_is_rechecked_at_first_byte(tmp_path, monkeypatch):
+    """No private prompt leaves the server after consent is removed."""
+    import asyncio
+    from fastapi import HTTPException
+    import compute_plane
+
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        node = identity["node_id"]
+        response = client.post(
+            f"/admin/api/compute/nodes/{node}/trust", auth=ADMIN,
+            headers={"X-SimpleAI-Admin-Action": "1"}, json={"allow_private": True})
+        assert response.status_code == 200
+        candidate = {"node_id": node, "model": "qwen35-0.8b-q4", "allow_private": True}
+
+        async def exercise():
+            prepared = await compute_plane.forward(candidate, {
+                "stream": True, "messages": [{"role": "user", "content": "secret"}]
+            })
+            denied = client.post(
+                f"/admin/api/compute/nodes/{node}/trust", auth=ADMIN,
+                headers={"X-SimpleAI-Admin-Action": "1"},
+                json={"allow_private": False},
+            )
+            assert denied.status_code == 200
+            try:
+                await anext(prepared.body_iterator)
+            except HTTPException as exc:
+                assert exc.status_code == 403 and "not trusted" in exc.detail
+            else:
+                assert False, "Streaming sent a prompt after private permission was removed"
+
+        asyncio.run(exercise())

@@ -91,12 +91,14 @@ def test_private_is_not_routed_to_untrusted_node(tmp_path, monkeypatch):
             with ThreadPoolExecutor(max_workers=1) as executor:
                 call = executor.submit(
                     client.post, "/v1/chat/completions",
-                    json={**body, "aiproxy_visibility": "public"},
+                    json={**body, "aiproxy_visibility": "public", "think": False},
                     headers={"Authorization": "Bearer local-test-key"},
                 )
                 run = ws.receive_json()
                 assert run["type"] == "run"
                 assert run["payload"].get("aiproxy_visibility") is None
+                assert run["payload"].get("think") is None
+                assert run["payload"]["chat_template_kwargs"]["enable_thinking"] is False
                 assert run["payload"]["messages"][0]["content"] == "secret prompt"
                 reply = {"id": "fake", "object": "chat.completion", "choices": [{"index": 0,
                          "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]}
@@ -292,3 +294,45 @@ def test_local_cpu_worker_respects_small_token_limit():
     )
     assert upstream["max_tokens"] == core.MIN_COMPLETION_TOKENS
     assert original["max_tokens"] == 64
+
+
+def test_proxy_thinking_defaults_on_and_explicit_override():
+    """The proxy creates the llama.cpp per-request knob only when requested."""
+    import compute_plane
+    from fastapi import HTTPException
+    import pytest
+
+    body = {"messages": [{"role": "user", "content": "Hello"}], "stream": True}
+    original = body.copy()
+    implicit = compute_plane.prepare_worker_thinking(body)
+    assert implicit == body
+    assert implicit is not body
+    assert body == original
+
+    explicit_on = compute_plane.prepare_worker_thinking({**body, "think": True})
+    explicit_off = compute_plane.prepare_worker_thinking({**body, "think": False})
+    assert explicit_on["chat_template_kwargs"]["enable_thinking"] is True
+    assert explicit_off["chat_template_kwargs"]["enable_thinking"] is False
+    assert "think" not in explicit_on and "think" not in explicit_off
+
+    # Explicit proxy setting wins over template kwargs.
+    priority = compute_plane.prepare_worker_thinking({
+        **body, "think": False, "chat_template_kwargs": {"enable_thinking": True, "foo": 1},
+    })
+    assert priority["chat_template_kwargs"] == {"enable_thinking": False, "foo": 1}
+
+    # OpenAI reasoning_effort=none is also supported by pinned llama.cpp.
+    assert compute_plane.prepare_worker_thinking({
+        **body, "reasoning_effort": "none",
+    })["reasoning_effort"] == "none"
+
+    for invalid in (None, "false", 0, 1, [], {}):
+        with pytest.raises(HTTPException) as err:
+            compute_plane.prepare_worker_thinking({**body, "think": invalid})
+        assert err.value.status_code == 400
+    with pytest.raises(HTTPException):
+        compute_plane.prepare_worker_thinking({**body, "think": True,
+            "reasoning_effort": "none"})
+    with pytest.raises(HTTPException):
+        compute_plane.prepare_worker_thinking({**body, "think": False,
+            "chat_template_kwargs": "not-an-object"})

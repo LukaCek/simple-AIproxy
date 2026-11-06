@@ -151,7 +151,14 @@ async def _dispatch(node_id: str, message: dict[str, Any], *, timeout: float = 9
         conn.pending.pop(request_id, None)
 
 
-async def _stream(node_id: str, model: str, payload: dict[str, Any]):
+async def _stream(node_id: str, model: str, payload: dict[str, Any], *, visibility: str = "private"):
+    # StreamingResponse bodies run after forward() returns. Check again before
+    # sending any prompt, not only when preparing the HTTP response.
+    current = _record(node_id)
+    if not current or current["revoked"]:
+        raise HTTPException(403, "Compute node has been revoked or removed")
+    if visibility == "private" and not bool(current["allow_private"]):
+        raise HTTPException(403, "This compute node is not trusted for private requests")
     conn = _connections.get(node_id)
     if conn is None:
         raise RuntimeError("Node is offline")
@@ -267,7 +274,7 @@ async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response
     if not payload.get("stream"):
         chunks: list[bytes] = []
         total = 0
-        async for chunk in _stream(node_id, endpoint["model"], payload):
+        async for chunk in _stream(node_id, endpoint["model"], payload, visibility=visibility):
             total += len(chunk)
             if total > 8 * 1024 * 1024:
                 raise HTTPException(413, "Worker response too large")
@@ -278,7 +285,7 @@ async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response
         except (ValueError, UnicodeDecodeError) as exc:
             raise HTTPException(502, "Invalid response from worker") from exc
         return Response(content=json.dumps(parsed), media_type="application/json")
-    return StreamingResponse(_stream(node_id, endpoint["model"], payload), media_type="text/event-stream")
+    return StreamingResponse(_stream(node_id, endpoint["model"], payload, visibility=visibility), media_type="text/event-stream")
 
 
 @router.post("/admin/api/compute/enrollments", dependencies=[Depends(require_admin_write)])

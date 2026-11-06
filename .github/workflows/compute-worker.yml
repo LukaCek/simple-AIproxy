@@ -6,7 +6,7 @@ on:
       - "worker/**"
       - "compute_catalog.py"
       - "compute_plane.py"
-      - "tests/test_compute_plane.py"
+      - "tests/test_zz_compute_plane.py"
       - ".github/workflows/compute-worker.yml"
   push:
     branches: [main]
@@ -32,7 +32,7 @@ jobs:
         run: |
           python -m compileall -q compute_catalog.py compute_plane.py worker/agent.py
           python -m pip install -r requirements.txt pytest
-          pytest -q tests/test_compute_plane.py
+          pytest -q tests/test_zz_compute_plane.py
 
   build-worker:
     needs: verify

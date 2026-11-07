@@ -796,7 +796,7 @@ async def admin_page(request: Request):
     return core.templates.TemplateResponse(
         request, "compute_nodes.html",
         {"nodes": [_public_node(dict(r)) for r in rows], "catalog": CATALOG,
-         "policy": _model_policy(),
+         "policy": _model_policy(), "placement_mode": _placement_mode(),
          "recommendations": {r["id"]: model_recommendations(dict(r)) for r in rows}},
     )
 

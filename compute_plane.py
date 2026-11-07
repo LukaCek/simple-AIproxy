@@ -16,12 +16,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 import main_impl as core
 from compute_catalog import CATALOG
 from compute_placement import models_for_node
 from compute_scheduler import auto_candidates as select_auto_candidates
+from compute_setup import compose_text, env_text, validate_setup
 
 router = APIRouter()
 
@@ -525,6 +526,33 @@ async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response
             _release(node_id, token)
 
     return StreamingResponse(reserved_stream(), media_type="text/event-stream")
+
+
+@router.get("/admin/compute-setup", response_class=HTMLResponse, dependencies=[Depends(core.verify_admin)])
+async def setup_page(request: Request):
+    return core.templates.TemplateResponse(request=request, name="compute_setup.html", context={})
+
+
+@router.post("/admin/api/compute/setup", dependencies=[Depends(require_admin_write)])
+async def generate_worker_setup(request: Request) -> JSONResponse:
+    """Issue short-lived credentials only on explicit admin action."""
+    try:
+        settings = validate_setup(await request.json())
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    enrollment = await create_enrollment()
+    return JSONResponse({
+        "compose": compose_text(settings),
+        "env": env_text(settings, enrollment["token"]),
+        "expires_at": enrollment["expires_at"],
+        "instructions": [
+            "Save docker-compose.yml and .env in the same empty folder.",
+            "Protect .env with chmod 600 .env and do not commit or share it.",
+            "Run: docker compose config --quiet && docker compose pull && docker compose up -d",
+            "Confirm the node is Online in SimpleAI Proxy.",
+            "After enrollment succeeds, remove the one-time token from .env.",
+        ],
+    }, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 @router.post("/admin/api/compute/enrollments", dependencies=[Depends(require_admin_write)])

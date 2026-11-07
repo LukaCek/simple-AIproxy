@@ -44,7 +44,14 @@ def main():
                 preferred = next((mid for mid in selected
                                   if statuses[mid] == "supported"), None)
                 if preferred is None:
-                    print("No tested model is compatible with this worker.")
+                    print("No tested model is currently available on this worker.")
+                    hw = node.get("hardware", {})
+                    limit = int(hw.get("memory_limit_bytes") or 0)
+                    free = int(hw.get("memory_available_bytes") or 0)
+                    print("Worker RAM limit:", round(limit / (1024**3), 2), "GiB")
+                    print("Worker RAM available:", round(free / (1024**3), 2), "GiB")
+                    print("Model cache:", round(int(models.get("disk_used_bytes") or 0) / (1024**3), 2),
+                          "/", round(int(models.get("disk_limit_bytes") or 0) / (1024**3), 2), "GiB")
                     for mid in selected:
                         print(mid, statuses[mid],
                               capabilities.get(mid, {}).get("reason", ""))

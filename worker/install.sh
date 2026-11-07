@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # SimpleAI Compute Worker Linux bootstrap.
-# Public installer; credentials are entered through /dev/tty, never command args.
+# Public installer. One-line setup accepts a short-lived single-use token
+# as the second CLI argument (visible in shell history/process listings).
+# Older interactive mode is retained for manually provided one-arg commands.
 set -Eeuo pipefail
 set +x
 umask 077
@@ -8,7 +10,7 @@ umask 077
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
 
-[[ $# -eq 1 ]] || fail "Usage: curl -fsSL https://YOUR_PROXY/compute/install.sh | bash -s -- https://YOUR_PROXY"
+[[ $# -eq 1 || $# -eq 2 ]] || fail "Usage: curl -fsSL https://YOUR_PROXY/compute/install.sh | bash -s -- https://YOUR_PROXY [ONE_TIME_CODE]"
 PROXY_ORIGIN="$1"
 case "$PROXY_ORIGIN" in
   https://*) ;;
@@ -30,13 +32,18 @@ command -v curl >/dev/null 2>&1 || fail "curl is required for the installer."
 command -v docker >/dev/null 2>&1 || fail "Install Docker Engine and the Compose v2 plugin first."
 docker compose version >/dev/null 2>&1 || fail "The Docker Compose v2 plugin is missing."
 docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable. Start Docker or configure access for this user."
-[[ -r /dev/tty && -w /dev/tty ]] || fail "Run in an interactive terminal to enter the private setup code."
-
 info "SimpleAI Compute Worker — isolated Linux installation"
 info "Proxy: $PROXY_ORIGIN"
 info "Your existing proxy/worker containers will not be changed."
-IFS= read -r -s -p "Paste the one-time setup code (hidden): " ENROLLMENT_CODE </dev/tty || fail "No setup code provided"
-printf '\n' >/dev/tty
+if [[ $# -eq 2 ]]; then
+  ENROLLMENT_CODE="$2"
+  # The code is never printed or recorded by the installer, but the initial
+  # paste may remain in shell history. It expires or is consumed after use.
+else
+  [[ -r /dev/tty && -w /dev/tty ]] || fail "Run in an interactive terminal to enter the private setup code."
+  IFS= read -r -s -p "Paste the one-time setup code (hidden): " ENROLLMENT_CODE </dev/tty || fail "No setup code provided"
+  printf '\n' >/dev/tty
+fi
 [[ "$ENROLLMENT_CODE" =~ ^[A-Za-z0-9_-]{32,128}$ ]] || fail "Invalid setup code format."
 
 TEMP_DIR="$(mktemp -d)" || fail "Could not prepare secure temporary directory."

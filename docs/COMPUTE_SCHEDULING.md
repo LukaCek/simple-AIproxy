@@ -41,8 +41,10 @@ positions are preserved.
 
 A short bounded reservation is created **before** sending any job. The slot
 is held until the final SSE chunk, normal response, error or cancellation.
-When all nodes are busy, the v1 coordinator waits briefly and then falls
-back or fails clearly; there is no durable queue yet. Run **one proxy server
+When all nodes are busy, the v1 coordinator waits briefly (default 10 seconds,
+configurable via `AIPROXY_COMPUTE_QUEUE_WAIT_SECONDS`, clamped to 0–60 seconds),
+with at most 16 simultaneous waiters per node. It then falls back or fails
+clearly; there is no durable queue yet. Run **one proxy server
 process** for now: the reservation map and WebSocket connections are process-local.
 
 Streaming cannot be transparently retried on another model once response

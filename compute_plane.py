@@ -825,10 +825,13 @@ async def admin_page(request: Request):
     _setup()
     with _db() as db:
         rows = db.execute("SELECT * FROM ComputeNodes ORDER BY created_at DESC").fetchall()
+    global_policy = _model_policy()
+    mode = _placement_mode()
     return core.templates.TemplateResponse(
         request, "compute_nodes.html",
         {"nodes": [_public_node(dict(r)) for r in rows], "catalog": CATALOG,
-         "policy": _model_policy(), "placement_mode": _placement_mode(),
+         "policy": global_policy, "placement_mode": mode,
+         "assignments": {r["id"]: _node_policy(r["id"], global_policy)["models"] for r in rows},
          "recommendations": {r["id"]: model_recommendations(dict(r)) for r in rows}},
     )
 

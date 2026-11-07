@@ -510,7 +510,18 @@ def test_automatic_policy_moves_models_to_node_fit_and_resolves_exact_model(tmp_
                 },
             })
             optimized = ws.receive_json()
-            assert optimized["models"] == ["qwen35-4b-q4", "qwen35-2b-q4"]
+            assert optimized["models"] == ["qwen35-4b-q4", "qwen35-2b-q4", "qwen35-0.8b-q4"]
+            # Global approval and node assignment must agree for this
+            # hardware, so small models appear in Playground and /v1/models.
+            assert compute_plane.endpoints("local/qwen35-0.8b-q4")
+            visible = client.get("/v1/models", headers={
+                "Authorization": "Bearer local-test-key"})
+            assert visible.status_code == 200, visible.text
+            model_ids = {model["id"] for model in visible.json()["data"]}
+            assert {"local/qwen35-0.8b-q4",
+                    "local/qwen35-2b-q4",
+                    "local/qwen35-4b-q4",
+                    "local/auto"}.issubset(model_ids)
             quality = compute_plane.automatic_endpoints({"aiproxy_compute_tier": "quality"})
             assert len(quality) == 1 and quality[0]["model"] == "qwen35-4b-q4"
             fast = compute_plane.automatic_endpoints({"aiproxy_compute_tier": "fast"})

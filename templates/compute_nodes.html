@@ -53,6 +53,10 @@
         {{ node.hardware.get('cpus', '?') }} CPUs ·
         {{ (node.hardware.get('memory_limit_bytes', 0) / 1073741824) | round(1) }} GiB memory limit
       </p>
+      <p class="mt-1 text-xs text-slate-500">
+        Worker version {{ node.hardware.get('version', 'unknown') }} ·
+        build {{ (node.hardware.get('build_revision') or 'unknown')[:12] }} (reported by worker)
+      </p>
       <p data-node-busy class="mt-1 text-xs text-slate-500">
         Inference: {{ 'Busy' if node.models.get('busy') else 'Idle' }} ·
         {{ node.models.get('running_tasks', 0) }} active slot

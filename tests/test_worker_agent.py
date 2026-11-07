@@ -282,3 +282,55 @@ def test_local_tui_snapshot_contains_status_not_prompts_or_credentials(tmp_path,
         assert secret_field not in content
     worker._activity("idle")
     assert read_snapshot(agent.DATA / STATUS_FILE)["current_model"] is None
+
+
+def test_large_manual_load_fails_before_evicting_working_model(tmp_path, monkeypatch):
+    """An impossible 4B model must not erase smaller cached GGUF files."""
+    worker = isolated_worker(tmp_path, monkeypatch)
+    small = agent.model_file("test-model")
+    small.write_bytes(b"small deterministic model")
+    monkeypatch.setattr(agent, "memory_limit", lambda: 3 * 1024**3)
+    monkeypatch.setattr(agent, "memory_available", lambda: 3 * 1024**3)
+    agent.CATALOG["oversized"] = {
+        "repo": "test/large", "file": "huge.gguf", "size": 2_740_000_000,
+        "sha256": "a" * 64, "ctx": 4096,
+    }
+    class Socket:
+        def __init__(self):
+            self.messages = []
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    sock = Socket()
+    asyncio.run(worker.command(sock, {"id":"cannot-load", "action":"load", "model":"oversized"}))
+    assert small.exists()
+    assert sock.messages[0]["type"] == "error"
+    assert "RAM limit" in sock.messages[0]["error"]
+    assert not (agent.MODELS / "oversized.gguf").exists()
+
+
+def test_worker_refreshes_local_snapshot_each_second_but_not_wss_telemetry(monkeypatch, tmp_path):
+    worker = isolated_worker(tmp_path, monkeypatch)
+    publishes = []
+    sleeps = []
+    monkeypatch.setattr(worker, "_publish_snapshot", lambda: publishes.append(1))
+
+    async def fake_sleep(value):
+        sleeps.append(value)
+        if len(sleeps) == 3:
+            raise TimeoutError("stop the local snapshot loop")
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+        async def send(self, raw):
+            self.messages.append(json.loads(raw))
+
+    monkeypatch.setattr(agent.asyncio, "sleep", fake_sleep)
+    sock = Socket()
+    with pytest.raises(TimeoutError):
+        asyncio.run(worker.heartbeat(sock))
+    assert sleeps == [1, 1, 1]
+    assert len(publishes) == 3
+    assert len(sock.messages) == 1
+    assert sock.messages[0]["type"] == "telemetry"

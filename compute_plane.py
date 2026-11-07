@@ -398,6 +398,7 @@ def endpoints(model: str) -> list[dict[str, Any]]:
             "name": "compute-" + node["id"][:8], "api_mode": "compute_worker",
             "node_id": node["id"], "model": model_id,
             "allow_private": bool(node["allow_private"]),
+            "model_metadata": {"context_tokens": CATALOG[model_id]["ctx"]},
             "compute_metrics": {
                 "warm": current_ready,
                 "busy": reserved or public["models"].get("busy", False),

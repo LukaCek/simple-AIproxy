@@ -264,3 +264,21 @@ def test_worker_reports_busy_without_inventing_parallel_capacity(tmp_path, monke
             assert worker.status()["running_tasks"] == 1
     asyncio.run(check())
 
+
+
+def test_local_tui_snapshot_contains_status_not_prompts_or_credentials(tmp_path, monkeypatch):
+    from compute_worker_snapshot import STATUS_FILE, read_snapshot
+
+    worker = isolated_worker(tmp_path, monkeypatch)
+    worker._activity("generating", "test-model", "inference")
+    current = read_snapshot(agent.DATA / STATUS_FILE)
+    assert current["phase"] == "generating"
+    assert current["current_model"] == "test-model"
+    assert current["current_kind"] == "inference"
+    assert current["connected"] is False
+    assert current["schema"] == 1
+    content = (agent.DATA / STATUS_FILE).read_text()
+    for secret_field in ("node_secret", "enrollment_token", "api_key", "payload", "messages"):
+        assert secret_field not in content
+    worker._activity("idle")
+    assert read_snapshot(agent.DATA / STATUS_FILE)["current_model"] is None

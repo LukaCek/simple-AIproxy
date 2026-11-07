@@ -357,6 +357,7 @@ def endpoints(model: str) -> list[dict[str, Any]]:
     if model_id not in CATALOG:
         return []
     policy = _model_policy()
+    placement_auto = _placement_mode() == "auto"
     with _db() as db:
         rows = db.execute("SELECT * FROM ComputeNodes WHERE revoked=0 ORDER BY allow_private DESC, last_seen DESC").fetchall()
     selected = policy["models"]
@@ -378,8 +379,14 @@ def endpoints(model: str) -> list[dict[str, Any]]:
         if managed:
             if model_id not in selected or not verified:
                 continue
-            if model_id not in _node_policy(node["id"], policy)["models"]:
-                continue
+            if placement_auto:
+                try:
+                    hardware = json.loads(node["hardware_json"])
+                except (TypeError, ValueError):
+                    hardware = {}
+                assigned = models_for_node(selected, CATALOG, hardware, models) if isinstance(hardware, dict) else selected
+                if model_id not in assigned:
+                    continue
         elif not current_ready:
             continue
         public = _public_node(node)

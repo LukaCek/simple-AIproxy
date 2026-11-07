@@ -543,3 +543,34 @@ def test_recommendations_distinguish_hard_ram_limit_from_temporary_usage():
     assert bigger["qwen35-4b-q4"]["grade"] in ("possible", "recommended")
     assert bigger["qwen35-4b-q4"]["grade"] != "too_large"
     assert bigger["qwen35-9b-q4"]["grade"] == "too_large"
+
+
+def test_models_endpoint_advertises_connected_approved_verified_worker(tmp_path, monkeypatch):
+    """Public model registry and live Playground must share compute eligibility."""
+    import time
+    import compute_plane
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        headers = {"X-SimpleAI-Admin-Action": "1"}
+        updated = client.post("/admin/api/compute/model-policy", auth=ADMIN,
+                              headers=headers, json={"models": ["qwen35-4b-q4"]})
+        assert updated.status_code == 200
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            assert ws.receive_json()["type"] == "policy"
+            ws.send_json({"type": "telemetry", "hardware": {"arch": "x86_64", "cpus": 2},
+                          "models": {"active": "qwen35-4b-q4", "ready": True,
+                                     "capabilities": {"qwen35-4b-q4":
+                                                      {"status": "supported"}}}})
+            for _ in range(40):
+                if compute_plane.endpoints("local/qwen35-4b-q4"):
+                    break
+                time.sleep(0.025)
+            assert compute_plane.endpoints("local/qwen35-4b-q4")
+            response = client.get("/v1/models",
+                                  headers={"Authorization": "Bearer local-test-key"})
+            assert response.status_code == 200, response.text
+            ids = [item["id"] for item in response.json()["data"]]
+            assert "local/qwen35-4b-q4" in ids
+            assert "local/auto" in ids

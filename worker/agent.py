@@ -167,6 +167,7 @@ class Worker:
         self.tasks = {}
         self.policy = None
         self.policy_revision = 0
+        self.policy_generation = 0
         self.reconcile_task = None
         self.last_used = {}
         self.capabilities = {}
@@ -312,6 +313,9 @@ class Worker:
         old_version = self.policy_revision
         self.policy = selected
         self.policy_revision = version
+        if previous != selected:
+            # A node may get a new model assignment at the same global revision.
+            self.policy_generation += 1
         self.force_retest = previous == selected and old_version not in (0, version)
         if self.reconcile_task is None or self.reconcile_task.done():
             self.reconcile_task = asyncio.create_task(self.reconcile(ws))
@@ -326,12 +330,13 @@ class Worker:
         while self.policy is not None:
             selected = list(self.policy)
             version = self.policy_revision
+            generation = self.policy_generation
             retest = getattr(self, "force_retest", False)
             self.force_retest = False
             # Test from lowest priority first so the preferred model is cached
             # last and remains available on small volumes.
             for mid in reversed(selected):
-                if version != self.policy_revision:
+                if version != self.policy_revision or generation != self.policy_generation:
                     break
                 previous = self.capabilities.get(mid, {})
                 if not retest and previous.get("status") in ("supported", "unsupported", "error"):
@@ -366,7 +371,7 @@ class Worker:
                         self.mark_model(mid, "error", str(exc),
                                         time.monotonic() - started)
                 await self.telemetry(ws)
-            if version != self.policy_revision:
+            if version != self.policy_revision or generation != self.policy_generation:
                 continue
             preferred = next((mid for mid in selected
                               if self.capabilities.get(mid, {}).get("status") == "supported"),
@@ -385,7 +390,7 @@ class Worker:
                 if preferred:
                     self.mark_model(preferred, "error", "Warmup: " + str(exc))
             await self.telemetry(ws)
-            if version == self.policy_revision:
+            if version == self.policy_revision and generation == self.policy_generation:
                 break
 
     async def unload(self):

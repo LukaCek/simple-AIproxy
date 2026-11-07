@@ -7,7 +7,7 @@ name: test-proxy-worker
 services:
   proxy:
     build:
-      context: https://github.com/LukaCek/simple-AIproxy.git#4496d23d9963979056f7b4689b30e6e3a938bc61
+      context: https://github.com/LukaCek/simple-AIproxy.git#df39b382d2a781c02c793e88970e8b94112032be
       dockerfile: Dockerfile
     image: test-proxy-worker/proxy:staging
     restart: unless-stopped
@@ -149,7 +149,7 @@ services:
 
   worker:
     build:
-      context: https://github.com/LukaCek/simple-AIproxy.git#4496d23d9963979056f7b4689b30e6e3a938bc61
+      context: https://github.com/LukaCek/simple-AIproxy.git#df39b382d2a781c02c793e88970e8b94112032be
       dockerfile: worker/Dockerfile
     image: test-proxy-worker/worker:staging
     restart: unless-stopped

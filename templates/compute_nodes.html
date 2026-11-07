@@ -121,6 +121,20 @@
     <div class="rounded-2xl bg-white p-6 text-slate-600">No compute nodes registered yet.</div>
   {% endfor %}
   </div>
+  <div class="mt-6 rounded-2xl border border-slate-200 bg-white p-6">
+    <div class="flex items-center justify-between gap-3">
+      <h2 class="text-lg font-semibold">Compute worker events</h2>
+      <button type="button" onclick="refreshComputeEvents()"
+        class="rounded-lg border px-3 py-2 text-xs">Refresh events</button>
+    </div>
+    <p class="mt-2 text-xs text-slate-600">
+      Connection changes, self-tests, model loading, admin operations and trust decisions.
+      API requests and privacy skips remain in Request Logs and Provider Attempts.
+      No prompts, generated text or credentials are stored here.
+    </p>
+    <div id="compute-events" class="mt-4 space-y-2 text-xs text-slate-700"
+      aria-live="polite">Loading worker events…</div>
+  </div>
 </section>
 <script>
 const notice = document.getElementById("notice");
@@ -238,6 +252,45 @@ async function refreshNodeStatuses() {
     // Temporary network failures must not block manual admin controls.
   } finally { refreshingNodes = false; }
 }
+async function refreshComputeEvents() {
+  const container = document.getElementById("compute-events");
+  try {
+    const response = await fetch("/admin/api/compute/events?limit=60", {cache:"no-store"});
+    if(!response.ok) throw new Error("Unable to load worker event history");
+    const entries = (await response.json()).events || [];
+    container.replaceChildren();
+    if(entries.length === 0) {
+      container.textContent = "No worker events recorded yet.";
+      return;
+    }
+    for(const event of entries) {
+      const card = document.querySelector('[data-node-id="' + event.node_id + '"]');
+      const name = card?.querySelector("h3")?.textContent || "Worker";
+      const row = document.createElement("div");
+      row.className = "flex flex-wrap gap-x-3 gap-y-1 border-b border-slate-100 py-1";
+      const date = new Date(event.created_at * 1000);
+      const parts = [
+        Number.isFinite(date.getTime()) ? date.toLocaleString() : "Unknown time",
+        name,
+        String(event.event || "").replaceAll("_", " "),
+        event.model || "",
+        event.status || "",
+        event.detail || "",
+      ];
+      for(const part of parts) {
+        if(!part) continue;
+        const text = document.createElement("span");
+        text.textContent = part;
+        row.appendChild(text);
+      }
+      container.appendChild(row);
+    }
+  } catch (error) {
+    container.textContent = "Worker event history temporarily unavailable.";
+  }
+}
+refreshComputeEvents();
+setInterval(refreshComputeEvents, 10000);
 setInterval(refreshNodeStatuses, 5000);
 </script>
 {% endblock %}

@@ -83,7 +83,7 @@ def test_compute_stream_error_is_not_logged_as_success(tmp_path, monkeypatch):
 
     async def fake_forward(endpoint, payload):
         async def produce():
-            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\\n\\n'
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
             raise RuntimeError("fake disconnect")
         return StreamingResponse(produce(), media_type="text/event-stream")
 

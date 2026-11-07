@@ -17,8 +17,12 @@ free -h
 df -h .
 ```
 
-A Linux AMD64 or ARM64 Docker host with at least ~4 GiB of spare RAM and several
-GiB of free storage is recommended for the 0.8B model and the Docker build.
+A Linux AMD64 or ARM64 Docker host with at least ~6 GiB of available RAM and
+8 GiB of disk storage is recommended for the optional 4B test. The home test
+worker now has a **6 GiB Docker RAM cap** and **8 GiB application-controlled
+model-cache cap**. Those are *maximum limits*, not a preallocation of RAM.
+Start with 0.8B and 2B before attempting 4B; 9B is not intended for this
+6 GiB RAM configuration.
 The llama.cpp build can use significant CPU/time even when runtime limits are
 restricted. Use a home computer rather than a production VPS for this test.
 
@@ -108,6 +112,28 @@ CPU/RAM/disk usage. Press `q` to exit. For a static view:
 docker compose -f deploy/home-compute-test.compose.yml exec -T worker \
   python tui.py --once
 ```
+
+## Optional: live diagnostics and Playground
+
+The local worker snapshot refreshes every second. In the TUI, use `+` to
+refresh faster, `-` to slow down, and `q` to quit. The CPU gauge measures
+the Docker worker cgroup, not mouse/keyboard activity on the host.
+
+Open <http://127.0.0.1:18180/admin/playground> and select **Compute Workers
+(CPU)**. Only connected, approved and verified model IDs appear. To test
+against the default-untrusted local node, check **Mark this test prompt as
+public**, using a harmless prompt with no private content. Image inputs are
+not supported by the current CPU text-only GGUF catalog.
+
+The browser Compute Nodes page polls for updated cache and test statuses.
+It is normal for the web dashboard's metrics to lag up to ~15 seconds
+because the WSS telemetry interval remains 15s, independently of the faster
+local TUI snapshot updates.
+
+Manual model **Install** can evict previous cached models when storage is
+full; manual **Load** now refuses a model that cannot fit the configured
+RAM before downloading or removing the current model. A model file being
+saved on disk does *not* imply it fits in RAM or has passed inference tests.
 
 ## 7. Stop safely
 

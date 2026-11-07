@@ -319,10 +319,15 @@ class Worker:
             await ws.send(json.dumps(msg, separators=(",", ":")))
 
     async def heartbeat(self, ws):
+        """15-second network heartbeat, 1-second local diagnostics snapshot.
+
+        Keep local TUI responsive without multiplying WSS telemetry traffic.
+        """
         while True:
             await self.send(ws, {"type": "telemetry", "hardware": hardware(), "models": self.status()})
-            self._publish_snapshot()
-            await asyncio.sleep(15)
+            for _ in range(15):
+                self._publish_snapshot()
+                await asyncio.sleep(1)
 
     async def telemetry(self, ws):
         try:
@@ -552,6 +557,15 @@ class Worker:
                 if action == "install":
                     await self.ensure_installed(mid)
                 elif action == "load":
+                    # Never evict the currently working models to download a
+                    # GGUF that cannot fit the configured container RAM cap.
+                    required = model_ram_requirement(int(CATALOG[mid]["size"])) + memory_safety_margin()
+                    if required > memory_limit():
+                        raise RuntimeError(
+                            f"Cannot load {mid}: estimated {required // 1024**2} MiB "
+                            f"exceeds worker RAM limit {memory_limit() // 1024**2} MiB. "
+                            "Increase Docker mem_limit or choose a smaller model."
+                        )
                     await self.unload()
                     await self.ensure_installed(mid)
                     await self.load(mid)

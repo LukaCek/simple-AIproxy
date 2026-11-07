@@ -57,6 +57,11 @@
         Inference: {{ 'Busy' if node.models.get('busy') else 'Idle' }} ·
         {{ node.models.get('running_tasks', 0) }} active slot
       </p>
+      <p class="mt-2 text-sm text-slate-700">
+        <strong>Assigned in {{ placement_mode }} mode:</strong>
+        {% set assigned = assignments.get(node.id, []) %}
+        {{ assigned | join(', ') if assigned else 'none (check resource limits / selection)' }}
+      </p>
       <p data-node-models class="mt-2 text-sm text-slate-700">
         Ready: {{ node.models.get('active') if node.models.get('ready') else 'none' }}
         · Installed: {{ node.models.get('installed', []) | join(', ') or 'none' }}

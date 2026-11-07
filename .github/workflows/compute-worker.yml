@@ -62,6 +62,7 @@ jobs:
           docker compose --env-file worker/.env.example -f worker/docker-compose.yml config --quiet
           docker compose --env-file deploy/compute-staging.env.example -f deploy/compute-staging.compose.yml config --quiet
           docker compose -f deploy/oblak-test-proxy-worker/docker-compose.yml config --quiet
+          docker compose -f deploy/home-compute-test.compose.yml config --quiet
 
   docker-smoke:
     needs: verify

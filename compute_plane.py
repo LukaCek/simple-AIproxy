@@ -9,6 +9,7 @@ import json
 import math
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -35,7 +36,31 @@ def require_admin_write(request: Request, _admin=Depends(core.verify_admin)) -> 
 
 _connections: dict[str, "NodeConnection"] = {}
 _registry_lock = asyncio.Lock()
+# One proxy event-loop process is the supported coordinator topology for v1.
+# Reserve before dispatch: heartbeat telemetry is too stale to prevent races.
+_reservation_lock = threading.Lock()
+_reservations: dict[str, str] = {}
 _installed = False
+
+
+async def _reserve(node_id: str, timeout: float = 2.0) -> str | None:
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + timeout
+    while True:
+        with _reservation_lock:
+            if node_id in _connections and node_id not in _reservations:
+                _reservations[node_id] = token
+                return token
+        if time.monotonic() >= deadline or node_id not in _connections:
+            return None
+        await asyncio.sleep(0.05)
+
+
+def _release(node_id: str, token: str) -> None:
+    with _reservation_lock:
+        if _reservations.get(node_id) == token:
+            _reservations.pop(node_id, None)
+
 
 
 @contextmanager
@@ -312,10 +337,19 @@ def endpoints(model: str) -> list[dict[str, Any]]:
                 continue
         elif not current_ready:
             continue
+        public = _public_node(node)
+        benchmark = public["models"].get("capabilities", {}).get(model_id, {}).get("benchmark", {})
+        with _reservation_lock:
+            reserved = node["id"] in _reservations
         result.append({
             "name": "compute-" + node["id"][:8], "api_mode": "compute_worker",
             "node_id": node["id"], "model": model_id,
             "allow_private": bool(node["allow_private"]),
+            "compute_metrics": {
+                "warm": current_ready,
+                "busy": reserved or public["models"].get("busy", False),
+                "benchmark": benchmark,
+            },
         })
     return result
 
@@ -400,21 +434,36 @@ async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response
         raise HTTPException(403, "Compute node has been revoked or removed")
     if visibility == "private" and not bool(current["allow_private"]):
         raise HTTPException(403, "This compute node is not trusted for private requests")
+    token = await _reserve(node_id)
+    if token is None:
+        raise HTTPException(503, "Compute worker busy or disconnected")
     if not payload.get("stream"):
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in _stream(node_id, endpoint["model"], payload, visibility=visibility):
-            total += len(chunk)
-            if total > 8 * 1024 * 1024:
-                raise HTTPException(413, "Worker response too large")
-            chunks.append(chunk)
-        raw = b"".join(chunks)
         try:
-            parsed = json.loads(raw)
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise HTTPException(502, "Invalid response from worker") from exc
-        return Response(content=json.dumps(parsed), media_type="application/json")
-    return StreamingResponse(_stream(node_id, endpoint["model"], payload, visibility=visibility), media_type="text/event-stream")
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in _stream(node_id, endpoint["model"], payload, visibility=visibility):
+                total += len(chunk)
+                if total > 8 * 1024 * 1024:
+                    raise HTTPException(413, "Worker response too large")
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise HTTPException(502, "Invalid response from worker") from exc
+            return Response(content=json.dumps(parsed), media_type="application/json")
+        finally:
+            _release(node_id, token)
+
+    async def reserved_stream():
+        try:
+            async for chunk in _stream(node_id, endpoint["model"], payload, visibility=visibility):
+                yield chunk
+        finally:
+            # Streaming owns the slot until the final byte or client disconnect.
+            _release(node_id, token)
+
+    return StreamingResponse(reserved_stream(), media_type="text/event-stream")
 
 
 @router.post("/admin/api/compute/enrollments", dependencies=[Depends(require_admin_write)])

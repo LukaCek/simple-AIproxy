@@ -20,6 +20,8 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 import main_impl as core
 from compute_catalog import CATALOG
+from compute_placement import models_for_node
+from compute_scheduler import auto_candidates as select_auto_candidates
 
 router = APIRouter()
 
@@ -101,8 +103,13 @@ def _setup() -> None:
             models_json TEXT NOT NULL,
             updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS ComputeSettings (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            placement_mode TEXT NOT NULL DEFAULT 'manual'
+        );
         """)
         db.execute("INSERT OR IGNORE INTO ComputePolicy(id,revision,models_json,updated_at) VALUES(1,1,'[]',?)", (int(time.time()),))
+        db.execute("INSERT OR IGNORE INTO ComputeSettings(id,placement_mode) VALUES(1,'manual')")
 
 
 def _model_policy() -> dict[str, Any]:
@@ -115,6 +122,41 @@ def _model_policy() -> dict[str, Any]:
         selected = []
     return {"type": "policy", "revision": int(row["revision"]) if row else 1,
             "models": [mid for mid in selected if isinstance(mid, str) and mid in CATALOG]}
+
+
+def _placement_mode() -> str:
+    _setup()
+    with _db() as db:
+        row = db.execute("SELECT placement_mode FROM ComputeSettings WHERE id=1").fetchone()
+    return row["placement_mode"] if row and row["placement_mode"] in ("manual", "auto") else "manual"
+
+
+def _node_policy(node_id: str, global_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    policy = dict(global_policy if global_policy is not None else _model_policy())
+    if _placement_mode() != "auto":
+        return policy
+    row = _record(node_id)
+    if not row:
+        return policy
+    try:
+        hardware = json.loads(row["hardware_json"])
+        state = json.loads(row["models_json"])
+    except (TypeError, ValueError):
+        return policy
+    if isinstance(hardware, dict) and isinstance(state, dict):
+        policy["models"] = models_for_node(policy["models"], CATALOG, hardware, state)
+    return policy
+
+
+async def _send_node_policy(conn: "NodeConnection") -> None:
+    policy = _node_policy(conn.node_id)
+    signature = (policy["revision"], tuple(policy["models"]))
+    if signature == conn.last_policy_signature:
+        return
+    if policy["revision"] <= 1 and not policy["models"]:
+        return
+    await conn.send(policy)
+    conn.last_policy_signature = signature
 
 
 def _hash(secret: str) -> str:
@@ -196,6 +238,7 @@ class NodeConnection:
     node_id: str
     pending: dict[str, asyncio.Queue] = field(default_factory=dict)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_policy_signature: tuple[int, tuple[str, ...]] | None = None
 
     async def send(self, message: dict[str, Any]) -> None:
         async with self.write_lock:
@@ -335,6 +378,8 @@ def endpoints(model: str) -> list[dict[str, Any]]:
         if managed:
             if model_id not in selected or not verified:
                 continue
+            if model_id not in _node_policy(node["id"], policy)["models"]:
+                continue
         elif not current_ready:
             continue
         public = _public_node(node)
@@ -352,6 +397,14 @@ def endpoints(model: str) -> list[dict[str, Any]]:
             },
         })
     return result
+
+
+def automatic_endpoints(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve local/auto to ONE exact catalog model, not a mixed-model fallback."""
+    policy = _model_policy()
+    approved = policy["models"] if policy["revision"] > 1 else list(CATALOG)
+    candidates = [candidate for mid in approved for candidate in endpoints("local/" + mid)]
+    return select_auto_candidates(candidates, payload, CATALOG)
 
 
 def prepare_worker_thinking(payload: dict[str, Any]) -> dict[str, Any]:
@@ -521,11 +574,8 @@ async def compute_ws(ws: WebSocket):
                 await old.ws.close(code=1012)
             _connections[node_id] = conn
         await conn.send({"type": "auth_ok", "protocol": 1})
-        policy = _model_policy()
-        # Avoid extra messages for the original manual-only protocol tests;
-        # send empty policies after an admin explicitly clears model targets.
-        if policy["revision"] > 1 or policy["models"]:
-            await conn.send(policy)
+        # A node's policy may differ from the globally approved model list.
+        await _send_node_policy(conn)
         with _db() as db:
             db.execute("UPDATE ComputeNodes SET last_seen=? WHERE id=?", (int(time.time()), node_id))
         while True:
@@ -542,6 +592,7 @@ async def compute_ws(ws: WebSocket):
                 with _db() as db:
                     db.execute("UPDATE ComputeNodes SET last_seen=?,hardware_json=?,models_json=? WHERE id=?",
                                (int(time.time()), json.dumps(hardware), json.dumps(models), node_id))
+                await _send_node_policy(conn)
             elif kind in ("chunk", "result", "end", "error"):
                 pending = conn.pending.get(str(message.get("id") or ""))
                 if pending:
@@ -634,10 +685,32 @@ async def change_model_policy(request: Request) -> dict[str, Any]:
     policy = {"type": "policy", "revision": version, "models": selected}
     for conn in list(_connections.values()):
         try:
-            await conn.send(policy)
+            await _send_node_policy(conn)
         except Exception:
-            pass  # The worker fetches the latest policy on its next WSS reconnect.
+            pass  # The worker receives the latest policy on its next WSS reconnect.
     return policy
+
+
+@router.get("/admin/api/compute/placement", dependencies=[Depends(core.verify_admin)])
+async def placement_settings() -> dict[str, str]:
+    return {"mode": _placement_mode()}
+
+
+@router.post("/admin/api/compute/placement", dependencies=[Depends(require_admin_write)])
+async def update_placement(request: Request) -> dict[str, str]:
+    data = await request.json()
+    mode = data.get("mode") if isinstance(data, dict) else None
+    if mode not in ("manual", "auto"):
+        raise HTTPException(400, "mode must be manual or auto")
+    _setup()
+    with _db() as db:
+        db.execute("UPDATE ComputeSettings SET placement_mode=? WHERE id=1", (mode,))
+    for conn in list(_connections.values()):
+        try:
+            await _send_node_policy(conn)
+        except Exception:
+            pass
+    return {"mode": mode}
 
 
 @router.post("/admin/api/compute/nodes/{node_id}/operations", dependencies=[Depends(require_admin_write)])

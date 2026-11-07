@@ -764,7 +764,7 @@ async def enroll(request: Request) -> dict[str, str]:
             raise HTTPException(401, "Invalid or expired enrollment token")
         db.execute("UPDATE ComputeEnrollments SET used=1 WHERE token_hash=?", (_hash(token),))
         db.execute("DELETE FROM ComputeInstallPlans WHERE token_hash=?", (_hash(token),))
-        db.execute("INSERT INTO ComputeNodes(id,name,secret_hash,created_at) VALUES (?,?,?,?)"
+        db.execute("INSERT INTO ComputeNodes(id,name,secret_hash,created_at) VALUES (?,?,?,?)",
                    (node_id, name, _hash(secret), int(time.time())))
     _event(node_id, "enrolled")
     return {"node_id": node_id, "node_secret": secret}

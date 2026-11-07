@@ -24,8 +24,9 @@ def validate_setup(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise ValueError("name must contain 1-64 letters, digits, dashes or underscores")
     url = data.get("proxy_url", "")
-    if not isinstance(url, str) or len(url) > 250:
-        raise ValueError("Enter the public HTTPS proxy URL")
+    if (not isinstance(url, str) or len(url) > 250 or
+            any(ord(char) <= 32 or ord(char) == 127 for char in url)):
+        raise ValueError("Enter a public HTTPS origin without whitespace or control characters")
     parsed = urlsplit(url)
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
             or parsed.query or parsed.fragment or parsed.path not in ("", "/")):

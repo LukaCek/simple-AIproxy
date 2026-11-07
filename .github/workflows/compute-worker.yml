@@ -49,7 +49,7 @@ jobs:
         run: |
           python -m compileall -q compute_catalog.py compute_worker_storage.py compute_plane.py worker/agent.py compute_staging_smoke.py compute_staging_auto_smoke.py
           python -m pip install -r requirements.txt -r worker/requirements.txt pytest
-          pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py tests/test_compute_worker_storage.py tests/test_oblak_compose.py tests/test_compute_scheduler.py
+          pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py tests/test_compute_worker_storage.py tests/test_oblak_compose.py tests/test_compute_scheduler.py tests/test_compute_placement.py
           pytest -q tests/compute_streaming_check.py
           docker compose --env-file worker/.env.example -f worker/docker-compose.yml config --quiet
           docker compose --env-file deploy/compute-staging.env.example -f deploy/compute-staging.compose.yml config --quiet

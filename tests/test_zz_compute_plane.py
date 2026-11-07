@@ -517,3 +517,29 @@ def test_automatic_policy_moves_models_to_node_fit_and_resolves_exact_model(tmp_
             assert len(fast) == 1 and fast[0]["model"] == "qwen35-2b-q4"
             assert client.get("/admin/api/compute/placement", auth=ADMIN).json()["mode"] == "auto"
 
+
+
+def test_recommendations_distinguish_hard_ram_limit_from_temporary_usage():
+    """A warmed 2B model can use free RAM without making 4B permanently too large."""
+    import compute_plane
+
+    def node(limit_gib):
+        return {
+            "hardware_json": json.dumps({
+                "memory_limit_bytes": limit_gib * 1024**3,
+                "memory_available_bytes": 1024**3,
+                "disk_free_bytes": 100 * 1024**3,
+            }),
+            "models_json": json.dumps({
+                "active": "qwen35-2b-q4",
+                "installed": ["qwen35-2b-q4"],
+                "disk_limit_bytes": 8 * 1024**3,
+            }),
+        }
+
+    small = compute_plane.model_recommendations(node(3))
+    assert small["qwen35-4b-q4"]["grade"] == "too_large"
+    bigger = compute_plane.model_recommendations(node(6))
+    assert bigger["qwen35-4b-q4"]["grade"] in ("possible", "recommended")
+    assert bigger["qwen35-4b-q4"]["grade"] != "too_large"
+    assert bigger["qwen35-9b-q4"]["grade"] == "too_large"

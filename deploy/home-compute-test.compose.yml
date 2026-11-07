@@ -165,7 +165,7 @@ services:
       WORKER_NAME: home-test-worker
       WORKER_THREADS: "2"
       WORKER_REASONING: "on"
-      WORKER_DISK_LIMIT_GB: "3"
+      WORKER_DISK_LIMIT_GB: "8"
     volumes:
       - worker-data:/data
       - worker-models:/models
@@ -183,7 +183,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=128m
-    mem_limit: 3g
+    mem_limit: 6g
+    memswap_limit: 6g
     cpus: 2.0
     pids_limit: 256
     cap_drop: [ALL]

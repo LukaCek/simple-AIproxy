@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import base64
 import hashlib
 import json
+import math
 import secrets
 import sqlite3
 import time
@@ -143,7 +144,18 @@ def _public_node(row: dict[str, Any]) -> dict[str, Any]:
                 "test_seconds": max(0.0, min(float(state.get("test_seconds") or 0), 86400.0))
                     if isinstance(state.get("test_seconds"), (int, float)) else 0.0,
             }
+            benchmark = state.get("benchmark", {})
+            if isinstance(benchmark, dict):
+                safe_bench = {}
+                for name in ("prompt_tps", "generation_tps", "load_seconds", "wall_seconds"):
+                    v = benchmark.get(name)
+                    if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                            and math.isfinite(v) and 0 <= v <= 1_000_000):
+                        safe_bench[name] = round(float(v), 3)
+                safe_capabilities[mid]["benchmark"] = safe_bench
     models["capabilities"] = safe_capabilities
+    models["busy"] = bool(models.get("busy", False))
+    models["running_tasks"] = min(1, _nonnegative_int(models.get("running_tasks")))
     models["disk_used_bytes"] = _nonnegative_int(models.get("disk_used_bytes"))
     models["disk_limit_bytes"] = _nonnegative_int(models.get("disk_limit_bytes"))
     return {

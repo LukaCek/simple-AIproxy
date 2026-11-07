@@ -25,7 +25,7 @@
       </select>
       <button type="button" id="save-placement" class="rounded-lg border px-3 py-2">Save placement mode</button>
     </div>
-    <p class="mt-2 text-sm text-slate-600">Choose the approved GGUF models each worker should test automatically. The first checked model is preferred for warm startup. Workers download, benchmark and report which models actually run; they switch on demand and evict old files within their own Compose disk cap.</p>
+    <p class="mt-2 text-sm text-slate-600">Approve the GGUF models workers may use. In Manual mode every selected model is assigned; in Automatic mode each worker receives <strong>all</strong> approved models fitting its RAM and cumulative model-cache budget (largest model is warmed first). A single CPU worker loads only one model in RAM at a time. Model files can be evicted if the configured disk quota is exceeded.</p>
     <form id="model-policy" class="mt-4 space-y-3">
       {% for mid, info in catalog.items() %}
       <label class="flex items-center gap-3 text-sm">

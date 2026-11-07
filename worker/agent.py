@@ -46,15 +46,37 @@ def memory_limit():
 
 
 def _reclaimable_file_cache(stat_path: str, key: str) -> int:
-    """Return the inactive file-page cache the kernel may reclaim on pressure."""
+    """Estimate clean file-backed cache reclaimable under cgroup pressure.
+
+    The inactive_file counter alone excludes warm GGUF mmap pages in
+    active_file. When the previous llama-server exits these *clean* cached
+    pages may be reclaimed for another model. Exclude shmem and dirty /
+    writeback pages to avoid treating pending writes as disposable.
+    Fall back to the conservative inactive_file counter if needed.
+    """
     try:
+        counters = {}
         for line in Path(stat_path).read_text().splitlines():
             parts = line.split()
-            if len(parts) == 2 and parts[0] == key:
-                return max(0, int(parts[1]))
+            if len(parts) == 2:
+                counters[parts[0]] = max(0, int(parts[1]))
+        inactive = counters.get(key, 0)
+        # cgroup v2 file includes shmem/tmpfs; v1 total_cache is analogous.
+        if "file" in counters:
+            file_total = counters["file"]
+            shmem = counters.get("shmem", 0)
+            dirty = counters.get("file_dirty", 0)
+            writeback = counters.get("file_writeback", 0)
+        elif "total_cache" in counters:
+            file_total = counters["total_cache"]
+            shmem = counters.get("total_shmem", counters.get("shmem", 0))
+            dirty = counters.get("total_dirty", counters.get("dirty", 0))
+            writeback = counters.get("total_writeback", counters.get("writeback", 0))
+        else:
+            return inactive
+        return max(0, file_total - shmem - dirty - writeback)
     except (OSError, ValueError):
-        pass
-    return 0
+        return 0
 
 
 def memory_available():

@@ -219,7 +219,7 @@ class Monitor:
         return Panel(table, title="Model catalog · disk ≠ RAM · ● current inference",
                      border_style="blue", padding=(0, 1))
 
-    def render(self, sample: dict[str, Any], width: int = 120) -> Group:
+    def render(self, sample: dict[str, Any], width: int = 120, interval: float = 1.0) -> Group:
         status = sample["status"] or {}
         fresh = sample["fresh"]
         connected = bool(status.get("connected")) if fresh else False
@@ -234,7 +234,7 @@ class Monitor:
         header = Panel(heading, border_style="cyan", padding=(0, 1))
         resources = self.resource_panels(sample, width)
         freshness = "waiting for worker" if sample["age"] is None else f"last snapshot {sample['age']:.0f}s ago"
-        footer = Text(f"  q  quit     r  refresh     auto refresh 1s    ·    {freshness}", style="dim")
+        footer = Text(f"  q  quit     r  refresh now     + faster / - slower     interval {interval:g}s    ·    {freshness}", style="dim")
         return Group(header, resources, self.activity_panel(sample),
                      self.models_panel(sample), footer)
 
@@ -254,16 +254,22 @@ def main(argv: list[str] | None = None) -> int:
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
+    interval = 1.0
     try:
         tty.setcbreak(fd)
         with Live(console=console, screen=True, auto_refresh=False) as live:
             while True:
-                live.update(monitor.render(monitor.collect(), console.width), refresh=True)
-                readable, _, _ = select.select([sys.stdin], [], [], 1.0)
+                live.update(monitor.render(monitor.collect(), console.width, interval), refresh=True)
+                readable, _, _ = select.select([sys.stdin], [], [], interval)
                 if readable:
                     key = sys.stdin.read(1).lower()
                     if key in ("q", "\x03"):
                         break
+                    if key in ("+", "="):
+                        interval = max(0.25, round(interval / 2, 2))
+                    elif key in ("-", "_"):
+                        interval = min(8.0, round(interval * 2, 2))
+                    # r: immediately refresh on the next iteration.
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return 0

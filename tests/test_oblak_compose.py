@@ -25,3 +25,20 @@ def test_proxy_is_loopback_only_with_distinct_staging_resources():
     assert "worker-data" in config["volumes"]
     assert "proxy-state" in config["volumes"]
     assert "worker" in config["services"]
+
+
+def test_laptop_compose_has_no_open_ports_and_isolated_quota():
+    file = ROOT / "deploy/laptop-test-worker.compose.yml"
+    config = yaml.safe_load(file.read_text(encoding="utf-8"))
+    assert config["name"] == "simpleai-laptop-test"
+    worker = config["services"]["worker"]
+    assert "ports" not in worker
+    assert worker["read_only"] is True
+    assert worker["cap_drop"] == ["ALL"]
+    assert worker["environment"]["WORKER_DISK_LIMIT_GB"] == "3"
+    assert worker["mem_limit"] == "6g"
+    assert worker["memswap_limit"] == "6g"
+    assert worker["build"]["context"].startswith(
+        "https://github.com/LukaCek/simple-AIproxy.git#")
+    assert "worker-models" in config["volumes"]
+    assert "worker-data" in config["volumes"]

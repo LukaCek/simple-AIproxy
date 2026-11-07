@@ -7,6 +7,9 @@ on:
       - "compute_catalog.py"
       - "compute_worker_snapshot.py"
       - "tests/test_compute_worker_tui.py"
+      - "tests/test_compute_playground.py"
+      - "templates/playground.html"
+      - "main_impl.py"
       - "compute_worker_storage.py"
       - "compute_plane.py"
       - "compute_scheduler.py"
@@ -56,6 +59,7 @@ jobs:
           python -m compileall -q compute_catalog.py compute_worker_storage.py compute_plane.py compute_scheduler.py compute_placement.py compute_setup.py compute_worker_snapshot.py worker/agent.py worker/tui.py compute_staging_smoke.py compute_staging_auto_smoke.py
           python -m pip install -r requirements.txt -r worker/requirements.txt pytest
           pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py tests/test_compute_worker_storage.py tests/test_oblak_compose.py tests/test_compute_scheduler.py tests/test_compute_placement.py tests/test_compute_setup.py tests/test_compute_worker_tui.py
+          pytest -q tests/test_compute_playground.py
           pytest -q tests/compute_streaming_check.py
           python -m worker.tui --once > /tmp/simpleai-tui-snapshot.txt
           grep -q 'Compute Worker' /tmp/simpleai-tui-snapshot.txt

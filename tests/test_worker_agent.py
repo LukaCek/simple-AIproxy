@@ -334,3 +334,29 @@ def test_worker_refreshes_local_snapshot_each_second_but_not_wss_telemetry(monke
     assert len(publishes) == 3
     assert len(sock.messages) == 1
     assert sock.messages[0]["type"] == "telemetry"
+
+
+def test_reclaimable_clean_mmap_cache_includes_active_pages(tmp_path):
+    # A just-unloaded 2B GGUF often remains in active_file cache, which
+    # Linux can reclaim on pressure. Inactive-only gave false 4B failures.
+    stat = tmp_path / "memory.stat"
+    gib = 1024 ** 3
+    stat.write_text(
+        "file " + str(3 * gib) + "\n"
+        "inactive_file " + str(gib // 4) + "\n"
+        "active_file " + str(2 * gib) + "\n"
+        "shmem " + str(gib // 2) + "\n"
+        "file_dirty " + str(gib // 4) + "\n"
+        "file_writeback 0\n"
+    )
+    assert agent._reclaimable_file_cache(str(stat), "inactive_file") == (
+        3 * gib - gib // 2 - gib // 4
+    )
+
+
+def test_reclaimable_file_cache_never_counts_dirty_or_tmpfs(tmp_path):
+    stat = tmp_path / "memory.stat"
+    stat.write_text("file 1024\nshmem 600\nfile_dirty 300\nfile_writeback 100\ninactive_file 100\n")
+    assert agent._reclaimable_file_cache(str(stat), "inactive_file") == 24
+    stat.write_text("inactive_file 123\n")
+    assert agent._reclaimable_file_cache(str(stat), "inactive_file") == 123

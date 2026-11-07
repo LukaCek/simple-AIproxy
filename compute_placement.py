@@ -27,7 +27,7 @@ def models_for_node(selected: list[str], catalog: dict[str, dict],
         if not item:
             continue
         size = item["size"]
-        if int(size * 1.25) + reserve + headroom <= limit and int(size * 1.15) <= disk_limit:
+        if int(size * 1.30) + reserve + headroom <= limit and int(size * 1.15) <= disk_limit:
             allowed.append(mid)
     if not allowed:
         return []

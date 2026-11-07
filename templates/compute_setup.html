@@ -24,12 +24,12 @@
       </label>
       <label class="text-sm font-medium md:col-span-2">Resources
         <select id="profile" class="mt-1 block w-full rounded-lg border p-2">
-          <option value="manual" selected>Manual – set exact limits</option>
+          <option value="auto_max" selected>Auto – maximum safe performance</option>
           <option value="auto_shared">Auto – shared computer (leave room for other apps)</option>
-          <option value="auto_max">Auto – maximum safe performance</option>
+          <option value="manual">Manual – set exact limits</option>
         </select>
       </label>
-      <div id="manual-fields" class="contents">
+      <div id="manual-fields" style="display:none">
         <label class="text-sm font-medium">Docker RAM limit (GiB)
           <input id="memory" required type="number" min="2" max="256" step="1" value="2" class="mt-1 block w-full rounded-lg border p-2">
         </label>
@@ -44,7 +44,7 @@
         </label>
       </div>
     </div>
-    <p id="profile-hint" class="text-xs text-slate-600">These low defaults are suitable for testing a second worker on your existing computer. Model storage is an application-level budget, not an operating-system disk quota.</p>
+    <p id="profile-hint" class="text-xs text-slate-600">Auto Maximum measures the actual Linux host's free RAM, CPU and Docker storage. It leaves a safety reserve. Switch to Manual for exact limits.</p>
     <p class="text-xs text-amber-800">New workers cannot process private prompts unless you explicitly enable trust after enrollment. Keep the one-time code confidential.</p>
     <div id="status" role="status" aria-live="polite" class="hidden rounded-lg bg-slate-100 p-3 text-sm"></div>
     <button id="generate" class="rounded-lg bg-slate-900 px-4 py-3 text-sm font-medium text-white" type="submit">Create one-line installation</button>
@@ -52,19 +52,15 @@
 
   <div id="result" class="hidden rounded-2xl border bg-white p-6 space-y-4">
     <h3 class="font-semibold">Install on the worker computer</h3>
-    <p class="text-sm">The setup code expires at <strong id="expires"></strong>. Open an interactive terminal on the computer where you want the worker.</p>
-    <p class="font-medium text-sm">1. Copy and run this one-line command:</p>
+    <p class="text-sm">The included enrollment code expires at <strong id="expires"></strong>. Run the full command in a terminal on the target computer. No additional prompt or second paste is needed.</p>
+    <p class="font-medium text-sm">1. Copy and run this one-line command (contains a secret):</p>
     <div class="flex gap-2 items-start">
       <pre class="min-w-0 flex-1 overflow-x-auto rounded-xl bg-slate-900 p-4 text-xs text-white"><code id="command"></code></pre>
       <button id="copy-command" type="button" class="rounded-lg border px-3 py-2 text-xs">Copy</button>
     </div>
-    <p class="text-sm">2. When prompted, paste this one-time setup code. It is intentionally <strong>not included in the command</strong> or your shell history:</p>
-    <div class="flex gap-2 items-start">
-      <pre class="min-w-0 flex-1 overflow-x-auto rounded-xl bg-slate-100 p-4 text-xs"><code id="code"></code></pre>
-      <button id="copy-code" type="button" class="rounded-lg border px-3 py-2 text-xs">Copy code</button>
-    </div>
+    <p class="text-xs text-amber-800"><strong>Secret command:</strong> The one-time enrollment token is embedded in this command and may remain in terminal history, clipboard managers or process listings. Use it only on machines you control. It expires after 15 minutes or first enrollment; never publish or share it.</p>
     <p class="text-xs text-slate-600">For the isolated home test, run this on the same Linux machine where <code>simpleai-home-test</code> is already running. The installer uses its local CA/network and builds a separate worker project. For real VPS deployments, use the public HTTPS address.</p>
-    <p class="text-sm">3. Once completed, open <a href="/admin/compute-nodes" class="underline">Compute Nodes</a>, verify the new name appears independently, then test a harmless public prompt.</p>
+    <p class="text-sm">2. Once completed, open <a href="/admin/compute-nodes" class="underline">Compute Nodes</a>, verify the new name appears independently, then test a harmless public prompt.</p>
     <details class="rounded-lg border p-3 text-sm">
       <summary class="cursor-pointer font-medium">Alternative: download Compose files manually</summary>
       <p class="mt-2 text-xs text-slate-600">Works for manual resource settings only. Keep the enrollment file private and remove its token after registration.</p>
@@ -101,8 +97,9 @@
     const manual = $("profile").value === "manual";
     for(const id of ["memory","disk","cpus","threads"]) {
       $(id).disabled = !manual;
+      $(id).required = manual;
     }
-    $("manual-fields").style.opacity = manual ? "1" : "0.45";
+    $("manual-fields").style.display = manual ? "contents" : "none";
     $("profile-hint").textContent = manual ?
       "Exact CPU/RAM/disk limits. Defaults suit a small second worker on this computer." :
       "Resources will be measured on the target Linux host by the installer, not guessed by the proxy.";
@@ -130,7 +127,7 @@
       });
       const data = await response.json();
       if(!response.ok) throw new Error(data.detail || "Could not create installer");
-      files = {compose:data.compose,env:data.env,token:data.install_code};
+      files = {compose:data.compose,env:data.env};
       const sourceOrigin = location.origin;
       if(!sourceOrigin.startsWith("https://") && !(staging && sourceOrigin === "http://127.0.0.1:18180") &&
          !(staging && sourceOrigin === "http://localhost:18180"))
@@ -138,23 +135,18 @@
       const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
       $("command").textContent =
         "curl -fsSL " + quote(sourceOrigin + "/compute/install.sh") +
-        " | bash -s -- " + quote(sourceOrigin);
-      $("code").textContent = data.install_code;
+        " | bash -s -- " + quote(sourceOrigin) + " " + quote(data.install_code);
       $("expires").textContent = new Date(data.expires_at*1000).toLocaleString();
       $("result").classList.remove("hidden");
       $("download-compose").disabled = payload.profile !== "manual";
       $("download-env").disabled = payload.profile !== "manual";
-      notice("Installer ready. Copy the command and enter the code when asked.");
+      notice("Installer ready. Copy the ONE command. It includes the short-lived secret code.");
     } catch(error) { notice(error.message || "Setup failed"); }
     finally { $("generate").disabled = false; }
   });
   $("copy-command").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText($("command").textContent); notice("Command copied."); }
     catch (_) { notice("Copy blocked by browser. Select the command manually."); }
-  });
-  $("copy-code").addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText($("code").textContent); notice("One-time setup code copied."); }
-    catch (_) { notice("Copy blocked by browser. Select the code manually."); }
   });
   $("download-compose").addEventListener("click", () => files && save("docker-compose.yml",files.compose));
   $("download-env").addEventListener("click", () => files && save(".env",files.env));

@@ -117,3 +117,76 @@ def test_btop_keyboard_refresh_controls():
     assert change_interval(0.25, "+") == 0.25
     assert change_interval(8.0, "-") == 8.0
     assert change_interval(2.0, "r") == 2.0
+
+
+def test_llama_cpu_is_measured_separately_from_terminal_cpu(tmp_path):
+    import os
+    from compute_worker_snapshot import llama_server_process
+    cgroup = tmp_path / "cgroup"
+    proc = tmp_path / "proc"
+    cgroup.mkdir()
+    proc.mkdir()
+    process = proc / "123"
+    process.mkdir()
+    (process / "comm").write_text("llama-server\n")
+    clock = os.sysconf("SC_CLK_TCK")
+
+    def write_stat(ticks: int):
+        # Linux /proc/PID/stat: field 3=state, 14/15=user/system CPU,
+        # 24=resident pages.
+        fields = ["S"] + ["0"] * 21
+        fields[11] = str(ticks)
+        fields[12] = "0"
+        fields[21] = "1000"
+        (process / "stat").write_text(f"123 (llama-server) " + " ".join(fields))
+    
+    write_stat(clock)
+    (cgroup / "memory.current").write_text(str(1024**3))
+    (cgroup / "cpu.stat").write_text("usage_usec 1000000\n")
+    data = tmp_path / "data"
+    data.mkdir()
+    status = fake_snapshot(1000)
+    status["hardware"]["cpus"] = 2
+    write_snapshot(data / STATUS_FILE, status)
+    monitor = Monitor(data=data, models=tmp_path, cgroup=cgroup, proc=proc)
+    assert llama_server_process(proc)["pid"] == 123
+    first = monitor.collect(now=1000, monotonic=10.0)
+    assert first["cpu"] is None
+
+    write_stat(clock * 2)
+    # Container total grows by 1.8 CPU-seconds while model consumes 1 CPU-second.
+    (cgroup / "cpu.stat").write_text("usage_usec 2800000\n")
+    second = monitor.collect(now=1001, monotonic=11.0)
+    assert round(second["cpu"]) == 50
+    assert round(second["container_cpu"]) == 90
+    assert second["llama_rss"] == 1000 * os.sysconf("SC_PAGE_SIZE")
+    console = Console(record=True, width=140, color_system=None)
+    console.print(monitor.render(second, 140))
+    output = console.export_text()
+    assert "Inference CPU" in output
+    assert "Container CPU" in output
+    assert "llama-server resident RAM" in output
+
+    (process / "comm").write_text("python\n")
+    idle = monitor.collect(now=1002, monotonic=12)
+    assert idle["cpu"] is None
+    assert idle["llama_pid"] is None
+
+
+def test_loading_ram_shows_real_rss_not_fake_percentage(tmp_path):
+    from compute_worker_snapshot import STATUS_FILE, write_snapshot
+    data = tmp_path / "data"
+    data.mkdir()
+    status = fake_snapshot(1000)
+    status["phase"] = "loading into RAM"
+    status["current_model"] = "qwen35-4b-q4"
+    write_snapshot(data / STATUS_FILE, status)
+    monitor = Monitor(data=data, models=tmp_path, cgroup=tmp_path)
+    sample = monitor.collect(now=1001, monotonic=5)
+    sample["llama_rss"] = 256 * 1024**2
+    console = Console(record=True, width=140, color_system=None)
+    console.print(monitor.render(sample, 140))
+    rendered = console.export_text()
+    assert "loading" in rendered.lower()
+    assert "256 MiB" in rendered
+    assert "No reliable load %" in rendered

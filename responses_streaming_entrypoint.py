@@ -347,7 +347,17 @@ async def chat_completions(
         )
 
     from compute_scheduler import order_candidates
-    endpoints = order_candidates(_impl.resolve_requested_model(requested_model), payload)
+    if requested_model == "local/auto":
+        from compute_plane import automatic_endpoints
+        try:
+            candidates = automatic_endpoints(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not candidates:
+            raise HTTPException(status_code=404, detail="No worker model supports the requested automatic tier")
+    else:
+        candidates = _impl.resolve_requested_model(requested_model)
+    endpoints = order_candidates(candidates, payload)
     api_key_value = api_key_record["key"]
     api_key_name = api_key_record["name"] if "name" in api_key_record.keys() else None
     prompt_text = _impl.extract_prompt(payload)

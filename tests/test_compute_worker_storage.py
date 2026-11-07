@@ -220,11 +220,11 @@ def test_cgroup_file_cache_does_not_disqualify_loaded_model(monkeypatch):
     mib = storage.MIB
     real_read = Path.read_text
     fake_files = {
-        "/proc/meminfo": "MemAvailable: 12582912 kB\\n",
+        "/proc/meminfo": "MemAvailable: 12582912 kB\n",
         "/sys/fs/cgroup/memory.current": str(int(1.70 * gib)),
         "/sys/fs/cgroup/memory.stat":
-            "anon 260000000\\nfile 1300000000\\ninactive_file " +
-            str(int(1.10 * gib)) + "\\n",
+            "anon 260000000\nfile 1300000000\ninactive_file " +
+            str(int(1.10 * gib)) + "\n",
     }
 
     def fake_read(self, *args, **kwargs):
@@ -245,10 +245,10 @@ def test_cgroup_nonreclaimable_usage_still_limits_model_admission(monkeypatch):
     gib = storage.GIB
     real_read = Path.read_text
     fake_files = {
-        "/proc/meminfo": "MemAvailable: 12582912 kB\\n",
+        "/proc/meminfo": "MemAvailable: 12582912 kB\n",
         "/sys/fs/cgroup/memory.current": str(int(1.70 * gib)),
         "/sys/fs/cgroup/memory.stat":
-            "anon 1800000000\\nfile 10000000\\ninactive_file 0\\n",
+            "anon 1800000000\nfile 10000000\ninactive_file 0\n",
     }
 
     def fake_read(self, *args, **kwargs):
@@ -263,10 +263,10 @@ def test_cgroup_v1_reclaimable_cache_is_supported(monkeypatch):
     gib = storage.GIB
     real_read = Path.read_text
     fake_files = {
-        "/proc/meminfo": "MemAvailable: 12582912 kB\\n",
+        "/proc/meminfo": "MemAvailable: 12582912 kB\n",
         "/sys/fs/cgroup/memory/memory.usage_in_bytes": str(int(1.70 * gib)),
         "/sys/fs/cgroup/memory/memory.stat":
-            "total_inactive_file " + str(int(1.10 * gib)) + "\\n",
+            "total_inactive_file " + str(int(1.10 * gib)) + "\n",
     }
 
     def fake_read(self, *args, **kwargs):

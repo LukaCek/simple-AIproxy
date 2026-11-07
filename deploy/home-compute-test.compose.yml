@@ -15,6 +15,9 @@ services:
       - "127.0.0.1:18180:8000"
     environment:
       ADMIN_USERNAME: staging-admin
+      # Enable the installer-only loopback test and internal worker WSS URL.
+      # Never use this development switch in production.
+      AIPROXY_COMPUTE_HOME_TEST: "1"
       AIPROXY_NTFY_URL: ""
       AIPROXY_NTFY_TOKEN: ""
     volumes:

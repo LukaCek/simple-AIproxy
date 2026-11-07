@@ -151,6 +151,33 @@ If your terminal is too narrow, the resource cards collapse to a compact
 table. The TUI requires a real interactive terminal for live mode; use
 `--once` when piping output to another command.
 
+## Proxy request logs and worker event audit
+
+- Normal Compute Worker chat calls appear in **Request Logs** with their
+  selected provider/model, status and timing. **Provider Attempts** records
+  fallback, errors and `privacy_skip` (private prompts never forwarded to
+  untrusted nodes).
+- Streaming calls are logged **after the stream completes or fails**, not when
+  HTTP 200 headers are first created. Interrupted streams are recorded as
+  `stream_error` (502 in the audit record) even if the client has already
+  received HTTP 200 headers.
+- On `/admin/compute-nodes`, **Compute worker events** shows connect/disconnect,
+  policy updates, model self-test statuses, model load/unload, manual operations
+  and trust/revocation changes. The admin-only read endpoint is
+  `GET /admin/api/compute/events?limit=100`; filter with `node_id=...`.
+- The event audit stores **only structured metadata**, not prompt contents,
+  model outputs, WSS payloads, node credentials or API keys. Heartbeats are
+  not logged. Retention is at most 30 days and 1000 events per node.
+- Raw `llama-server` output is not collected by this audit; the worker's
+  Docker stdout captures disconnect errors. Worker model test details remain
+  available through the admin node capabilities status.
+- **Version updates:** the worker image is currently updated on its own host
+  with `docker compose pull && docker compose up -d`. The admin proxy does
+  *not* have Docker daemon privileges, and must not be granted a host Docker
+  socket just to offer remote updates. A remote-update feature requires a
+  separate opt-in, strongly restricted host update service, image verification,
+  explicit host-owner consent and rollback.
+
 ## Pre-production acceptance checks
 
 - All proxy and worker GitHub CI tests pass, including both amd64 and arm64

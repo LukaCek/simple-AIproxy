@@ -6,7 +6,7 @@ name: simpleai-home-test
 services:
   proxy:
     build:
-      context: ../..
+      context: ..
       dockerfile: Dockerfile
     image: simpleai-home-test/proxy:local
     restart: unless-stopped
@@ -148,7 +148,7 @@ services:
 
   worker:
     build:
-      context: ../..
+      context: ..
       dockerfile: worker/Dockerfile
     image: simpleai-home-test/worker:local
     restart: unless-stopped

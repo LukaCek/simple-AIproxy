@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import math
+import os
 import secrets
 import sqlite3
 import threading
@@ -43,20 +44,44 @@ _registry_lock = asyncio.Lock()
 # Reserve before dispatch: heartbeat telemetry is too stale to prevent races.
 _reservation_lock = threading.Lock()
 _reservations: dict[str, str] = {}
+_reservation_waiters: dict[str, int] = {}
 _installed = False
 
 
-async def _reserve(node_id: str, timeout: float = 2.0) -> str | None:
+def _wait_timeout() -> float:
+    try:
+        value = float(os.environ.get("AIPROXY_COMPUTE_QUEUE_WAIT_SECONDS", "10"))
+    except ValueError:
+        return 10.0
+    return value if math.isfinite(value) and 0 <= value <= 60 else 10.0
+
+
+async def _reserve(node_id: str, timeout: float | None = None) -> str | None:
+    """Reserve one slot with bounded waiters. Does not depend on stale telemetry."""
+    if timeout is None:
+        timeout = _wait_timeout()
     token = uuid.uuid4().hex
-    deadline = time.monotonic() + timeout
-    while True:
-        with _reservation_lock:
-            if node_id not in _reservations:
-                _reservations[node_id] = token
-                return token
-        if time.monotonic() >= deadline:
+    deadline = time.monotonic() + max(0, timeout)
+    with _reservation_lock:
+        if _reservation_waiters.get(node_id, 0) >= 16:
             return None
-        await asyncio.sleep(0.05)
+        _reservation_waiters[node_id] = _reservation_waiters.get(node_id, 0) + 1
+    try:
+        while True:
+            with _reservation_lock:
+                if node_id not in _reservations:
+                    _reservations[node_id] = token
+                    return token
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.05)
+    finally:
+        with _reservation_lock:
+            remaining = _reservation_waiters.get(node_id, 1) - 1
+            if remaining > 0:
+                _reservation_waiters[node_id] = remaining
+            else:
+                _reservation_waiters.pop(node_id, None)
 
 
 def _release(node_id: str, token: str) -> None:

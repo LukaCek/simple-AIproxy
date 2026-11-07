@@ -3,6 +3,41 @@
 CPU-only GGUF worker for Linux Docker hosts, amd64 or arm64. Requires outbound
 HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
 
+## One-line Linux installation (recommended)
+
+Open /admin/compute-setup on the proxy. Choose a worker name (for example
+oblak-vps-1), a publicly reachable HTTPS proxy URL, and Manual limits or an
+Auto resource profile. Copy the one-line Linux command into a terminal on the
+target machine. Paste the separately generated, short-lived setup code when
+asked. No token is placed into the shell command or history.
+
+Requirements: Linux AMD64 or ARM64; Docker Engine + Compose v2, Python 3,
+curl, and outbound HTTPS/WSS. Docker is not installed or configured silently.
+
+The installer creates a new, isolated Compose project in
+~/.local/share/simpleai-compute/<worker-name>. It preserves its own model and
+identity volumes, clears the enrollment token from the private .env file
+after successful registration, and recreates that one container without it.
+The worker cannot access the host's Docker socket. Newly enrolled workers
+are untrusted for private prompts until approved in the admin dashboard.
+
+Auto Shared and Auto Maximum measure resources on the target Linux machine,
+including free memory and Docker's filesystem. These are conservative resource
+budgets, not guarantees that a particular model will fit.
+
+### Test a second worker on the same computer
+
+Update and rebuild the isolated deploy/home-compute-test.compose.yml stack.
+Open http://127.0.0.1:18180/admin/compute-setup on that computer. Set a
+distinct name, e.g. oblak-vps-1, and use the default internal HTTPS worker
+URL. Copy the generated one-line command and enter its code on the SAME host.
+It uses the existing home-test image, the public staging CA and network,
+but gets its own Compose project, model cache and identity. The original
+home-test-worker and production services are not changed by this installer.
+
+For an actual VPS or Raspberry Pi use the externally reachable public HTTPS
+proxy and the published multiarchitecture worker image, not loopback staging.
+
 ## Installation
 
 1. First deploy the proxy version containing PR #24 and publish the worker

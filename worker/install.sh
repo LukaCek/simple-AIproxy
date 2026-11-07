@@ -131,10 +131,10 @@ if profile != 'manual':
     disk_gb = min(64, math.floor((max_disk * (0.40 if share else 0.70)) / gib))
     if disk_gb < 2:
         raise SystemExit('Insufficient Docker disk space for a safe auto worker.')
-    env += (f'WORKER_MEMORY_LIMIT={memory_gb}g\\n'
-            f'WORKER_CPU_LIMIT={cpu_limit}\\n'
-            f'WORKER_THREADS={threads}\\n'
-            f'WORKER_DISK_BUDGET_GB={disk_gb}\\n')
+    env += (f'WORKER_MEMORY_LIMIT={memory_gb}g\n'
+            f'WORKER_CPU_LIMIT={cpu_limit}\n'
+            f'WORKER_THREADS={threads}\n'
+            f'WORKER_DISK_BUDGET_GB={disk_gb}\n')
     print(f'Auto limits: RAM {memory_gb} GiB, CPU {cpu_limit}, '
           f'threads {threads}, disk budget {disk_gb} GiB', file=sys.stderr)
 

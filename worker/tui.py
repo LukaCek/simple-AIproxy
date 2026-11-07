@@ -42,6 +42,15 @@ SPARK = "▁▂▃▄▅▆▇█"
 GIB = 1024 ** 3
 
 
+def change_interval(current: float, key: str) -> float:
+    """btop-like keyboard speed control: + faster, - slower."""
+    if key in ("+", "="):
+        return max(0.25, round(current / 2, 2))
+    if key in ("-", "_"):
+        return min(8.0, round(current * 2, 2))
+    return current
+
+
 def human_bytes(value: Any) -> str:
     if not isinstance(value, (float, int)) or isinstance(value, bool) or value < 0:
         return "—"
@@ -265,10 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                     key = sys.stdin.read(1).lower()
                     if key in ("q", "\x03"):
                         break
-                    if key in ("+", "="):
-                        interval = max(0.25, round(interval / 2, 2))
-                    elif key in ("-", "_"):
-                        interval = min(8.0, round(interval * 2, 2))
+                    interval = change_interval(interval, key)
                     # r: immediately refresh on the next iteration.
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)

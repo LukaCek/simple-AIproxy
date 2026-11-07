@@ -108,6 +108,14 @@ def test_private_is_not_routed_to_untrusted_node(tmp_path, monkeypatch):
                 result = call.result(timeout=10)
             assert result.status_code == 200
             assert result.json()["choices"][0]["message"]["content"] == "OK"
+            import main_impl as core
+            with sqlite3.connect(str(core.DB_PATH)) as db:
+                record = db.execute(
+                    "SELECT status_code,output FROM Logs "
+                    "WHERE requested_model='local/qwen35-4b-q4' AND status_code=200 "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            assert record == (200, "OK")
 
 
 def test_catalog_rejects_unknown_model(tmp_path, monkeypatch):

@@ -5,6 +5,8 @@ on:
     paths:
       - "worker/**"
       - "compute_catalog.py"
+      - "compute_worker_snapshot.py"
+      - "tests/test_compute_worker_tui.py"
       - "compute_worker_storage.py"
       - "compute_plane.py"
       - "compute_scheduler.py"

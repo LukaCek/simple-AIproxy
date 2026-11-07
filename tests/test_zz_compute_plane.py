@@ -244,6 +244,8 @@ def test_real_wss_sse_chunk_passthrough(tmp_path, monkeypatch):
                 result = future.result(timeout=15)
             assert result.status_code == 200, result.text
             assert result.content == expected
+            assert identity["node_id"] not in compute_plane._reservations
+            assert compute_plane.endpoints("local/qwen35-0.8b-q4")[0]["model_metadata"]["context_tokens"] == 4096
 
 
 def test_streaming_consent_is_rechecked_at_first_byte(tmp_path, monkeypatch):

@@ -61,3 +61,45 @@ def order_candidates(endpoints: list[dict[str, Any]], payload: dict[str, Any]) -
     for i, endpoint in zip(slots, ranked):
         result[i] = endpoint
     return result
+
+
+def auto_tier(payload: dict[str, Any]) -> str:
+    """Explicit quality requests win over conservative length-based defaults."""
+    tier = payload.get("aiproxy_compute_tier", "auto")
+    if tier not in ("auto", "fast", "balanced", "quality"):
+        raise ValueError("aiproxy_compute_tier must be auto, fast, balanced or quality")
+    if tier != "auto":
+        return tier
+    inp, out = estimate_tokens(payload)
+    if inp < 256 and out <= 128:
+        return "fast"
+    if inp < 1400 and out <= 512:
+        return "balanced"
+    return "quality"
+
+
+def auto_candidates(endpoints: list[dict[str, Any]], payload: dict[str, Any],
+                    catalog: dict[str, dict]) -> list[dict[str, Any]]:
+    """Select one catalog model, then schedule only equivalent replicas.
+
+    Explicit 'quality' never degrades to a tiny model. Automatic selection is
+    heuristic, not a reliable measure of semantic difficulty.
+    """
+    tier = auto_tier(payload)
+    size_by_id = {mid: v.get("size", 0) for mid, v in catalog.items()}
+    available = {e["model"] for e in endpoints if e.get("model") in size_by_id}
+    if not available:
+        return []
+    gib = 1024 ** 3
+    eligible = [mid for mid in available if (
+        (tier == "fast" and size_by_id[mid] <= 1.5 * gib) or
+        (tier == "balanced" and 1.0 * gib <= size_by_id[mid] <= 3.5 * gib) or
+        (tier == "quality" and size_by_id[mid] >= 2.5 * gib)
+    )]
+    if not eligible:
+        if payload.get("aiproxy_compute_tier", "auto") != "auto":
+            return []
+        # Automatic mode can use a weaker available model; explicit tiers cannot.
+        eligible = list(available)
+    chosen = max(eligible, key=lambda mid: size_by_id[mid])
+    return order_candidates([e for e in endpoints if e["model"] == chosen], payload)

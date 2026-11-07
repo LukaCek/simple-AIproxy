@@ -1,0 +1,199 @@
+# Isolated all-in-one home test for SimpleAI Proxy + CPU worker + TUI.
+# Run from a NEW checkout of feat/compute-worker-live-tui (not production).
+# Does not expose anything to the network beyond 127.0.0.1:18180.
+name: simpleai-home-test
+
+services:
+  proxy:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: simpleai-home-test/proxy:local
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:18180:8000"
+    environment:
+      ADMIN_USERNAME: staging-admin
+      AIPROXY_NTFY_URL: ""
+      AIPROXY_NTFY_TOKEN: ""
+    volumes:
+      - proxy-state:/state
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        if [ ! -s /state/config.yml ]; then
+          printf '%s\n' 'providers: []' 'groups: {}' 'model_profiles: {}' > /state/config.yml
+        fi
+        if [ ! -s /state/admin-password ]; then
+          python -c 'import secrets; print(secrets.token_urlsafe(32))' > /state/admin-password
+        fi
+        ln -sfn /state/config.yml /app/config.yml
+        ln -sfn /state/app.db /app/app.db
+        export ADMIN_PASSWORD="$$(cat /state/admin-password)"
+        exec uvicorn full_entrypoint:app --host 0.0.0.0 --port 8000
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=5)"
+      interval: 15s
+      timeout: 7s
+      retries: 8
+      start_period: 25s
+    mem_limit: 512m
+    cpus: 1.0
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  # Internal TLS reverse proxy for WSS. Does not touch NPM or Cloudflare routes.
+  gateway:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # Official Caddy image does not set an ENTRYPOINT; invoke caddy explicitly.
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - https://home-compute.internal:8443
+      - --to
+      - http://proxy:8000
+      - --internal-certs
+      - --disable-redirects
+    depends_on:
+      proxy:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - home-compute.internal
+    volumes:
+      - gateway-state:/data
+      - gateway-config:/config
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  # The worker receives the staging CA certificate, never Caddy's private key.
+  ca-export:
+    image: busybox:1.37
+    restart: "no"
+    depends_on:
+      gateway:
+        condition: service_started
+    volumes:
+      - gateway-state:/caddy-state:ro
+      - staging-ca:/public-ca
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        n=0
+        until [ -s /caddy-state/caddy/pki/authorities/local/root.crt ]; do
+          wget -q -O /dev/null --no-check-certificate https://home-compute.internal:8443/openapi.json || true
+          n=$$((n + 1))
+          if [ "$$n" -ge 60 ]; then
+            echo 'Staging Caddy root CA was not generated' >&2
+            exit 1
+          fi
+          sleep 1
+        done
+        cp /caddy-state/caddy/pki/authorities/local/root.crt /public-ca/root.crt
+        chmod 0644 /public-ca/root.crt
+
+  # Register the first worker automatically using the staging-only admin account.
+  # No token or password is committed or printed to Docker logs.
+  enroll:
+    image: python:3.11-alpine
+    restart: "no"
+    depends_on:
+      proxy:
+        condition: service_healthy
+    volumes:
+      - proxy-state:/state:ro
+      - enrollment:/enrollment
+    entrypoint:
+      - python
+      - -c
+      - |
+        import base64
+        import json
+        import os
+        from pathlib import Path
+        from urllib.request import Request, urlopen
+
+        token_file = Path('/enrollment/token')
+        password = Path('/state/admin-password').read_text().strip()
+        credentials = base64.b64encode(f'staging-admin:{password}'.encode()).decode()
+        req = Request(
+            'http://proxy:8000/admin/api/compute/enrollments',
+            data=b'{}',
+            headers={
+                'Authorization': f'Basic {credentials}',
+                'X-SimpleAI-Admin-Action': '1',
+                'Content-Type': 'application/json',
+            },
+            method='POST',
+        )
+        with urlopen(req, timeout=20) as response:
+            token = json.load(response)['token']
+        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(token)
+        os.chmod(token_file, 0o600)
+        os.chown(token_file, 10001, 10001)
+        print('Created a one-time staging worker enrollment token')
+
+  worker:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    image: simpleai-home-test/worker:local
+    restart: unless-stopped
+    init: true
+    depends_on:
+      ca-export:
+        condition: service_completed_successfully
+      enroll:
+        condition: service_completed_successfully
+    environment:
+      SIMPLEAI_PROXY_URL: https://home-compute.internal:8443
+      SSL_CERT_FILE: /tmp/staging-ca-bundle.pem
+      REQUESTS_CA_BUNDLE: /tmp/staging-ca-bundle.pem
+      WORKER_NAME: home-test-worker
+      WORKER_THREADS: "2"
+      WORKER_REASONING: "on"
+      WORKER_DISK_LIMIT_GB: "3"
+    volumes:
+      - worker-data:/data
+      - worker-models:/models
+      - staging-ca:/staging-ca:ro
+      - enrollment:/enrollment:ro
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        cat /etc/ssl/certs/ca-certificates.crt /staging-ca/root.crt > /tmp/staging-ca-bundle.pem
+        if [ -r /enrollment/token ]; then
+          export WORKER_ENROLLMENT_TOKEN="$$(cat /enrollment/token)"
+        fi
+        exec python agent.py
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+    mem_limit: 3g
+    cpus: 2.0
+    pids_limit: 256
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  proxy-state:
+  gateway-state:
+  gateway-config:
+  staging-ca:
+  enrollment:
+  worker-data:
+  worker-models:

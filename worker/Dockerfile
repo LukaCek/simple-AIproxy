@@ -21,7 +21,7 @@ ENV LD_LIBRARY_PATH=/usr/local/bin PYTHONUNBUFFERED=1 HOME=/data HF_HOME=/models
 WORKDIR /app
 COPY worker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-COPY compute_catalog.py compute_worker_storage.py worker/agent.py /app/
+COPY compute_catalog.py compute_worker_storage.py compute_worker_snapshot.py worker/agent.py worker/tui.py /app/
 RUN mkdir /data /models && chown -R 10001:10001 /data /models
 USER 10001:10001
 CMD ["python", "agent.py"]

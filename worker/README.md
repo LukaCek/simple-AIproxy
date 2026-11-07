@@ -101,6 +101,49 @@ be reused.
 Unprivileged container with no Docker socket, no exposed ports, configurable
 Docker CPU/memory limits and restricted model operations.
 
+## Local live terminal dashboard (TUI)
+
+After starting a worker, open a terminal on the machine running Docker:
+
+```bash
+docker compose exec compute-worker python tui.py
+```
+
+The dashboard runs **inside the existing container**; it does not start a
+second inference worker or require a separate port. Press **q** to quit.
+To print one snapshot without an interactive TTY:
+
+```bash
+docker compose exec -T compute-worker python tui.py --once
+```
+
+The dashboard updates every second and shows:
+- Current connection status to the proxy and the live phase (idle, checking
+  disk/downloading, loading, benchmarking, generating or disconnected).
+- The model currently active for inference and elapsed job time.
+- All catalog models, which are approved by policy, tested capability,
+  saved GGUF files (disk), current model resident in **RAM**, and which model
+  is actively generating right now.
+- Actual measured generation tokens/second, when reported by llama.cpp.
+- CPU quota utilization, container cgroup memory usage and model storage
+  quota utilization. A recent CPU/memory history is shown on wide terminals.
+
+Worker status is written atomically to `/data/worker-runtime-status.json`
+with permissions 0600. The TUI is **read-only** and polls only this local
+snapshot, the local model directory and Linux cgroup counters. It never
+opens an API connection, executes shell commands, downloads models or reads
+the worker's identity file. **Prompts, API keys and enrollment credentials are
+never written into the snapshot**.
+
+If the worker process stops, the TUI labels the snapshot stale after 45
+seconds rather than pretending the old job is still running. CPU/memory
+gauges use the container's cgroup; they are *not host-wide* utilization.
+The disk budget is an application-enforced quota, not a filesystem limit.
+
+If your terminal is too narrow, the resource cards collapse to a compact
+table. The TUI requires a real interactive terminal for live mode; use
+`--once` when piping output to another command.
+
 ## Pre-production acceptance checks
 
 - All proxy and worker GitHub CI tests pass, including both amd64 and arm64

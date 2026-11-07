@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from websockets.asyncio.client import connect
 from compute_catalog import CATALOG
+from compute_worker_snapshot import STATUS_FILE, write_snapshot
 from compute_worker_storage import (disk_limit_bytes, used_bytes, install_model, remove_model, verify_model, target_path, prune_to_limit)
 
 DATA = Path(os.getenv("WORKER_DATA_DIR", "/data"))
@@ -187,6 +188,72 @@ class Worker:
         # If an operator lowers the Compose disk budget, automatically reclaim
         # oldest cached model files before accepting more downloads.
         prune_to_limit(MODELS, DISK_LIMIT_BYTES, self.last_used)
+        self.connected = False
+        self.phase = "starting"
+        self.current_model = None
+        self.current_kind = None
+        self.phase_started_at = int(time.time())
+        self.job_started_at = None
+        self._publish_snapshot()
+
+    def _publish_snapshot(self):
+        """Local TUI observability only: never serialize credentials or prompts."""
+        try:
+            state = self.status()
+            safe_capabilities = {}
+            for mid, result in self.capabilities.items():
+                if mid not in CATALOG or not isinstance(result, dict):
+                    continue
+                metric = result.get("benchmark")
+                safe_metric = {}
+                if isinstance(metric, dict):
+                    for name in ("prompt_tps", "generation_tps", "load_seconds"):
+                        value = metric.get(name)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value < 1_000_000:
+                            safe_metric[name] = round(float(value), 3)
+                safe_capabilities[mid] = {
+                    "status": result.get("status") if result.get("status") in
+                        ("supported", "unsupported", "testing", "error") else "untested",
+                    "benchmark": safe_metric,
+                }
+            snapshot = {
+                "schema": 1, "updated_at": time.time(), "worker_name": NAME,
+                "connected": self.connected, "phase": self.phase,
+                "phase_started_at": self.phase_started_at,
+                "job_started_at": self.job_started_at,
+                "current_model": self.current_model, "current_kind": self.current_kind,
+                "policy": list(self.policy or []),
+                "hardware": hardware(),
+                "models": {
+                    "installed": state["installed"], "active": state["active"],
+                    "ready": state["ready"], "busy": state["busy"],
+                    "running_tasks": state["running_tasks"],
+                    "disk_used_bytes": state["disk_used_bytes"],
+                    "disk_limit_bytes": state["disk_limit_bytes"],
+                    "policy_revision": state["policy_revision"],
+                    "capabilities": safe_capabilities,
+                },
+            }
+            write_snapshot(DATA / STATUS_FILE, snapshot)
+        except (OSError, ValueError, TypeError):
+            # Diagnostics must never prevent inference or reconnects.
+            pass
+
+    def _activity(self, phase, model=None, kind=None):
+        now = time.time()
+        if phase in ("idle", "starting", "connecting", "disconnected"):
+            self.current_model = None
+            self.current_kind = None
+            self.job_started_at = None
+        else:
+            if self.job_started_at is None:
+                self.job_started_at = now
+            self.current_model = model
+            if kind is not None:
+                self.current_kind = kind
+        self.phase = phase
+        self.phase_started_at = now
+        self._publish_snapshot()
 
     def _read_state(self):
         try:
@@ -254,6 +321,7 @@ class Worker:
     async def heartbeat(self, ws):
         while True:
             await self.send(ws, {"type": "telemetry", "hardware": hardware(), "models": self.status()})
+            self._publish_snapshot()
             await asyncio.sleep(15)
 
     async def telemetry(self, ws):
@@ -273,8 +341,10 @@ class Worker:
         if isinstance(benchmark, dict):
             self.capabilities[mid]["benchmark"] = benchmark
         self._save_state()
+        self._publish_snapshot()
 
     async def ensure_installed(self, mid):
+        self._activity("checking disk / downloading", mid)
         evicted = await asyncio.to_thread(download, mid, self.last_used, {self.active} if self.active else set())
         self.last_used[mid] = time.time()
         self._save_state()
@@ -282,6 +352,7 @@ class Worker:
 
     async def benchmark(self, mid):
         """One real non-thinking completion to prove the CPU backend works."""
+        self._activity("benchmarking", mid, "self-test")
         async with httpx.AsyncClient(timeout=180) as client:
             started = time.monotonic()
             response = await client.post(
@@ -332,6 +403,7 @@ class Worker:
         old_version = self.policy_revision
         self.policy = selected
         self.policy_revision = version
+        self._publish_snapshot()
         if previous != selected:
             # A node may get a new model assignment at the same global revision.
             self.policy_generation += 1
@@ -409,11 +481,13 @@ class Worker:
                 if preferred:
                     self.mark_model(preferred, "error", "Warmup: " + str(exc))
             await self.telemetry(ws)
+            self._activity("idle")
             if version == self.policy_revision and generation == self.policy_generation:
                 break
 
     async def unload(self):
         if self.process and self.process.returncode is None:
+            self._activity("unloading", self.active)
             self.process.terminate()
             try:
                 await asyncio.wait_for(self.process.wait(), 15)
@@ -440,6 +514,7 @@ class Worker:
                 f"need {required // 1024**2} MiB, have {available // 1024**2} MiB"
             )
         await self.unload()
+        self._activity("loading into RAM", mid)
         started_loading = time.monotonic()
         self.process = await asyncio.create_subprocess_exec(
             "/usr/local/bin/llama-server", "-m", str(path), "--alias", mid,
@@ -459,6 +534,7 @@ class Worker:
                     result = await client.get(f"http://127.0.0.1:{PORT}/health")
                     if result.status_code == 200:
                         self.last_load_seconds = time.monotonic() - started_loading
+                        self._publish_snapshot()
                         return
                 except httpx.HTTPError:
                     pass
@@ -472,6 +548,7 @@ class Worker:
             if mid not in CATALOG:
                 raise ValueError("Unapproved model")
             async with self.lock:
+                self._activity("command", mid, action)
                 if action == "install":
                     await self.ensure_installed(mid)
                 elif action == "load":
@@ -494,6 +571,7 @@ class Worker:
             await self.send(ws, {"type": "error", "id": cid, "error": str(exc)[:400]})
         finally:
             self.tasks.pop(cid, None)
+            self._activity("idle")
 
     async def inference(self, ws, msg):
         cid, mid = msg["id"], msg.get("model")
@@ -507,6 +585,7 @@ class Worker:
                 raise ValueError("Invalid inference payload")
             payload = {**payload, "model": mid}
             async with self.lock:
+                self._activity("preparing inference", mid, "inference")
                 if self.active != mid or not self.status()["ready"]:
                     if self.policy is not None and self.capabilities.get(mid, {}).get("status") != "supported":
                         raise RuntimeError("Model has not passed worker self-test")
@@ -516,6 +595,7 @@ class Worker:
                     await self.telemetry(ws)
                 self.last_used[mid] = time.time()
                 self._save_state()
+                self._activity("generating", mid, "inference")
                 await self._inference_stream(ws, cid, mid, payload)
         except asyncio.CancelledError:
             raise
@@ -523,6 +603,7 @@ class Worker:
             await self.send(ws, {"type": "error", "id": cid, "error": str(exc)[:400]})
         finally:
             self.tasks.pop(cid, None)
+            self._activity("idle")
             # Immediately release the stale busy flag instead of waiting up to
             # the next 15-second heartbeat before the scheduler scores us.
             await self.telemetry(ws)
@@ -550,6 +631,7 @@ class Worker:
         if parts.scheme != "https" or not parts.netloc:
             raise RuntimeError("Proxy address must be HTTPS")
         url = urlunsplit(("wss", parts.netloc, parts.path.rstrip("/") + "/compute/ws", "", ""))
+        self._activity("connecting")
         identity = await self.credentials()
         delay = 2
         while True:
@@ -559,6 +641,8 @@ class Worker:
                     msg = json.loads(await asyncio.wait_for(ws.recv(), 20))
                     if msg.get("type") != "auth_ok":
                         raise RuntimeError("Authentication rejected")
+                    self.connected = True
+                    self._activity("idle")
                     delay = 2
                     heart = asyncio.create_task(self.heartbeat(ws))
                     try:
@@ -589,10 +673,14 @@ class Worker:
                             task.cancel()
                         await asyncio.gather(heart, *list(self.tasks.values()), return_exceptions=True)
                         self.tasks.clear()
+                        self.connected = False
+                        self._activity("disconnected")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 print(f"Disconnected: {exc}", flush=True)
+            self.connected = False
+            self._activity("disconnected")
             await asyncio.sleep(delay)
             delay = min(60, delay * 2)
 

@@ -48,6 +48,7 @@ def test_auto_alias_uses_one_model_and_honors_explicit_tier():
 
 
 def test_auto_model_input_is_heuristic_not_forced_on_explicit_model():
+    assert auto_tier({"messages": [{"role": "user", "content": "Hi"}]}) == "fast"
     assert auto_tier({"messages": [{"role": "user", "content": "a" * 10000}]}) == "quality"
     assert auto_tier({"messages": [{"role": "user", "content": "Hi"}],
                       "aiproxy_compute_tier": "fast"}) == "fast"

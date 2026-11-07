@@ -175,7 +175,7 @@ class Worker:
         self.fingerprint = hashlib.sha256(
             (str(DISK_LIMIT_BYTES) + ":" + str(memory_limit()) + ":" +
              str(cpu_count()) + ":" + json.dumps(CATALOG, sort_keys=True) +
-             ":autotest-v2-reclaimable-file").encode()
+             ":autotest-v3-timing-sample").encode()
         ).hexdigest()
         self._read_state()
         # No download is running before the worker main loop starts. Clean
@@ -298,6 +298,25 @@ class Worker:
             if not isinstance(content, str) or not content.strip():
                 raise RuntimeError("Inference returned no visible answer")
             result = benchmark_metrics(data, time.monotonic() - started)
+            # The READY probe may generate only two tokens. A second bounded,
+            # non-thinking probe provides a more representative throughput
+            # sample without making valid models depend on this optional test.
+            try:
+                started = time.monotonic()
+                perf = await client.post(
+                    f"http://127.0.0.1:{PORT}/v1/chat/completions",
+                    json={"model": mid, "stream": False, "max_tokens": 64,
+                          "chat_template_kwargs": {"enable_thinking": False},
+                          "messages": [{"role": "user", "content":
+                                        "Count from 1 to 40, comma separated, no explanation."}]},
+                )
+                perf.raise_for_status()
+                measured = benchmark_metrics(perf.json(), time.monotonic() - started)
+                for field in ("prompt_tps", "generation_tps", "wall_seconds"):
+                    if field in measured:
+                        result[field] = measured[field]
+            except (httpx.HTTPError, ValueError, KeyError):
+                pass  # Never fail model support merely for a speed probe.
             if self.last_load_seconds is not None:
                 result["load_seconds"] = round(max(0, float(self.last_load_seconds)), 3)
             return result
@@ -504,6 +523,9 @@ class Worker:
             await self.send(ws, {"type": "error", "id": cid, "error": str(exc)[:400]})
         finally:
             self.tasks.pop(cid, None)
+            # Immediately release the stale busy flag instead of waiting up to
+            # the next 15-second heartbeat before the scheduler scores us.
+            await self.telemetry(ws)
 
     async def _inference_stream(self, ws, cid, mid, payload):
             async with httpx.AsyncClient(timeout=httpx.Timeout(3600, connect=10)) as client:

@@ -32,6 +32,7 @@ def test_generated_compose_is_valid_and_has_no_inline_secret():
     {"proxy_url": "http://example.com"},
     {"proxy_url": "https://user:secret@example.com"},
     {"proxy_url": "https://example.com/foo"},
+    {"proxy_url": "https://example.com/\n"},
     {"memory_gb": 0}, {"disk_gb": -2},
     {"cpus": True}, {"cpus": float("nan")}, {"threads": 100},
 ])

@@ -418,6 +418,18 @@ python slowbrain_worker.py --worker-id llama-slot-1 --once
 
 It intentionally does not implement llama.cpp, AirLLM, or Accelerate themselves.
 
+## CPU Compute scheduling and setup wizard (draft)
+
+The optional distributed CPU worker supports measured per-model throughput,
+exclusive single-slot reservations, latency-aware replica scheduling, and the
+opt-in `local/auto` model selection alias. Administrators can configure
+automatic model placement and generate worker Compose + enrollment files at
+`/admin/compute-setup`.
+
+**Important:** These features are staged on top of draft PR #24 and are not
+production-ready until the release gates pass. See
+[Compute scheduling, security and release gates](docs/COMPUTE_SCHEDULING.md).
+
 ## Docker (Local Testing)
 
 ```bash

@@ -6,6 +6,8 @@ on:
       - "worker/**"
       - "compute_catalog.py"
       - "compute_worker_snapshot.py"
+      - "codex_registry.py"
+      - "tests/test_codex_registry.py"
       - "tests/test_compute_worker_tui.py"
       - "tests/test_compute_playground.py"
       - "templates/playground.html"
@@ -60,6 +62,9 @@ jobs:
           python -m pip install -r requirements.txt -r worker/requirements.txt pytest
           pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py tests/test_compute_worker_storage.py tests/test_oblak_compose.py tests/test_compute_scheduler.py tests/test_compute_placement.py tests/test_compute_setup.py tests/test_compute_worker_tui.py
           pytest -q tests/test_compute_playground.py
+          # The production full_entrypoint installs a Codex-aware /v1/models
+          # replacement; exercise it to prevent silently losing local models.
+          pytest -q tests/test_codex_registry.py
           pytest -q tests/compute_streaming_check.py
           python -m worker.tui --once > /tmp/simpleai-tui-snapshot.txt
           grep -q 'Compute Worker' /tmp/simpleai-tui-snapshot.txt

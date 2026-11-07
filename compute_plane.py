@@ -784,18 +784,20 @@ async def list_nodes() -> dict[str, Any]:
 async def list_events(node_id: str = "", limit: int = Query(100, ge=1, le=200)):
     """Worker lifecycle and administration metadata; no prompts or credentials."""
     _setup()
+    cutoff = int(time.time()) - 30 * 86400
     with _db() as db:
         if node_id:
             rows = db.execute(
                 "SELECT id,node_id,event,model,status,detail,created_at "
-                "FROM ComputeEvents WHERE node_id=? ORDER BY id DESC LIMIT ?",
-                (node_id, limit),
+                "FROM ComputeEvents WHERE node_id=? AND created_at>=? "
+                "ORDER BY id DESC LIMIT ?",
+                (node_id, cutoff, limit),
             ).fetchall()
         else:
             rows = db.execute(
                 "SELECT id,node_id,event,model,status,detail,created_at "
-                "FROM ComputeEvents ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "FROM ComputeEvents WHERE created_at>=? ORDER BY id DESC LIMIT ?",
+                (cutoff, limit),
             ).fetchall()
     return {"events": [dict(row) for row in rows]}
 

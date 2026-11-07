@@ -476,3 +476,42 @@ def test_admin_model_policy_pushes_wss_and_routes_verified_cached_models(tmp_pat
             assert update_message["models"] == []
             assert compute_plane.endpoints("local/qwen35-2b-q4") == []
             assert compute_plane.endpoints("local/qwen35-0.8b-q4") == []
+
+
+def test_automatic_policy_moves_models_to_node_fit_and_resolves_exact_model(tmp_path, monkeypatch):
+    """Full admin -> WSS telemetry -> per-node policy -> auto routing path."""
+    import compute_plane
+    from compute_catalog import CATALOG
+    selected = ["qwen35-9b-q4", "qwen35-4b-q4", "qwen35-2b-q4", "qwen35-0.8b-q4"]
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        headers = {"X-SimpleAI-Admin-Action": "1"}
+        response = client.post("/admin/api/compute/model-policy",
+                               auth=ADMIN, headers=headers, json={"models": selected})
+        assert response.status_code == 200, response.text
+        mode = client.post("/admin/api/compute/placement",
+                           auth=ADMIN, headers=headers, json={"mode": "auto"})
+        assert mode.status_code == 200 and mode.json()["mode"] == "auto"
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            # Before first telemetry, the safe baseline is the global list.
+            first_policy = ws.receive_json()
+            assert first_policy["models"] == selected
+            ws.send_json({
+                "type": "telemetry",
+                "hardware": {"memory_limit_bytes": 8 * 1024**3, "cpus": 4},
+                "models": {
+                    "disk_limit_bytes": 8 * 1024**3, "installed": selected,
+                    "capabilities": {mid: {"status": "supported"} for mid in selected},
+                    "active": "qwen35-4b-q4", "ready": True,
+                },
+            })
+            optimized = ws.receive_json()
+            assert optimized["models"] == ["qwen35-4b-q4", "qwen35-2b-q4"]
+            quality = compute_plane.automatic_endpoints({"aiproxy_compute_tier": "quality"})
+            assert len(quality) == 1 and quality[0]["model"] == "qwen35-4b-q4"
+            fast = compute_plane.automatic_endpoints({"aiproxy_compute_tier": "fast"})
+            assert len(fast) == 1 and fast[0]["model"] == "qwen35-2b-q4"
+            assert client.get("/admin/api/compute/placement", auth=ADMIN).json()["mode"] == "auto"
+

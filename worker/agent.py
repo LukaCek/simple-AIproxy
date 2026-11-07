@@ -523,6 +523,9 @@ class Worker:
             await self.send(ws, {"type": "error", "id": cid, "error": str(exc)[:400]})
         finally:
             self.tasks.pop(cid, None)
+            # Immediately release the stale busy flag instead of waiting up to
+            # the next 15-second heartbeat before the scheduler scores us.
+            await self.telemetry(ws)
 
     async def _inference_stream(self, ws, cid, mid, payload):
             async with httpx.AsyncClient(timeout=httpx.Timeout(3600, connect=10)) as client:

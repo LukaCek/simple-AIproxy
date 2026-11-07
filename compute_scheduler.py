@@ -71,9 +71,9 @@ def auto_tier(payload: dict[str, Any]) -> str:
     if tier != "auto":
         return tier
     inp, out = estimate_tokens(payload)
-    if inp < 256 and out <= 128:
+    if inp < 512 and out <= 512:
         return "fast"
-    if inp < 1400 and out <= 512:
+    if inp < 1600 and out <= 768:
         return "balanced"
     return "quality"
 

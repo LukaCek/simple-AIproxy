@@ -349,25 +349,31 @@ def model_recommendations(row: dict[str, Any]) -> dict[str, Any]:
         hw = {}
     if not isinstance(state, dict):
         state = {}
-    ram = min(_nonnegative_int(hw.get("memory_limit_bytes")),
-              _nonnegative_int(hw.get("memory_available_bytes")))
-    disk = _nonnegative_int(hw.get("disk_free_bytes"))
+    ram_limit = _nonnegative_int(hw.get("memory_limit_bytes"))
+    ram_available = _nonnegative_int(hw.get("memory_available_bytes"))
+    host_disk_free = _nonnegative_int(hw.get("disk_free_bytes"))
+    disk_quota = _nonnegative_int(state.get("disk_limit_bytes"))
     installed = state.get("installed") if isinstance(state.get("installed"), list) else []
     recommendations = {}
     for mid, model in CATALOG.items():
-        reserve = min(2 * 1024**3, max(512 * 1024**2, ram // 8))
-        required_ram = int(model["size"] * 1.25) + reserve
-        required_disk = int(model["size"] * 1.15)
-        if not ram or not disk:
+        reserve = min(2 * 1024**3, max(512 * 1024**2, ram_limit // 8))
+        headroom = max(128 * 1024**2, min(256 * 1024**2, ram_limit // 8))
+        required_ram = int(model["size"] * 1.25) + reserve + headroom
+        required_disk = max(int(model["size"] * 1.15), int(model["size"] + 16 * 1024**2))
+        if not ram_limit or not host_disk_free or not disk_quota:
             grade, reason = "unknown", "Waiting for hardware telemetry"
-        elif ram < required_ram:
-            grade, reason = "too_large", "Insufficient available RAM"
-        elif mid not in installed and disk < required_disk:
-            grade, reason = "too_large", "Insufficient free disk"
-        elif ram < required_ram * 1.3:
-            grade, reason = "possible", "Near memory budget; measure before production"
+        elif ram_limit < required_ram:
+            grade, reason = "too_large", "Exceeds configured worker RAM limit"
+        elif required_disk > disk_quota:
+            grade, reason = "too_large", "Exceeds configured model storage quota"
+        elif mid not in installed and host_disk_free < required_disk:
+            grade, reason = "too_large", "Insufficient physical disk space"
+        elif ram_available < required_ram and state.get("active") != mid:
+            grade, reason = "possible", "Fits RAM limit but current model may need unloading"
+        elif ram_limit < required_ram * 1.3:
+            grade, reason = "possible", "Close to configured RAM limit; test before production"
         else:
-            grade, reason = "recommended", "Fits conservative CPU memory estimate"
+            grade, reason = "recommended", "Fits conservative CPU RAM and disk estimates"
         recommendations[mid] = {
             "grade": grade, "reason": reason, "estimated_ram_bytes": required_ram,
             "estimated_download_bytes": required_disk, "installed": mid in installed,

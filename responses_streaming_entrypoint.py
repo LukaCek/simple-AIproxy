@@ -471,10 +471,15 @@ async def chat_completions(
                         first_at: Optional[str] = None
                         completed = False
                         stream_error: Optional[str] = None
+                        # Bounded SSE prefix for visible assistant text in
+                        # standard Request Logs. Excludes reasoning deltas.
+                        text_capture = bytearray()
                         try:
                             async for part in original_iterator:
                                 if first_at is None:
                                     first_at = datetime.utcnow().isoformat()
+                                if isinstance(part, bytes) and len(text_capture) < 65536:
+                                    text_capture.extend(part[:65536 - len(text_capture)])
                                 yield part
                             completed = True
                         except asyncio.CancelledError:
@@ -493,12 +498,18 @@ async def chat_completions(
                             record_attempt(number, provider_name, provider_model,
                                            code, action, stream_error,
                                            attempt_started_at, attempt_started_monotonic)
+                            try:
+                                output_text = _impl.extract_response_text_from_sse(
+                                    bytes(text_capture)
+                                )
+                            except (ValueError, TypeError):
+                                output_text = ""
                             _impl.insert_log(
                                 api_key_value, api_key_name, requested_model,
                                 requested_model, provider_name, provider_model,
                                 code, started_at, first_at, ended_at, first_ms,
-                                total_ms, prompt_text, None, stream_error,
-                                request_id=request_id,
+                                total_ms, prompt_text, output_text or None,
+                                stream_error, request_id=request_id,
                             )
 
                     compute_response.body_iterator = metered_compute_stream()

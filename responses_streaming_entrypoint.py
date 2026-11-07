@@ -346,7 +346,8 @@ async def chat_completions(
             detail="Missing model in request payload",
         )
 
-    endpoints = _impl.resolve_requested_model(requested_model)
+    from compute_scheduler import order_candidates
+    endpoints = order_candidates(_impl.resolve_requested_model(requested_model), payload)
     api_key_value = api_key_record["key"]
     api_key_name = api_key_record["name"] if "name" in api_key_record.keys() else None
     prompt_text = _impl.extract_prompt(payload)

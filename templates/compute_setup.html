@@ -1,0 +1,104 @@
+{% extends "layout.html" %}
+{% block content %}
+<section class="mx-auto max-w-3xl space-y-6">
+  <div class="rounded-2xl border border-slate-200 bg-white p-6">
+    <h2 class="text-xl font-semibold">Add a Compute Worker</h2>
+    <p class="mt-2 text-sm text-slate-600">Create an unprivileged Linux AMD64/ARM64 Docker worker. All inference and model settings are managed later in SimpleAI Proxy.</p>
+    <p class="mt-2 text-sm text-amber-800">Prerequisite: proxy endpoints and the multi-architecture GHCR worker image must already be deployed. Keep all private data on trusted workers only.</p>
+  </div>
+  <form id="setup" class="rounded-2xl border bg-white p-6 space-y-5">
+    <div class="grid gap-4 md:grid-cols-2">
+      <label class="text-sm font-medium">Worker name
+        <input id="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" value="my-compute-worker" class="mt-1 block w-full rounded-lg border p-2">
+      </label>
+      <label class="text-sm font-medium">Public HTTPS proxy URL
+        <input id="url" required type="url" placeholder="https://proxy.example.com" class="mt-1 block w-full rounded-lg border p-2">
+      </label>
+      <label class="text-sm font-medium">Docker memory limit (GB)
+        <input id="memory" required type="number" min="2" max="256" step="1" value="4" class="mt-1 block w-full rounded-lg border p-2">
+      </label>
+      <label class="text-sm font-medium">Model disk budget (GB)
+        <input id="disk" required type="number" min="2" max="2048" step="1" value="8" class="mt-1 block w-full rounded-lg border p-2">
+      </label>
+      <label class="text-sm font-medium">Docker CPU limit (cores)
+        <input id="cpus" required type="number" min="0.5" max="128" step="0.5" value="2" class="mt-1 block w-full rounded-lg border p-2">
+      </label>
+      <label class="text-sm font-medium">Worker inference threads
+        <input id="threads" required type="number" min="1" max="128" step="1" value="2" class="mt-1 block w-full rounded-lg border p-2">
+      </label>
+    </div>
+    <p class="text-xs text-slate-600">The worker cannot use more than these CPU/RAM limits. The disk budget is enforced by the application, not a hard filesystem quota. Choose resources that leave enough capacity for the host.</p>
+    <div id="status" role="status" aria-live="polite" class="hidden rounded-lg bg-slate-100 p-3 text-sm"></div>
+    <button id="generate" class="rounded-lg bg-slate-900 px-4 py-3 text-sm font-medium text-white" type="submit">Generate files and enrollment token</button>
+  </form>
+  <div id="result" class="hidden rounded-2xl border bg-white p-6 space-y-4">
+    <h3 class="font-semibold">Your worker installation</h3>
+    <p class="text-sm">The one-time enrollment token expires at <strong id="expires"></strong>. Both files must be saved in the same folder on the Docker host.</p>
+    <div class="flex flex-wrap gap-3">
+      <button id="download-compose" type="button" class="rounded-lg border px-4 py-2 text-sm">Download docker-compose.yml</button>
+      <button id="download-env" type="button" class="rounded-lg border px-4 py-2 text-sm">Download .env (secret)</button>
+    </div>
+    <p class="text-sm text-amber-800">The .env contains a temporary credential. Never publish it. Delete the token from .env after successful enrollment; the worker saves its identity in a private volume.</p>
+    <p class="font-medium text-sm">Run in the folder containing both files:</p>
+    <pre class="overflow-x-auto rounded-xl bg-slate-900 p-4 text-sm text-white"><code>chmod 600 .env
+docker compose config --quiet
+docker compose pull
+docker compose up -d
+docker compose logs --tail=50 compute-worker</code></pre>
+    <p class="text-sm text-slate-600">Then check the <a href="/admin/compute-nodes" class="underline">Compute Nodes dashboard</a>. Do not grant access to private prompts unless you trust the computer's operator.</p>
+  </div>
+</section>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const status = $("status");
+  let files = null;
+  if (location.protocol === "https:") $("url").value = location.origin;
+  function notice(message) {
+    status.classList.remove("hidden");
+    status.textContent = message;
+  }
+  function save(name, content) {
+    if (!files) return;
+    const url = URL.createObjectURL(new Blob([content], {type:"text/plain;charset=utf-8"}));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  $("setup").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = $("generate");
+    button.disabled = true;
+    notice("Generating enrollment files...");
+    try {
+      const payload = {
+        name: $("name").value.trim(), proxy_url: $("url").value.trim(),
+        memory_gb: Number($("memory").value), disk_gb: Number($("disk").value),
+        cpus: Number($("cpus").value), threads: Number($("threads").value)
+      };
+      const response = await fetch("/admin/api/compute/setup", {
+        method: "POST", credentials: "same-origin", cache: "no-store",
+        headers: {"Content-Type": "application/json", "X-SimpleAI-Admin-Action": "1"},
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Could not generate setup");
+      files = {compose: data.compose, env: data.env};
+      $("expires").textContent = new Date(data.expires_at * 1000).toLocaleTimeString();
+      $("result").classList.remove("hidden");
+      notice("Files generated. Download both before the token expires.");
+    } catch (err) {
+      notice(err.message || "Setup failed");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  $("download-compose").addEventListener("click", () => save("docker-compose.yml", files?.compose || ""));
+  $("download-env").addEventListener("click", () => save(".env", files?.env || ""));
+})();
+</script>
+{% endblock %}

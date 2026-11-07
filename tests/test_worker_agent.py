@@ -240,3 +240,27 @@ def test_load_defaults_to_reasoning_on(tmp_path, monkeypatch):
     assert commands
     cmd = commands[0]
     assert cmd[cmd.index("--reasoning") + 1] == "on"
+
+
+def test_benchmark_metrics_never_invents_unreported_speed():
+    data = {"timings": {"prompt_n": 100, "prompt_ms": 2000,
+                        "predicted_n": 20, "predicted_ms": 4000}}
+    result = agent.benchmark_metrics(data, 6.0)
+    assert result["prompt_tps"] == 50.0
+    assert result["generation_tps"] == 5.0
+    assert result["wall_seconds"] == 6.0
+    assert "generation_tps" not in agent.benchmark_metrics({"usage": {"completion_tokens": 20}}, 5.0)
+    assert "generation_tps" not in agent.benchmark_metrics(
+        {"timings": {"predicted_per_second": float("nan")}}, 1.0)
+
+
+def test_worker_reports_busy_without_inventing_parallel_capacity(tmp_path, monkeypatch):
+    worker = isolated_worker(tmp_path, monkeypatch)
+    assert worker.status()["busy"] is False
+    assert worker.status()["running_tasks"] == 0
+    async def check():
+        async with worker.lock:
+            assert worker.status()["busy"] is True
+            assert worker.status()["running_tasks"] == 1
+    asyncio.run(check())
+

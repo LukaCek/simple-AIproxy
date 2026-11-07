@@ -44,6 +44,10 @@
         {{ node.hardware.get('cpus', '?') }} CPUs ·
         {{ (node.hardware.get('memory_limit_bytes', 0) / 1073741824) | round(1) }} GiB memory limit
       </p>
+      <p class="mt-1 text-xs text-slate-500">
+        Inference: {{ 'Busy' if node.models.get('busy') else 'Idle' }} ·
+        {{ node.models.get('running_tasks', 0) }} active slot
+      </p>
       <p class="mt-2 text-sm text-slate-700">
         Ready: {{ node.models.get('active') if node.models.get('ready') else 'none' }}
         · Installed: {{ node.models.get('installed', []) | join(', ') or 'none' }}
@@ -60,7 +64,10 @@
           {% set test = node.models.get('capabilities', {}).get(mid, {}) %}
           <li class="flex justify-between gap-2">
             <span>{{ catalog[mid].name }}{% if mid in node.models.get('installed', []) %} · cached{% endif %}</span>
-            {% if test %}
+            {% if test and test.benchmark is defined and test.benchmark.generation_tps is defined %}
+            <span class="text-xs text-slate-600">{{ test.benchmark.generation_tps }} tok/s</span>
+          {% endif %}
+          {% if test %}
               <span class="{{ 'text-green-700' if test.status == 'supported' else 'text-amber-700' if test.status in ['testing','error'] else 'text-red-700' }}"
                     title="{{ test.reason }}">{{ test.status | capitalize }}{% if test.status == 'supported' and test.test_seconds %} ({{ test.test_seconds }}s){% endif %}</span>
             {% else %}

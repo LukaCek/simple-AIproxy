@@ -487,6 +487,22 @@ async def listed_models(api_key_record: Any = Depends(lambda: None)) -> dict[str
                 models.add(group)
         except HTTPException:
             pass
+
+    # Full production entrypoint replaces main_impl's /v1/models endpoint
+    # with this Codex-aware listing. Include the same connected, verified,
+    # approved compute models that the Playground and request router expose.
+    # Do not expose offline, unapproved, untested or revoked workers.
+    from compute_catalog import CATALOG
+    from compute_plane import endpoints as compute_endpoints
+    local_available = False
+    for mid in CATALOG:
+        model_id = "local/" + mid
+        if compute_endpoints(model_id):
+            models.add(model_id)
+            local_available = True
+    if local_available:
+        models.add("local/auto")
+
     return {"object": "list", "data": [
         {"id": m, "object": "model", "created": 0, "owned_by": "simple-aiproxy"}
         for m in sorted(models)

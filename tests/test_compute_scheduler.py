@@ -40,6 +40,14 @@ def test_untrusted_or_missing_telemetry_is_not_treated_as_fast():
     assert scheduler.estimate_tokens({"messages": [{"role": "user", "content": "Hello"}]})[0] > 0
 
 
+def test_wait_limit_is_bounded(monkeypatch):
+    monkeypatch.setenv("AIPROXY_COMPUTE_QUEUE_WAIT_SECONDS", "50")
+    assert compute_plane._wait_timeout() == 50.0
+    for invalid in ("nan", "inf", "9000", "-1", "oops"):
+        monkeypatch.setenv("AIPROXY_COMPUTE_QUEUE_WAIT_SECONDS", invalid)
+        assert compute_plane._wait_timeout() == 10.0
+
+
 def test_atomic_single_slot_reservation_and_release():
     async def run():
         node = "compute-test-single-slot"

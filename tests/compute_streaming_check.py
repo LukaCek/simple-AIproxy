@@ -52,7 +52,7 @@ def test_true_streaming_production_route(tmp_path, monkeypatch):
             ("local/qwen35-2b-q4",),
         ).fetchall()
         logs = db.execute(
-            "SELECT status_code,first_response_ms,total_ms,provider_name "
+            "SELECT status_code,first_response_ms,total_ms,provider_name,output "
             "FROM Logs WHERE requested_model=? ORDER BY id",
             ("local/qwen35-2b-q4",),
         ).fetchall()
@@ -61,6 +61,7 @@ def test_true_streaming_production_route(tmp_path, monkeypatch):
     assert logs[0][1] is not None
     assert logs[0][2] is not None and logs[0][2] >= logs[0][1]
     assert logs[0][3] == "compute-test"
+    assert logs[0][4] == "Hello"
 
 
 def test_compute_stream_error_is_not_logged_as_success(tmp_path, monkeypatch):
@@ -101,9 +102,11 @@ def test_compute_stream_error_is_not_logged_as_success(tmp_path, monkeypatch):
             "WHERE requested_model='local/qwen35-0.8b-q4'",
         ).fetchall()
         logs = db.execute(
-            "SELECT status_code,error FROM Logs "
+            "SELECT status_code,error,output FROM Logs "
             "WHERE requested_model='local/qwen35-0.8b-q4'",
         ).fetchall()
     assert attempts == [("stream_error", 502)]
     assert len(logs) == 1 and logs[0][0] == 502
     assert logs[0][1] == "Compute stream interrupted"
+    # The partial message is retained for diagnosis without marking it success.
+    assert logs[0][2] is None or "partial" in logs[0][2]

@@ -8,6 +8,8 @@ on:
       - "compute_worker_storage.py"
       - "compute_plane.py"
       - "compute_scheduler.py"
+      - "compute_placement.py"
+      - "tests/test_compute_placement.py"
       - "tests/test_compute_scheduler.py"
       - "tests/test_zz_compute_plane.py"
       - "tests/test_worker_agent.py"

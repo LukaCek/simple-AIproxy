@@ -101,6 +101,7 @@ jobs:
           context: .
           file: worker/Dockerfile
           platforms: ${{ matrix.platform }}
+          build-args: WORKER_BUILD_REVISION=${{ github.sha }}
           push: false
           cache-from: type=gha,scope=compute-worker-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=compute-worker-${{ matrix.arch }}
@@ -126,6 +127,7 @@ jobs:
           context: .
           file: worker/Dockerfile
           platforms: linux/amd64,linux/arm64
+          build-args: WORKER_BUILD_REVISION=${{ github.sha }}
           push: true
           tags: |
             ghcr.io/lukacek/simple-aiproxy-worker:latest

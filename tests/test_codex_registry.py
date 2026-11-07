@@ -172,12 +172,25 @@ def test_codex_model_list_hides_offline_compute_nodes(registry, monkeypatch):
 
 
 def test_full_entrypoint_uses_codex_aware_compute_model_list():
-    """Catch route replacement regressions that main_impl-only tests miss."""
-    import full_entrypoint
-    from codex_registry import listed_models
-    route = next(r for r in full_entrypoint.app.router.routes
-                 if getattr(r, "path", None) == "/v1/models" and
-                 "GET" in (getattr(r, "methods", None) or set()))
-    assert route.endpoint.__name__ == "model_list"
-    # Route wrapper delegates to the Codex-aware listing (also tested above).
-    assert "listed_models" in route.endpoint.__code__.co_names
+    """Verify production startup in an isolated Python interpreter.
+
+    The full pytest suite starts main_impl.app in TestClient fixtures. Importing
+    full_entrypoint after that mutates middleware and fails under Starlette;
+    real production startup happens in a fresh process instead.
+    """
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    script = """
+import full_entrypoint
+routes = [r for r in full_entrypoint.app.router.routes
+          if getattr(r, "path", None) == "/v1/models"
+          and "GET" in (getattr(r, "methods", None) or set())]
+assert len(routes) == 1
+assert routes[0].endpoint.__name__ == "model_list"
+assert "listed_models" in routes[0].endpoint.__code__.co_names
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]

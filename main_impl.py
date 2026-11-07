@@ -2693,9 +2693,16 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             if api_mode == "compute_worker":
                 from compute_plane import forward as compute_forward
                 output = await compute_forward(endpoint, dict(provider_payload))
+                # Keep Compute completions consistent with other providers:
+                # request logs include the visible assistant text, not only
+                # status and prompt. Worker response size is already bounded.
+                try:
+                    output_text = extract_response_text(json.loads(output.body))
+                except (AttributeError, UnicodeDecodeError, ValueError, TypeError):
+                    output_text = None
                 record_attempt(number, provider_name, provider_model, 200, "success", None, attempt_started_at, attempt_started_monotonic)
                 ended_at, first_ms, total_ms = timing(datetime.utcnow().isoformat())
-                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, None, ended_at, first_ms, total_ms, prompt_text, None, None, request_id=request_id)
+                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, None, ended_at, first_ms, total_ms, prompt_text, output_text, None, request_id=request_id)
                 return output
             if api_mode in {"openai_responses", "codex_responses"}:
                 response = await send_responses_adapter(endpoint, provider_payload)

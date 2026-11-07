@@ -108,6 +108,14 @@ def test_private_is_not_routed_to_untrusted_node(tmp_path, monkeypatch):
                 result = call.result(timeout=10)
             assert result.status_code == 200
             assert result.json()["choices"][0]["message"]["content"] == "OK"
+            import main_impl as core
+            with sqlite3.connect(str(core.DB_PATH)) as db:
+                record = db.execute(
+                    "SELECT status_code,output FROM Logs "
+                    "WHERE requested_model='local/qwen35-4b-q4' AND status_code=200 "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            assert record == (200, "OK")
 
 
 def test_catalog_rejects_unknown_model(tmp_path, monkeypatch):
@@ -585,3 +593,68 @@ def test_models_endpoint_advertises_connected_approved_verified_worker(tmp_path,
             ids = [item["id"] for item in response.json()["data"]]
             assert "local/qwen35-4b-q4" in ids
             assert "local/auto" in ids
+
+
+def test_compute_events_capture_lifecycle_without_heartbeat_or_secrets(tmp_path, monkeypatch):
+    """Admin lifecycle events are bounded metadata, distinct from prompt logs."""
+    import time
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        node = identity["node_id"]
+        url = "/admin/api/compute/events"
+        assert client.get(url).status_code in (401, 403)
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            report = {"type": "telemetry", "hardware": {"version": "0.1.0"},
+                      "models": {"active": "qwen35-0.8b-q4", "ready": True,
+                                 "capabilities": {"qwen35-0.8b-q4":
+                                                   {"status": "supported"}}}}
+            ws.send_json(report)
+            for _ in range(30):
+                events = client.get(url + "?node_id=" + node, auth=ADMIN).json()["events"]
+                if any(event["event"] == "model_loaded" for event in events):
+                    break
+                time.sleep(.025)
+            events = client.get(url + "?node_id=" + node, auth=ADMIN).json()["events"]
+            types = [event["event"] for event in events]
+            assert "enrolled" in types and "connected" in types
+            assert "model_test" in types and "model_loaded" in types
+            initial_count = len(events)
+            ws.send_json(report)  # A heartbeat is not an audit-worthy event.
+            time.sleep(.08)
+            events = client.get(url + "?node_id=" + node, auth=ADMIN).json()["events"]
+            assert len(events) == initial_count
+            trust = client.post(
+                f"/admin/api/compute/nodes/{node}/trust",
+                auth=ADMIN, headers={"X-SimpleAI-Admin-Action": "1"},
+                json={"allow_private": True})
+            assert trust.status_code == 200
+            trust = client.post(
+                f"/admin/api/compute/nodes/{node}/trust",
+                auth=ADMIN, headers={"X-SimpleAI-Admin-Action": "1"},
+                json={"allow_private": False})
+            assert trust.status_code == 200
+        events = client.get(url + "?node_id=" + node, auth=ADMIN).json()["events"]
+        types = [event["event"] for event in events]
+        assert "disconnected" in types
+        assert "private_access_enabled" in types
+        assert "private_access_disabled" in types
+        assert all(set(event) == {"id", "node_id", "event", "model", "status",
+                                  "detail", "created_at"} for event in events)
+        dump = json.dumps(events)
+        assert identity["node_secret"] not in dump
+        assert "secret prompt" not in dump
+        assert client.get(url + "?limit=999", auth=ADMIN).status_code == 422
+        assert len(client.get(url + "?limit=2", auth=ADMIN).json()["events"]) == 2
+
+
+def test_compute_events_reject_unapproved_categories(tmp_path, monkeypatch):
+    import compute_plane
+    with fixture_client(tmp_path, monkeypatch):
+        try:
+            compute_plane._event("node", "arbitrary worker input")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Unapproved event names must be rejected")

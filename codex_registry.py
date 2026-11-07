@@ -251,6 +251,9 @@ def resolve_requested_model(name: str) -> list[dict[str, Any]]:
                 continue
             if member.get("group"):
                 out.extend(group(str(member["group"]), seen | {key}))
+            elif member.get("provider") == "compute":
+                from compute_plane import endpoints as compute_endpoints
+                out.extend(compute_endpoints(str(member.get("model") or "")))
             elif member.get("provider"):
                 out.extend(endpoint(str(member["provider"]), str(member.get("model") or "")))
         return out
@@ -262,6 +265,10 @@ def resolve_requested_model(name: str) -> list[dict[str, Any]]:
         for p in providers.values():
             if p.get("api_mode") != "codex_responses" and name in [str(m) for m in p.get("models", [])]:
                 result.extend(endpoint(str(p["name"]), name))
+    # Include healthy local compute nodes without bypassing Codex's
+    # account-specific catalog and quota filters.
+    from compute_plane import endpoints as compute_endpoints
+    result.extend(compute_endpoints(name))
     if not result:
         raise HTTPException(status_code=503, detail=f"No eligible provider for model '{name}' (catalog/usage/access)")
     # De-duplicate nested group aliases while preserving round robin.

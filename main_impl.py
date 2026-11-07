@@ -511,7 +511,10 @@ def clamp_completion_token_limit(payload: Dict[str, Any]) -> None:
 def prepare_provider_chat_payload(payload: Dict[str, Any], endpoint: Dict[str, Any], provider_model: str) -> Dict[str, Any]:
     provider_payload = dict(payload)
     provider_payload["model"] = provider_model
-    clamp_completion_token_limit(provider_payload)
+    # The global minimum is for upstream providers. A limited CPU worker must
+    # honor small completion caps; inflating 64 tokens to 1024 can take minutes.
+    if endpoint.get("api_mode") != "compute_worker":
+        clamp_completion_token_limit(provider_payload)
     # Ollama thinking/reasoning models can spend a small Home Assistant token
     # budget entirely in `message.reasoning`, then return empty content with
     # finish_reason=length. Keep thinking enabled by default and solve the HA
@@ -1362,6 +1365,11 @@ def resolve_group(group_name: str, seen: Optional[set[str]] = None) -> List[Dict
             model_name = member.get("model")
             if not provider_name:
                 continue
+            if provider_name == "compute":
+                # Synthetic compute provider, resolved from currently healthy nodes.
+                from compute_plane import endpoints as compute_endpoints
+                endpoints.extend(compute_endpoints(str(model_name or "")))
+                continue
             provider = provider_map.get(provider_name)
             if not provider:
                 continue
@@ -1392,6 +1400,8 @@ def resolve_requested_model(model_name: str) -> List[Dict[str, Any]]:
             if model_name not in models:
                 continue
             endpoints.append(provider_to_endpoint(provider, model_name))
+    from compute_plane import endpoints as compute_endpoints
+    endpoints.extend(compute_endpoints(model_name))
     if not endpoints:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_name}' not configured")
     return route_endpoints(model_name, endpoints)
@@ -2393,6 +2403,12 @@ async def list_openai_models(api_key_record: sqlite3.Row = Depends(validate_api_
             for profile_name in profiles:
                 if profile_name not in model_ids:
                     model_ids.append(str(profile_name))
+    from compute_catalog import CATALOG
+    from compute_plane import endpoints as compute_endpoints
+    for compute_id in CATALOG:
+        public_id = "local/" + compute_id
+        if compute_endpoints(public_id) and public_id not in model_ids:
+            model_ids.append(public_id)
     return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "simple-aiproxy"} for model_id in model_ids]}
 
 
@@ -2551,6 +2567,19 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
         provider_name = str(endpoint.get("name", "unknown"))
         provider_model = str(endpoint.get("model") or "")
         provider_payload = prepare_provider_chat_payload(payload, endpoint, provider_model)
+        if endpoint.get("api_mode") == "compute_worker":
+            # Validate request controls before the generic provider fallback
+            # handler, so malformed think/budget fields return HTTP 400.
+            from compute_plane import prepare_worker_thinking
+            provider_payload = prepare_worker_thinking(provider_payload)
+        # Private by default: untrusted machines must not receive prompts unless
+        # the API caller explicitly marks the request public.
+        if endpoint.get("api_mode") == "compute_worker" and not endpoint.get("allow_private") and payload.get("aiproxy_visibility") != "public":
+            number, attempt_started_at, attempt_started_monotonic = begin_attempt()
+            reason = "Compute node is not trusted for private requests"
+            record_attempt(number, provider_name, provider_model, None, "privacy_skip", reason, attempt_started_at, attempt_started_monotonic)
+            last_error = reason
+            continue
         cooldown_remaining = provider_cooldown_remaining(endpoint)
         if cooldown_remaining > 0:
             number, attempt_started_at, attempt_started_monotonic = begin_attempt()
@@ -2587,6 +2616,13 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
         try:
             await ensure_provider_token(endpoint)
             api_mode = str(endpoint.get("api_mode", "openai_chat_completions"))
+            if api_mode == "compute_worker":
+                from compute_plane import forward as compute_forward
+                output = await compute_forward(endpoint, dict(provider_payload))
+                record_attempt(number, provider_name, provider_model, 200, "success", None, attempt_started_at, attempt_started_monotonic)
+                ended_at, first_ms, total_ms = timing(datetime.utcnow().isoformat())
+                insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, None, ended_at, first_ms, total_ms, prompt_text, None, None, request_id=request_id)
+                return output
             if api_mode in {"openai_responses", "codex_responses"}:
                 response = await send_responses_adapter(endpoint, provider_payload)
                 content = response.content

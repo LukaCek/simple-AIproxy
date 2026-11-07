@@ -1,0 +1,129 @@
+# Isolated test stack intended to run alongside the existing production VPS.
+# Usage: docker compose --env-file deploy/compute-staging.env -f deploy/compute-staging.compose.yml ...
+name: simpleai-compute-staging
+
+services:
+  llm-proxy:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: simpleai-proxy:compute-staging
+    restart: unless-stopped
+    environment:
+      ADMIN_USERNAME: ${STAGING_ADMIN_USERNAME:?Configure a separate test admin user}
+      ADMIN_PASSWORD: ${STAGING_ADMIN_PASSWORD:?Configure a strong test admin password}
+      AIPROXY_NTFY_URL: ""
+      AIPROXY_NTFY_TOKEN: ""
+    ports:
+      - "127.0.0.1:${STAGING_PROXY_PORT:-18080}:8000"
+    volumes:
+      - type: bind
+        source: ./compute-staging.config.yml
+        target: /app/config.yml
+        read_only: true
+      - type: bind
+        source: ../staging-runtime/app.db
+        target: /app/app.db
+      - proxy-cache:/app/cache
+    mem_limit: 512m
+    cpus: "1.0"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # Internal TLS tests HTTPS/WSS without altering the production Cloudflare route.
+  tls-gateway:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    command:
+      - reverse-proxy
+      - --from
+      - https://compute-staging.internal:8443
+      - --to
+      - http://llm-proxy:8000
+      - --internal-certs
+      - --disable-redirects
+    depends_on:
+      llm-proxy:
+        condition: service_healthy
+    networks:
+      default:
+        aliases: [compute-staging.internal]
+    volumes:
+      - gateway-data:/data
+      - gateway-config:/config
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /data/caddy/pki/authorities/local/root.crt"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # Export the public CA cert only; do not share Caddy's signing key with worker.
+  ca-export:
+    image: busybox:1.37
+    profiles: [worker]
+    restart: "no"
+    depends_on:
+      tls-gateway:
+        condition: service_healthy
+    volumes:
+      - gateway-data:/ca-private:ro
+      - ca-public:/ca-public
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cp /ca-private/caddy/pki/authorities/local/root.crt /ca-public/root.crt
+        chmod 0644 /ca-public/root.crt
+
+  compute-worker:
+    profiles: [worker]
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    image: simpleai-compute-worker:staging
+    restart: unless-stopped
+    init: true
+    depends_on:
+      ca-export:
+        condition: service_completed_successfully
+    environment:
+      SIMPLEAI_PROXY_URL: https://compute-staging.internal:8443
+      # Preserve public trust roots for Hugging Face alongside staging CA.
+      SSL_CERT_FILE: /tmp/compute-staging-ca-bundle.crt
+      REQUESTS_CA_BUNDLE: /tmp/compute-staging-ca-bundle.crt
+      WORKER_ENROLLMENT_TOKEN: ${STAGING_WORKER_ENROLLMENT_TOKEN:-}
+      WORKER_NAME: ${STAGING_WORKER_NAME:-vps-staging-worker}
+      WORKER_THREADS: ${STAGING_WORKER_THREADS:-2}
+    volumes:
+      - worker-data:/data
+      - worker-models:/models
+      - ca-public:/staging-ca:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat /etc/ssl/certs/ca-certificates.crt /staging-ca/root.crt > /tmp/compute-staging-ca-bundle.crt
+        exec python agent.py
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: ${STAGING_WORKER_MEMORY_LIMIT:-3g}
+    cpus: ${STAGING_WORKER_CPUS:-2}
+    tmpfs:
+      - /tmp:size=128m
+
+volumes:
+  proxy-cache:
+  gateway-data:
+  gateway-config:
+  ca-public:
+  worker-data:
+  worker-models:

@@ -441,6 +441,19 @@ async def chat_completions(
         number, attempt_started_at, attempt_started_monotonic = begin_attempt()
         response: Optional[httpx.Response] = None
         try:
+            if endpoint.get("api_mode") == "compute_worker":
+                # Preserve the default-private trust boundary for true SSE requests.
+                if not endpoint.get("allow_private") and payload.get("aiproxy_visibility") != "public":
+                    record_attempt(number, provider_name, provider_model, None, "privacy_skip",
+                                   "Compute node is not trusted for private requests",
+                                   attempt_started_at, attempt_started_monotonic)
+                    last_error = "Compute node is not trusted for private requests"
+                    continue
+                from compute_plane import forward as compute_forward
+                compute_response = await compute_forward(endpoint, dict(provider_payload))
+                record_attempt(number, provider_name, provider_model, 200, "success", None,
+                               attempt_started_at, attempt_started_monotonic)
+                return compute_response
             await _impl.ensure_provider_token(endpoint)
             if _impl.http_client is None:
                 raise RuntimeError("HTTP client is not initialized")

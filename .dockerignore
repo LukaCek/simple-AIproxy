@@ -1,0 +1,27 @@
+# Never bundle local credentials or databases into image layers.
+.git/
+.env
+.env.*
+**/.env
+**/.env.*
+config.yml
+**/config.yml
+app.db
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+staging-runtime/
+deploy/compute-staging.env
+cache/
+**/cache/
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log

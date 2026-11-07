@@ -26,4 +26,9 @@ import main_impl as _impl
 _codex_registry.install(_impl)
 _codex_pricing.install(_impl)
 _free_registry.install(_impl)
+
+# Register outbound CPU compute worker control plane on the production app.
+import compute_plane as _compute_plane
+_compute_plane.install(_impl.app)
+
 app = _live.app

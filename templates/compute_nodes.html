@@ -1,0 +1,164 @@
+{% extends "layout.html" %}
+{% block content %}
+<section class="space-y-6">
+  <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+    <h2 class="text-xl font-semibold">Compute nodes</h2>
+    <p class="mt-2 text-sm text-slate-600">Outbound-only CPU workers. Unknown or friend's computers are untrusted by default. Each machine must enroll with a one-time token.</p>
+    <div class="mt-4 flex flex-wrap gap-3">
+      <button id="enroll" class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white">Generate 15-minute enrollment token</button>
+      <button onclick="location.reload()" class="rounded-xl border px-4 py-2 text-sm">Refresh nodes</button>
+    </div>
+    <div id="token-panel" class="mt-4 hidden rounded-xl border border-amber-200 bg-amber-50 p-4">
+      <p class="font-medium">Token (shown once)</p>
+      <code id="token" class="mt-2 block break-all text-sm"></code>
+      <p class="mt-2 text-sm">Use it in WORKER_ENROLLMENT_TOKEN inside worker/.env on the remote Docker host. Once enrolled, the worker stores its own identity.</p>
+    </div>
+  </div>
+  <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+    <h2 class="text-lg font-semibold">Models managed by SimpleAI Proxy</h2>
+    <p class="mt-2 text-sm text-slate-600">Choose the approved GGUF models each worker should test automatically. The first checked model is preferred for warm startup. Workers download, benchmark and report which models actually run; they switch on demand and evict old files within their own Compose disk cap.</p>
+    <form id="model-policy" class="mt-4 space-y-3">
+      {% for mid, info in catalog.items() %}
+      <label class="flex items-center gap-3 text-sm">
+        <input type="checkbox" name="models" value="{{ mid }}" {{ 'checked' if mid in policy.models else '' }} class="h-4 w-4">
+        <span>{{ info.name }} <span class="text-xs text-slate-500">({{ (info.size / 1073741824) | round(2) }} GiB)</span></span>
+      </label>
+      {% endfor %}
+      <div class="flex flex-wrap gap-3 items-center">
+        <button type="submit" class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white">Save &amp; send to workers</button>
+        <span class="text-xs text-slate-500">Policy version {{ policy.revision }} · Save again to re-test the selected models</span>
+      </div>
+    </form>
+  </div>
+  <div id="notice" role="status" class="hidden rounded-lg border p-3 text-sm"></div>
+  <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+  {% for node in nodes %}
+    <article class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <div class="flex items-center justify-between gap-2">
+        <h3 class="text-lg font-semibold">{{ node.name }}</h3>
+        <span class="rounded-full px-3 py-1 text-xs {{ 'bg-green-100 text-green-800' if node.online else 'bg-slate-100 text-slate-700' }}">{{ 'Online' if node.online else 'Offline' }}</span>
+      </div>
+      <p class="mt-1 break-all font-mono text-xs text-slate-400">{{ node.id }}</p>
+      <p class="mt-3 text-sm text-slate-700">
+        {{ node.hardware.get('arch', 'Unknown CPU') }} ·
+        {{ node.hardware.get('cpus', '?') }} CPUs ·
+        {{ (node.hardware.get('memory_limit_bytes', 0) / 1073741824) | round(1) }} GiB memory limit
+      </p>
+      <p class="mt-2 text-sm text-slate-700">
+        Ready: {{ node.models.get('active') if node.models.get('ready') else 'none' }}
+        · Installed: {{ node.models.get('installed', []) | join(', ') or 'none' }}
+      </p>
+      <p class="mt-1 text-xs text-slate-500">
+        Model storage: {{ (node.models.get('disk_used_bytes', 0) / 1073741824) | round(2) }} /
+        {{ (node.models.get('disk_limit_bytes', 0) / 1073741824) | round(2) }} GiB
+        (application-enforced quota)
+      </p>
+      <div class="mt-4 rounded-xl border p-3 text-xs">
+        <strong>Model self-tests (actual CPU load + inference)</strong>
+        <ul class="mt-2 space-y-1">
+        {% for mid, recommendation in recommendations.get(node.id, {}).items() %}
+          {% set test = node.models.get('capabilities', {}).get(mid, {}) %}
+          <li class="flex justify-between gap-2">
+            <span>{{ catalog[mid].name }}{% if mid in node.models.get('installed', []) %} · cached{% endif %}</span>
+            {% if test %}
+              <span class="{{ 'text-green-700' if test.status == 'supported' else 'text-amber-700' if test.status in ['testing','error'] else 'text-red-700' }}"
+                    title="{{ test.reason }}">{{ test.status | capitalize }}{% if test.status == 'supported' and test.test_seconds %} ({{ test.test_seconds }}s){% endif %}</span>
+            {% else %}
+              <span class="text-slate-500" title="Estimated fit only, not yet tested">{{ recommendation.grade | replace('_',' ') | capitalize }} (estimate)</span>
+            {% endif %}
+          </li>
+        {% endfor %}
+        </ul>
+      </div>
+      <div class="mt-4 rounded-xl bg-slate-50 p-3 text-sm">
+        <strong>Privacy:</strong>
+        {{ 'Approved for private prompts' if node.allow_private else 'Public prompts only' }}
+      </div>
+      {% if not node.revoked %}
+      <div class="mt-4 flex flex-wrap gap-2">
+        <button onclick="setTrust('{{ node.id }}', {{ 'false' if node.allow_private else 'true' }})"
+          class="rounded-lg border px-3 py-2 text-xs">
+          {{ 'Disable private access' if node.allow_private else 'Approve private access' }}
+        </button>
+        <button onclick="revoke('{{ node.id }}')" class="rounded-lg border border-red-300 px-3 py-2 text-xs text-red-700">Revoke node</button>
+      </div>
+      {% if node.online %}
+      <div class="mt-4 flex flex-wrap gap-2">
+        <select id="model-{{ node.id }}" class="min-w-0 rounded-lg border px-3 py-2 text-sm">
+          {% for mid,info in catalog.items() %}
+          <option value="{{ mid }}">{{ info.name }}</option>
+          {% endfor %}
+        </select>
+        {% for action in ['install','load','unload','delete'] %}
+          <button onclick="manage('{{ node.id }}','{{ action }}')" class="rounded-lg bg-slate-900 px-3 py-2 text-xs text-white">{{ action | capitalize }}</button>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% else %}
+        <p class="mt-3 text-xs font-semibold text-red-600">Access revoked</p>
+      {% endif %}
+    </article>
+  {% else %}
+    <div class="rounded-2xl bg-white p-6 text-slate-600">No compute nodes registered yet.</div>
+  {% endfor %}
+  </div>
+</section>
+<script>
+const notice = document.getElementById("notice");
+function show(value) { notice.textContent = value; notice.classList.remove("hidden"); }
+async function post(path, data) {
+  const res = await fetch(path, {method:"POST", credentials:"same-origin",
+    headers: {"Content-Type":"application/json", "X-SimpleAI-Admin-Action":"1"}, body:JSON.stringify(data)});
+  const body = await res.json();
+  if(!res.ok) throw new Error(body.detail || "Request failed");
+  return body;
+}
+document.getElementById("model-policy").onsubmit = async (event) => {
+  event.preventDefault();
+  const chosen = Array.from(document.querySelectorAll('#model-policy input[name="models"]:checked'))
+    .map(el => el.value);
+  try {
+    const result = await post("/admin/api/compute/model-policy", {models:chosen});
+    show("Model policy updated (revision "+result.revision+"). Workers will self-test the selected models.");
+    setTimeout(() => location.reload(), 1200);
+  } catch(err) { show(err.message); }
+};
+document.getElementById("enroll").onclick = async () => {
+  try {
+    const body = await post("/admin/api/compute/enrollments", {});
+    document.getElementById("token").textContent = body.token;
+    document.getElementById("token-panel").classList.remove("hidden");
+  } catch(err) { show(err.message); }
+};
+async function setTrust(id, enabled) {
+  if(enabled && !confirm("The remote computer operator can read your private prompts. Approve this node?")) return;
+  try {
+    await post("/admin/api/compute/nodes/"+encodeURIComponent(id)+"/trust", {allow_private:enabled});
+    location.reload();
+  } catch(err) { show(err.message); }
+}
+async function revoke(id) {
+  if(!confirm("Permanently revoke this worker's access?")) return;
+  try { await post("/admin/api/compute/nodes/"+encodeURIComponent(id)+"/revoke", {}); location.reload(); }
+  catch(err) { show(err.message); }
+}
+async function manage(id, action) {
+  const model = document.getElementById("model-"+id).value;
+  if(action === "delete" && !confirm("Delete "+model+" from this node?")) return;
+  try {
+    const op = await post("/admin/api/compute/nodes/"+encodeURIComponent(id)+"/operations", {action,model});
+    show(action+" started, operation "+op.id);
+    for(let i=0;i<120;i++) {
+      await new Promise(r=>setTimeout(r,3000));
+      const res = await fetch("/admin/api/compute/operations/"+op.id);
+      const job = await res.json();
+      if(["succeeded","failed"].includes(job.status)) {
+        show(action+": "+job.status+(job.detail?": "+job.detail:""));
+        if(job.status==="succeeded") setTimeout(()=>location.reload(),1000);
+        return;
+      }
+    }
+  } catch(err) { show(err.message); }
+}
+</script>
+{% endblock %}

@@ -14,10 +14,11 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 import main_impl as core
 from compute_catalog import CATALOG
@@ -111,6 +112,11 @@ def _setup() -> None:
         db.executescript("""
         CREATE TABLE IF NOT EXISTS ComputeEnrollments (
             token_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS ComputeInstallPlans (
+            token_hash TEXT PRIMARY KEY,
+            settings_json TEXT NOT NULL,
+            expires INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS ComputeNodes (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, secret_hash TEXT NOT NULL,
@@ -642,7 +648,61 @@ async def forward(endpoint: dict[str, Any], payload: dict[str, Any]) -> Response
 
 @router.get("/admin/compute-setup", response_class=HTMLResponse, dependencies=[Depends(core.verify_admin)])
 async def setup_page(request: Request):
-    return core.templates.TemplateResponse(request=request, name="compute_setup.html", context={})
+    staging = os.environ.get("AIPROXY_COMPUTE_HOME_TEST") == "1"
+    default_url = (
+        "https://home-compute.internal:8443" if staging else
+        os.environ.get("AIPROXY_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    )
+    return core.templates.TemplateResponse(
+        request=request, name="compute_setup.html",
+        context={"default_worker_url": default_url,
+                 "local_test_mode": staging},
+    )
+
+
+@router.get("/compute/install.sh", response_class=PlainTextResponse)
+async def linux_install_script():
+    # Public static script has no credentials, filesystem lookup is fixed.
+    data = (Path(__file__).parent / "worker" / "install.sh").read_text()
+    return PlainTextResponse(data, headers={
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    })
+
+
+@router.post("/compute/bootstrap")
+async def claim_install_plan(request: Request):
+    # The short-lived random token authorizes access to pre-approved setup,
+    # not an API key or the host's Docker daemon.
+    if len(await request.body()) > 2048:
+        raise HTTPException(413, "Bootstrap request too large")
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "Invalid request")
+    token = body.get("token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or len(token) > 256 or len(token) < 32:
+        raise HTTPException(401, "Invalid or expired setup code")
+    _setup()
+    with _db() as db:
+        row = db.execute(
+            "SELECT p.settings_json FROM ComputeInstallPlans p "
+            "JOIN ComputeEnrollments e ON p.token_hash=e.token_hash "
+            "WHERE p.token_hash=? AND p.expires>=? AND e.expires>=? "
+            "AND e.used=0",
+            (_hash(token), int(time.time()), int(time.time())),
+        ).fetchone()
+    if not row:
+        raise HTTPException(401, "Invalid or expired setup code")
+    settings = json.loads(row["settings_json"])
+    # Regenerate canonical Compose from validated server-side settings, never
+    # execute or forward a script supplied by the connecting machine.
+    return JSONResponse({
+        "compose": compose_text(settings),
+        "env": env_text(settings, token),
+        "name": settings["name"],
+        "profile": settings["profile"],
+        "local_test": settings.get("local_test", False),
+    }, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 @router.post("/admin/api/compute/setup", dependencies=[Depends(require_admin_write)])
@@ -652,10 +712,21 @@ async def generate_worker_setup(request: Request) -> JSONResponse:
         settings = validate_setup(await request.json())
     except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc)) from exc
+    # This development-only switch is set exclusively by the isolated
+    # localhost home-test Compose stack; never supplied by the browser.
+    settings["local_test"] = os.environ.get("AIPROXY_COMPUTE_HOME_TEST") == "1"
     enrollment = await create_enrollment()
+    with _db() as db:
+        db.execute("DELETE FROM ComputeInstallPlans WHERE expires < ?", (int(time.time()),))
+        db.execute(
+            "INSERT INTO ComputeInstallPlans(token_hash,settings_json,expires) "
+            "VALUES(?,?,?)",
+            (_hash(enrollment["token"]), json.dumps(settings), enrollment["expires_at"]),
+        )
     return JSONResponse({
         "compose": compose_text(settings),
         "env": env_text(settings, enrollment["token"]),
+        "install_code": enrollment["token"],
         "expires_at": enrollment["expires_at"],
         "instructions": [
             "Save docker-compose.yml and .env in the same empty folder.",
@@ -692,7 +763,8 @@ async def enroll(request: Request) -> dict[str, str]:
         if not row or row["used"] or row["expires"] < int(time.time()):
             raise HTTPException(401, "Invalid or expired enrollment token")
         db.execute("UPDATE ComputeEnrollments SET used=1 WHERE token_hash=?", (_hash(token),))
-        db.execute("INSERT INTO ComputeNodes(id,name,secret_hash,created_at) VALUES (?,?,?,?)",
+        db.execute("DELETE FROM ComputeInstallPlans WHERE token_hash=?", (_hash(token),))
+        db.execute("INSERT INTO ComputeNodes(id,name,secret_hash,created_at) VALUES (?,?,?,?)"
                    (node_id, name, _hash(secret), int(time.time())))
     _event(node_id, "enrolled")
     return {"node_id": node_id, "node_secret": secret}

@@ -43,6 +43,18 @@ def memory_limit():
     return min(values)
 
 
+def _reclaimable_file_cache(stat_path: str, key: str) -> int:
+    """Return the inactive file-page cache the kernel may reclaim on pressure."""
+    try:
+        for line in Path(stat_path).read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == key:
+                return max(0, int(parts[1]))
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
 def memory_available():
     host = memory_limit()
     try:
@@ -52,13 +64,38 @@ def memory_available():
                 break
     except (OSError, IndexError, ValueError):
         pass
-    # /proc/meminfo reflects host memory on many container setups. Deduct
-    # actual cgroup consumption before deciding whether to load a model.
-    try:
-        current = int(Path("/sys/fs/cgroup/memory.current").read_text())
-        return max(0, min(host, memory_limit() - current))
-    except (OSError, ValueError):
-        return min(host, memory_limit())
+
+    # cgroup memory.current includes reclaimable page cache from model GGUF
+    # download and SHA256 verification. If counted as non-reclaimable, loading
+    # Qwen 0.8B after a 2B download is falsely denied even with ample headroom.
+    for usage_path, stat_path, inactive_key in (
+        ("/sys/fs/cgroup/memory.current",
+         "/sys/fs/cgroup/memory.stat", "inactive_file"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file"),
+    ):
+        try:
+            used = int(Path(usage_path).read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if used < 0:
+            continue
+        inactive_file = _reclaimable_file_cache(stat_path, inactive_key)
+        effective_used = max(0, used - min(used, inactive_file))
+        return max(0, min(host, memory_limit() - effective_used))
+    return max(0, min(host, memory_limit()))
+
+
+def model_ram_requirement(model_bytes: int) -> int:
+    """Conservative RAM prediction, plus runtime/context overhead."""
+    limit = memory_limit()
+    reserve = min(2 * 1024**3, max(512 * 1024**2, limit // 8))
+    return int(model_bytes * 1.25) + reserve
+
+
+def memory_safety_margin() -> int:
+    """Keep hard cgroup headroom even when a model is close to the limit."""
+    return max(128 * 1024**2, min(256 * 1024**2, memory_limit() // 8))
 
 
 def cpu_count():
@@ -113,7 +150,7 @@ class Worker:
         self.fingerprint = hashlib.sha256(
             (str(DISK_LIMIT_BYTES) + ":" + str(memory_limit()) + ":" +
              str(cpu_count()) + ":" + json.dumps(CATALOG, sort_keys=True) +
-             ":autotest-v1").encode()
+             ":autotest-v2-reclaimable-file").encode()
         ).hexdigest()
         self._read_state()
         # No download is running before the worker main loop starts. Clean
@@ -271,12 +308,12 @@ class Worker:
                 await self.telemetry(ws)
                 model = CATALOG[mid]
                 max_file = max(model["size"] + 16 * 1024**2, int(model["size"] * 1.15))
-                reserve = min(2 * 1024**3, max(512 * 1024**2, memory_limit() // 8))
-                required_ram = int(model["size"] * 1.25) + reserve
+                required_ram = model_ram_requirement(int(model["size"]))
                 if max_file > DISK_LIMIT_BYTES:
                     self.mark_model(mid, "unsupported", "Exceeds configured model disk limit")
-                elif required_ram > memory_limit():
-                    self.mark_model(mid, "unsupported", "Insufficient cgroup RAM for model")
+                elif required_ram + memory_safety_margin() > memory_limit():
+                    self.mark_model(mid, "unsupported",
+                                    "Model plus runtime safety margin exceeds configured cgroup RAM")
                 else:
                     try:
                         async with self.lock:
@@ -334,10 +371,17 @@ class Worker:
             raise RuntimeError("Model not installed")
         if self.active == mid and self.status()["ready"]:
             return
-        reserve = min(2 * 1024**3, max(512 * 1024**2, memory_limit() // 8))
-        required = int(path.stat().st_size * 1.25) + reserve
-        if required > min(memory_limit(), memory_available()):
-            raise RuntimeError("Insufficient available memory for this model")
+        required = model_ram_requirement(path.stat().st_size)
+        if required + memory_safety_margin() > memory_limit():
+            raise RuntimeError("Model exceeds cgroup RAM limit with required safety margin")
+        # Page cache from SHA256/model download is reclaimable. Do not include
+        # it as resident used memory when considering model startup.
+        available = memory_available()
+        if required > available:
+            raise RuntimeError(
+                f"Insufficient *reclaimable-adjusted* available memory: "
+                f"need {required // 1024**2} MiB, have {available // 1024**2} MiB"
+            )
         await self.unload()
         self.process = await asyncio.create_subprocess_exec(
             "/usr/local/bin/llama-server", "-m", str(path), "--alias", mid,

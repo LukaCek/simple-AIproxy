@@ -32,7 +32,7 @@ from rich.text import Text
 from compute_catalog import CATALOG
 from compute_worker_snapshot import (
     STATUS_FILE, cgroup_cpu_usage, cgroup_memory_used,
-    cpu_percent, read_snapshot,
+    cpu_percent, read_snapshot, llama_server_process,
 )
 
 DATA = Path(os.getenv("WORKER_DATA_DIR", "/data"))
@@ -94,11 +94,14 @@ def elapsed(start: Any, now: float) -> str:
 
 class Monitor:
     """Only reads the local status file and kernel resource counters."""
-    def __init__(self, data: Path = DATA, models: Path = MODELS, cgroup: Path = CGROUP):
+    def __init__(self, data: Path = DATA, models: Path = MODELS,
+                 cgroup: Path = CGROUP, proc: Path = Path("/proc")):
         self.data = data
         self.models = models
         self.cgroup = cgroup
+        self.proc = proc
         self.previous_cpu: tuple[int, float] | None = None
+        self.previous_inference: tuple[int, int, float] | None = None
         self.cpu_history: deque[float | None] = deque(maxlen=36)
         self.memory_history: deque[float | None] = deque(maxlen=36)
 
@@ -110,16 +113,29 @@ class Monitor:
         cap = hw.get("cpus") or 0
         cpus = float(cap) if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0 else 0
         usage = cgroup_cpu_usage(self.cgroup)
-        cpu = cpu_percent(self.previous_cpu, (usage, monotonic), cpus) if usage is not None else None
+        container_cpu = cpu_percent(self.previous_cpu, (usage, monotonic), cpus) if usage is not None else None
         self.previous_cpu = (usage, monotonic) if usage is not None else None
+        process = llama_server_process(self.proc)
+        inference_cpu = None
+        if process is not None:
+            prev = self.previous_inference
+            if prev and prev[0] == process["pid"]:
+                inference_cpu = cpu_percent(
+                    (prev[1], prev[2]), (process["cpu_usec"], monotonic), cpus)
+            self.previous_inference = (process["pid"], process["cpu_usec"], monotonic)
+        else:
+            self.previous_inference = None
         used_ram = cgroup_memory_used(self.cgroup)
         limit_ram = hw.get("memory_limit_bytes") if isinstance(hw.get("memory_limit_bytes"), int) else None
         memory_ratio = 100 * used_ram / limit_ram if used_ram is not None and limit_ram else None
-        self.cpu_history.append(cpu)
+        self.cpu_history.append(inference_cpu)
         self.memory_history.append(min(100, memory_ratio) if memory_ratio is not None else None)
         age = max(0.0, now - float(status.get("updated_at") or 0)) if status else None
         return {"status": status, "age": age, "fresh": age is not None and age <= 45,
-                "cpu": cpu, "ram_used": used_ram, "ram_limit": limit_ram,
+                "cpu": inference_cpu, "container_cpu": container_cpu,
+                "llama_rss": process["rss_bytes"] if process else None,
+                "llama_pid": process["pid"] if process else None,
+                "ram_used": used_ram, "ram_limit": limit_ram,
                 "memory_pct": memory_ratio, "now": now}
 
     def resource_panels(self, sample: dict[str, Any], width: int) -> Any:
@@ -129,8 +145,10 @@ class Monitor:
         used = state.get("disk_used_bytes")
         limit = state.get("disk_limit_bytes")
         rows = [
-            ("CPU quota", f"{cpu:.0f}%" if cpu is not None else "Measuring…",
+            ("Inference CPU", f"{cpu:.0f}%" if cpu is not None else ("Measuring…" if sample["llama_pid"] else "Not running"),
              progress_bar(cpu, 100), sparkline(self.cpu_history), "cyan"),
+            ("Container CPU", f"{sample['container_cpu']:.0f}%" if sample["container_cpu"] is not None else "Measuring…",
+             progress_bar(sample["container_cpu"], 100), "Includes TUI display activity", "yellow"),
             ("Container RAM", f"{human_bytes(sample['ram_used'])} / {human_bytes(sample['ram_limit'])}",
              progress_bar(sample["ram_used"], sample["ram_limit"]),
              sparkline(self.memory_history), "magenta"),
@@ -180,6 +198,17 @@ class Monitor:
         table.add_row(Text(f"Task: {status.get('current_kind') or 'none'} · CPU backend: llama.cpp",
                            style="dim"),
                       Text(f"Policy rev {state.get('policy_revision', '—')}", style="dim"))
+        rss = sample.get("llama_rss")
+        if rss is not None:
+            # RSS is a real measurement, but mmap/page cache makes it unsuitable
+            # as a truthful percent-complete signal for model initialization.
+            if phase == "loading into RAM":
+                table.add_row(Text("Loading: model process RAM " + human_bytes(rss) +
+                                   " · waiting for llama.cpp /health", style="yellow"),
+                              Text("No reliable load %", style="dim"))
+            else:
+                table.add_row(Text("llama-server resident RAM: " + human_bytes(rss), style="dim"),
+                              Text("RSS", style="dim"))
         return Panel(table, title="Current activity", border_style=color, padding=(0, 1))
 
     def models_panel(self, sample: dict[str, Any]) -> Panel:

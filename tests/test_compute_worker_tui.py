@@ -108,3 +108,12 @@ def test_display_helpers_never_invent_resource_values():
     assert human_bytes(1024**3) == "1.00 GiB"
     assert progress_bar(None, None) == "░" * 14
     assert len(progress_bar(50, 100)) == 14
+
+
+def test_btop_keyboard_refresh_controls():
+    from worker.tui import change_interval
+    assert change_interval(1.0, "+") == 0.5
+    assert change_interval(1.0, "-") == 2.0
+    assert change_interval(0.25, "+") == 0.25
+    assert change_interval(8.0, "-") == 8.0
+    assert change_interval(2.0, "r") == 2.0

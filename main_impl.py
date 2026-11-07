@@ -2510,7 +2510,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     requested_model = str(payload.get("model") or "")
     if not requested_model:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing model in request payload")
-    endpoints = resolve_requested_model(requested_model)
+    from compute_scheduler import order_candidates
+    endpoints = order_candidates(resolve_requested_model(requested_model), payload)
     api_key_value = api_key_record["key"]
     api_key_name = api_key_record["name"] if "name" in api_key_record.keys() else None
     prompt_text = extract_prompt(payload)

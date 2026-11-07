@@ -116,9 +116,12 @@ def compose_text(settings: dict[str, Any]) -> str:
         parts.extend([
             "      - staging-ca:/staging-ca:ro\n",
             "    entrypoint: [/bin/sh, -ec]\n",
-            "    command: >-\n",
-            "      cat /etc/ssl/certs/ca-certificates.crt /staging-ca/root.crt\n",
-            "      > /tmp/staging-ca-bundle.pem && exec python agent.py\n",
+            "    # Compose scalar command can be tokenized; make the entire",
+            "    # shell script ONE argv element passed after /bin/sh -ec.\n",
+            "    command:\n",
+            "      - >-\n",
+            "        cat /etc/ssl/certs/ca-certificates.crt /staging-ca/root.crt\n",
+            "        > /tmp/staging-ca-bundle.pem && exec python agent.py\n",
         ])
     parts.extend([
         "    tmpfs: [/tmp:size=128m]\n",

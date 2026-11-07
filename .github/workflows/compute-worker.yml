@@ -63,6 +63,9 @@ jobs:
           docker compose --env-file deploy/compute-staging.env.example -f deploy/compute-staging.compose.yml config --quiet
           docker compose -f deploy/oblak-test-proxy-worker/docker-compose.yml config --quiet
           docker compose -f deploy/home-compute-test.compose.yml config --quiet
+          # Validate resolved paths, not just Compose syntax. Relative build
+          # contexts resolve from deploy/, not the shell's working directory.
+          docker compose -f deploy/home-compute-test.compose.yml config --format json | python -c 'import json,pathlib,sys; cfg=json.load(sys.stdin); root=pathlib.Path.cwd().resolve(); assert all(pathlib.Path(cfg["services"][service]["build"]["context"]).resolve()==root for service in ("proxy","worker")), "Home test build context does not resolve to repository root"'
 
   docker-smoke:
     needs: verify

@@ -141,6 +141,7 @@ def hardware():
         "memory_available_bytes": memory_available(),
         "disk_free_bytes": disk.free, "disk_total_bytes": disk.total,
         "version": "0.1.0", "backend": "llama.cpp-cpu",
+        "build_revision": os.getenv("WORKER_BUILD_REVISION", "local-dev")[:64],
     }
 
 

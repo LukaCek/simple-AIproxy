@@ -212,3 +212,71 @@ def test_corrupted_existing_model_is_redownloaded(tmp_path, monkeypatch):
     (tmp_path / "a.gguf").write_bytes(b"corrupted")
     storage.install_model(tmp_path, "a", storage.GIB, {})
     assert (tmp_path / "a.gguf").read_bytes() == content
+
+
+def test_cgroup_file_cache_does_not_disqualify_loaded_model(monkeypatch):
+    """A large preceding GGUF download must not mask reclaimable RAM."""
+    gib = storage.GIB
+    mib = storage.MIB
+    real_read = Path.read_text
+    fake_files = {
+        "/proc/meminfo": "MemAvailable: 12582912 kB\\n",
+        "/sys/fs/cgroup/memory.current": str(int(1.70 * gib)),
+        "/sys/fs/cgroup/memory.stat":
+            "anon 260000000\\nfile 1300000000\\ninactive_file " +
+            str(int(1.10 * gib)) + "\\n",
+    }
+
+    def fake_read(self, *args, **kwargs):
+        if str(self) in fake_files:
+            return fake_files[str(self)]
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read)
+    monkeypatch.setattr(agent, "memory_limit", lambda: 2 * gib)
+    available = agent.memory_available()
+    assert available > int(1.35 * gib)
+    assert agent.model_ram_requirement(533_000_000) < available
+    assert agent.model_ram_requirement(533_000_000) + agent.memory_safety_margin() < 2*gib
+    assert agent.model_ram_requirement(1_280_000_000) + agent.memory_safety_margin() > 2*gib
+
+
+def test_cgroup_nonreclaimable_usage_still_limits_model_admission(monkeypatch):
+    gib = storage.GIB
+    real_read = Path.read_text
+    fake_files = {
+        "/proc/meminfo": "MemAvailable: 12582912 kB\\n",
+        "/sys/fs/cgroup/memory.current": str(int(1.70 * gib)),
+        "/sys/fs/cgroup/memory.stat":
+            "anon 1800000000\\nfile 10000000\\ninactive_file 0\\n",
+    }
+
+    def fake_read(self, *args, **kwargs):
+        return fake_files.get(str(self)) or real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read)
+    monkeypatch.setattr(agent, "memory_limit", lambda: 2 * gib)
+    assert agent.memory_available() < agent.model_ram_requirement(533_000_000)
+
+
+def test_cgroup_v1_reclaimable_cache_is_supported(monkeypatch):
+    gib = storage.GIB
+    real_read = Path.read_text
+    fake_files = {
+        "/proc/meminfo": "MemAvailable: 12582912 kB\\n",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes": str(int(1.70 * gib)),
+        "/sys/fs/cgroup/memory/memory.stat":
+            "total_inactive_file " + str(int(1.10 * gib)) + "\\n",
+    }
+
+    def fake_read(self, *args, **kwargs):
+        key = str(self)
+        if key == "/sys/fs/cgroup/memory.current":
+            raise FileNotFoundError(key)
+        if key in fake_files:
+            return fake_files[key]
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read)
+    monkeypatch.setattr(agent, "memory_limit", lambda: 2*gib)
+    assert agent.memory_available() > int(1.35*gib)

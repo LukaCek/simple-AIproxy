@@ -48,10 +48,10 @@ async def _reserve(node_id: str, timeout: float = 2.0) -> str | None:
     deadline = time.monotonic() + timeout
     while True:
         with _reservation_lock:
-            if node_id in _connections and node_id not in _reservations:
+            if node_id not in _reservations:
                 _reservations[node_id] = token
                 return token
-        if time.monotonic() >= deadline or node_id not in _connections:
+        if time.monotonic() >= deadline:
             return None
         await asyncio.sleep(0.05)
 

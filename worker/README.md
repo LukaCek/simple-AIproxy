@@ -125,8 +125,15 @@ The dashboard updates every second and shows:
   saved GGUF files (disk), current model resident in **RAM**, and which model
   is actively generating right now.
 - Actual measured generation tokens/second, when reported by llama.cpp.
-- CPU quota utilization, container cgroup memory usage and model storage
-  quota utilization. A recent CPU/memory history is shown on wide terminals.
+- Model-process CPU usage (**Inference CPU**) separate from overall container CPU
+  (**Container CPU**, which includes TUI rendering). Both are normalized
+  against the configured Docker CPU quota.
+- llama-server resident RAM (RSS) when the process exists, container cgroup
+  RAM and model storage quota. A recent inference-CPU/memory history is shown
+  on wide terminals. While the model is loading, TUI shows its current
+  process RSS and elapsed time; exact load percentage is unavailable in our
+  pinned *direct* llama-server mode. It would be incorrect to infer a percent
+  from mmap/page-cache usage, so no fabricated loading % is displayed.
 
 Worker status is written atomically to `/data/worker-runtime-status.json`
 with permissions 0600. The TUI is **read-only** and polls only this local

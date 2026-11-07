@@ -416,6 +416,7 @@ def prepare_worker_thinking(payload: dict[str, Any]) -> dict[str, Any]:
     content instead of exhausting max_tokens entirely on reasoning.
     """
     body = dict(payload)
+    body.pop("aiproxy_compute_tier", None)
     explicit_think = "think" in body
     think = body.pop("think") if explicit_think else None
     if explicit_think and type(think) is not bool:

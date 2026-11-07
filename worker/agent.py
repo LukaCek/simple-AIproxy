@@ -3,6 +3,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -120,6 +121,28 @@ def hardware():
     }
 
 
+def benchmark_metrics(data, elapsed):
+    """Read actual llama.cpp timing counters. Do not invent token throughput."""
+    timings = data.get("timings", {}) if isinstance(data, dict) else {}
+    if not isinstance(timings, dict):
+        timings = {}
+    result = {"wall_seconds": round(max(0.0, min(float(elapsed), 3600.0)), 3)}
+    for key, count_key, ms_key in (
+        ("prompt_tps", "prompt_n", "prompt_ms"),
+        ("generation_tps", "predicted_n", "predicted_ms"),
+    ):
+        rate_key = "prompt_per_second" if key == "prompt_tps" else "predicted_per_second"
+        value = timings.get(rate_key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            n, ms = timings.get(count_key), timings.get(ms_key)
+            value = n * 1000.0 / ms if (isinstance(n, (int, float)) and
+                isinstance(ms, (int, float)) and not isinstance(n, bool) and
+                not isinstance(ms, bool) and math.isfinite(n) and math.isfinite(ms) and n > 0 and ms > 0) else None
+        if isinstance(value, (int, float)) and math.isfinite(value) and 0 < value < 1_000_000:
+            result[key] = round(float(value), 3)
+    return result
+
+
 def model_file(mid):
     return target_path(MODELS, mid)
 
@@ -138,6 +161,7 @@ class Worker:
         MODELS.mkdir(parents=True, exist_ok=True)
         self.process = None
         self.active = None
+        self.last_load_seconds = None
         self.lock = asyncio.Lock()
         self.write_lock = asyncio.Lock()
         self.tasks = {}
@@ -199,6 +223,8 @@ class Worker:
         return {"installed": [k for k in CATALOG if model_file(k).exists()],
                 "active": self.active if ready else None, "ready": ready,
                 "capabilities": self.capabilities,
+                "busy": self.lock.locked() or bool(self.tasks),
+                "running_tasks": 1 if self.lock.locked() else 0,
                 "disk_used_bytes": used_bytes(MODELS),
                 "disk_limit_bytes": DISK_LIMIT_BYTES,
                 "policy_revision": self.policy_revision}
@@ -237,12 +263,14 @@ class Worker:
             # Reconciliation is also able to finish when WSS reconnects.
             pass
 
-    def mark_model(self, mid, status, reason="", seconds=0):
+    def mark_model(self, mid, status, reason="", seconds=0, benchmark=None):
         self.capabilities[mid] = {
             "status": status, "reason": str(reason)[:240],
             "test_seconds": round(float(seconds), 2),
             "tested_at": int(time.time()),
         }
+        if isinstance(benchmark, dict):
+            self.capabilities[mid]["benchmark"] = benchmark
         self._save_state()
 
     async def ensure_installed(self, mid):
@@ -254,6 +282,7 @@ class Worker:
     async def benchmark(self, mid):
         """One real non-thinking completion to prove the CPU backend works."""
         async with httpx.AsyncClient(timeout=180) as client:
+            started = time.monotonic()
             response = await client.post(
                 f"http://127.0.0.1:{PORT}/v1/chat/completions",
                 json={"model": mid, "stream": False, "max_tokens": 64,
@@ -267,6 +296,10 @@ class Worker:
             content = choices[0].get("message", {}).get("content") if choices else None
             if not isinstance(content, str) or not content.strip():
                 raise RuntimeError("Inference returned no visible answer")
+            result = benchmark_metrics(data, time.monotonic() - started)
+            if self.last_load_seconds is not None:
+                result["load_seconds"] = round(max(0, float(self.last_load_seconds)), 3)
+            return result
 
     async def receive_policy(self, ws, message):
         selected = message.get("models")
@@ -320,10 +353,10 @@ class Worker:
                             await self.unload()
                             await self.ensure_installed(mid)
                             await self.load(mid)
-                            await self.benchmark(mid)
+                            measured = await self.benchmark(mid)
                             await self.unload()
                         self.mark_model(mid, "supported", "Actual inference passed",
-                                        time.monotonic() - started)
+                                        time.monotonic() - started, benchmark=measured)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -383,6 +416,7 @@ class Worker:
                 f"need {required // 1024**2} MiB, have {available // 1024**2} MiB"
             )
         await self.unload()
+        started_loading = time.monotonic()
         self.process = await asyncio.create_subprocess_exec(
             "/usr/local/bin/llama-server", "-m", str(path), "--alias", mid,
             "--host", "127.0.0.1", "--port", str(PORT),
@@ -400,6 +434,7 @@ class Worker:
                 try:
                     result = await client.get(f"http://127.0.0.1:{PORT}/health")
                     if result.status_code == 200:
+                        self.last_load_seconds = time.monotonic() - started_loading
                         return
                 except httpx.HTTPError:
                     pass

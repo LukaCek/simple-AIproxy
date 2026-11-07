@@ -80,3 +80,37 @@ def cpu_percent(previous: tuple[int, float] | None, current: tuple[int, float],
     delta_us = current[0] - previous[0]
     wall_us = (current[1] - previous[1]) * 1_000_000
     return min(100.0, max(0.0, 100 * delta_us / (wall_us * cpus)))
+
+
+def llama_server_process(proc_root: Path = Path("/proc")) -> dict[str, int] | None:
+    """Read CPU time and resident memory of llama-server, excluding the TUI.
+
+    Linux /proc/PID/stat reports CPU time for the entire process, including
+    llama.cpp inference threads. This is a read-only best-effort measurement.
+    It does not estimate model-loading percentage (mmap can be lazy).
+    """
+    try:
+        pids = (item for item in proc_root.iterdir() if item.name.isdigit())
+        for pid_path in pids:
+            try:
+                if (pid_path / "comm").read_text().strip() != "llama-server":
+                    continue
+                raw = (pid_path / "stat").read_text()
+                # comm is parenthesized and may contain spaces and parentheses.
+                close = raw.rfind(")")
+                if close < 0:
+                    continue
+                fields = raw[close + 1:].split()
+                # fields[0] is /proc/stat field 3 (state)
+                ticks = int(fields[11]) + int(fields[12])  # utime + stime
+                pages = int(fields[21])  # resident set size (pages)
+                clock = os.sysconf("SC_CLK_TCK")
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                return {"pid": int(pid_path.name),
+                        "cpu_usec": max(0, int(ticks * 1_000_000 / clock)),
+                        "rss_bytes": max(0, pages * page_size)}
+            except (OSError, ValueError, IndexError, ZeroDivisionError):
+                continue
+    except OSError:
+        pass
+    return None

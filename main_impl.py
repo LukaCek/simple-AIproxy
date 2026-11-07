@@ -2409,6 +2409,8 @@ async def list_openai_models(api_key_record: sqlite3.Row = Depends(validate_api_
         public_id = "local/" + compute_id
         if compute_endpoints(public_id) and public_id not in model_ids:
             model_ids.append(public_id)
+    if any(name.startswith("local/") for name in model_ids) and "local/auto" not in model_ids:
+        model_ids.append("local/auto")
     return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "simple-aiproxy"} for model_id in model_ids]}
 
 

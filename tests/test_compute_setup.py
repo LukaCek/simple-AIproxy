@@ -137,12 +137,40 @@ def test_installer_is_public_but_bootstrap_requires_unused_matching_token(tmp_pa
         assert client.post("/compute/bootstrap", json={"token": "a" * 44}).status_code == 401
 
 
-def test_install_script_is_static_and_avoids_token_in_shell_history():
+def test_install_script_supports_single_copy_paste_and_legacy_hidden_prompt():
     from pathlib import Path
     script = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    assert "[[ $# -eq 1 || $# -eq 2 ]]" in script
+    assert 'ENROLLMENT_CODE="$2"' in script
     assert "read -r -s" in script
     assert "</dev/tty" in script
     assert "docker compose" in script
     assert "docker.sock" not in script
     assert "/compute/bootstrap" in script
     assert "WORKER_ENROLLMENT_TOKEN=" in script
+    assert 'info "$ENROLLMENT_CODE"' not in script
+
+
+def test_wizard_defaults_auto_max_and_hides_manual_fields():
+    from pathlib import Path
+    wizard = (Path(__file__).resolve().parents[1] /
+              "templates" / "compute_setup.html").read_text()
+    assert '<option value="auto_max" selected>' in wizard
+    assert '<div id="manual-fields" style="display:none">' in wizard
+    assert '"manual-fields").style.display = manual ? "contents" : "none"' in wizard
+    assert '$(id).disabled = !manual;' in wizard
+    assert '$(id).required = manual;' in wizard
+    assert 'quote(sourceOrigin) + " " + quote(data.install_code)' in wizard
+    assert 'id="copy-code"' not in wizard
+
+
+def test_local_worker_ca_setup_passed_as_one_command_argument():
+    settings = validate_setup({**VALID, "name": "oblak-vps-1"})
+    settings["local_test"] = True
+    worker = yaml.safe_load(compose_text(settings))["services"]["compute-worker"]
+    assert worker["entrypoint"] == ["/bin/sh", "-ec"]
+    assert isinstance(worker["command"], list)
+    assert len(worker["command"]) == 1
+    assert "cat /etc/ssl/certs/ca-certificates.crt" in worker["command"][0]
+    assert "exec python agent.py" in worker["command"][0]
+

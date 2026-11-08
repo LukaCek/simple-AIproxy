@@ -273,9 +273,17 @@ def _node_policy(node_id: str, global_policy: dict[str, Any] | None = None) -> d
 
 
 async def _send_node_policy(conn: "NodeConnection") -> None:
-    policy = _node_policy(conn.node_id)
+    if conn.catalog_capable:
+        policy = _node_policy(conn.node_id)
+    else:
+        # Keep pre-upgrade workers operating on their bundled models while
+        # the host auto-updater rolls out the new catalog protocol.
+        legacy = _model_policy()
+        legacy["models"] = [mid for mid in legacy["models"] if mid in BUILTIN_CATALOG]
+        policy = _node_policy(conn.node_id, legacy)
+        policy.pop("catalog", None)
     signature = (policy["revision"], tuple(policy["models"]),
-                 hashlib.sha256(json.dumps(policy["catalog"], sort_keys=True).encode()).hexdigest())
+                 hashlib.sha256(json.dumps(policy.get("catalog", {}), sort_keys=True).encode()).hexdigest())
     if signature == conn.last_policy_signature:
         return
     if policy["revision"] <= 1 and not policy["models"]:
@@ -366,7 +374,8 @@ class NodeConnection:
     node_id: str
     pending: dict[str, asyncio.Queue] = field(default_factory=dict)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    last_policy_signature: tuple[int, tuple[str, ...]] | None = None
+    catalog_capable: bool = False
+    last_policy_signature: tuple | None = None
 
     async def send(self, message: dict[str, Any]) -> None:
         async with self.write_lock:
@@ -824,7 +833,9 @@ async def compute_ws(ws: WebSocket):
         if not row or row["revoked"] or not secrets.compare_digest(row["secret_hash"], _hash(secret)):
             await ws.close(code=1008)
             return
-        conn = NodeConnection(ws=ws, node_id=node_id)
+        conn = NodeConnection(ws=ws, node_id=node_id,
+                              catalog_capable=(type(data.get("catalog_protocol")) is int
+                                               and data["catalog_protocol"] == 1))
         async with _registry_lock:
             old = _connections.get(node_id)
             if old:

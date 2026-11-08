@@ -368,6 +368,11 @@ elif a[:2] == ["inspect", "--format"]:
 elif a[:3] == ["compose", "exec", "-T"]:
     if os.environ.get("MOCK_BUSY") == "1":
         sys.exit(1)
+    # Only reject the newly updated container's connectivity check.
+    if os.environ.get("MOCK_REJECT") == "1" and "assert s.get(\"connected\")" in " ".join(a):
+        text = open(os.environ["MOCK_DOCKER_LOG"]).read()
+        if "image tag sha256:old ghcr.io/lukacek/simple-aiproxy-worker:latest" not in text:
+            sys.exit(1)
 elif a[:3] == ["image", "inspect", "--format"]:
     print("sha256:" + os.environ.get("MOCK_RELEASE", "old"))
 ''')
@@ -398,3 +403,18 @@ elif a[:3] == ["image", "inspect", "--format"]:
     assert "Updated successfully" in upgraded.stdout
     assert "compose up -d --no-build --no-deps --force-recreate" in log.read_text()
     assert not (root / ".update-rejected-image").exists()
+
+    # A failed image triggers rollback; the exact failed image ID is blocked
+    # until a different upstream release arrives.
+    sleeper = mock_bin / "sleep"
+    sleeper.write_text("#!/bin/sh\\nexit 0\\n")
+    sleeper.chmod(0o700)
+    failed = run(MOCK_RELEASE="new", MOCK_REJECT="1")
+    assert failed.returncode == 0, failed.stderr
+    assert "Rollback successful" in failed.stdout
+    assert (root / ".update-rejected-image").read_text().strip() == "sha256:new"
+    assert "image tag sha256:old ghcr.io/lukacek/simple-aiproxy-worker:latest" in log.read_text()
+    blocked = run(MOCK_RELEASE="new")
+    assert blocked.returncode == 0, blocked.stderr
+    assert "Previously failed image" in blocked.stdout
+    assert "compose up " not in log.read_text()

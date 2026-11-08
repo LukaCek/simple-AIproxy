@@ -40,7 +40,7 @@ import re
 BUILTIN_CATALOG = {key: dict(value) for key, value in CATALOG.items()}
 MAX_CATALOG_MODELS = 64
 MAX_MODEL_SIZE = 512 * 1024**3
-_MODEL_ID = re.compile(r"[a-z][a-z0-9-]{1,63}\Z")
+_MODEL_ID = re.compile(r"[a-z][a-z0-9._-]{1,63}\Z")
 _HF_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\Z")
 _GGUF_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 

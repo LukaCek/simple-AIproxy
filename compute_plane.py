@@ -192,6 +192,10 @@ def _event(node_id: str, event: str, *, model: str = "",
     clean_detail = detail[:120] if isinstance(detail, str) else ""
     _setup()
     with _db() as db:
+        # Removed workers must never resurrect zombie audit records when a
+        # pending async operation completes or a heartbeat races with delete.
+        if not db.execute("SELECT 1 FROM ComputeNodes WHERE id=?", (node_id,)).fetchone():
+            return
         db.execute(
             "INSERT INTO ComputeEvents(node_id,event,model,status,detail,created_at) "
             "VALUES(?,?,?,?,?,?)",
@@ -860,6 +864,11 @@ async def compute_ws(ws: WebSocket):
                     continue
                 with _db() as db:
                     old = db.execute("SELECT models_json FROM ComputeNodes WHERE id=?", (node_id,)).fetchone()
+                    if old is None:
+                        # The registration was permanently removed while a
+                        # final heartbeat was in flight. Close without events.
+                        await ws.close(code=1008)
+                        break
                     db.execute("UPDATE ComputeNodes SET last_seen=?,hardware_json=?,models_json=? WHERE id=?",
                                (int(time.time()), json.dumps(hardware), json.dumps(models), node_id))
                 try:

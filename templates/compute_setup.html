@@ -59,6 +59,7 @@
       <button id="copy-command" type="button" class="rounded-lg border px-3 py-2 text-xs">Copy</button>
     </div>
     <p class="text-xs text-amber-800"><strong>Secret command:</strong> The one-time enrollment token is embedded in this command and may remain in terminal history, clipboard managers or process listings. Use it only on machines you control. It expires after 15 minutes or first enrollment; never publish or share it.</p>
+    <p class="text-sm">After the worker connects, the installer automatically opens the interactive TUI in your terminal. Press <code>q</code> to exit. Any time later, open it from any directory with <code>simpleai-tui</code> (or <code>simpleai-tui WORKER_NAME</code> if multiple workers are installed). Open a new shell if <code>~/.local/bin</code> was not already on your PATH.</p>
     <p class="text-xs text-slate-600">For the isolated home test, run this on the same Linux machine where <code>simpleai-home-test</code> is already running. The installer uses its local CA/network and builds a separate worker project. For real VPS deployments, use the public HTTPS address.</p>
     <p class="text-sm">2. Once completed, open <a href="/admin/compute-nodes" class="underline">Compute Nodes</a>, verify the new name appears independently, then test a harmless public prompt.</p>
     <details class="rounded-lg border p-3 text-sm">

@@ -14,7 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from websockets.asyncio.client import connect
 from compute_catalog import CATALOG, BUILTIN_CATALOG, MAX_CATALOG_MODELS, validate_model_entry
-from compute_worker_diagnostics import error_code, validate as validate_diagnostic
+from compute_worker_diagnostics import backend_error_code, error_code, validate as validate_diagnostic
 from compute_worker_snapshot import STATUS_FILE, write_snapshot
 from compute_worker_storage import (disk_limit_bytes, used_bytes, install_model, remove_model, verify_model, target_path, prune_to_limit)
 
@@ -188,6 +188,7 @@ class Worker:
         self.process = None
         self.active = None
         self.last_load_seconds = None
+        self.backend_log_task = None
         self.lock = asyncio.Lock()
         self.write_lock = asyncio.Lock()
         self.tasks = {}
@@ -704,6 +705,27 @@ class Worker:
             if version == self.policy_revision and generation == self.policy_generation:
                 break
 
+    async def _capture_backend_errors(self, proc, mid):
+        """Observe only known llama.cpp stderr failure signatures.
+
+        NEVER forward or persist raw stderr; upstream versions may include
+        user-provided prompt text and even model responses in their logs.
+        """
+        seen = set()
+        try:
+            while proc.stderr is not None:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                code = backend_error_code(line)
+                if code and code not in seen:
+                    seen.add(code)
+                    self._diag("model", code, level="error", model=mid)
+        except (OSError, ValueError, asyncio.LimitOverrunError):
+            # Capturing stderr is optional diagnostics, not a failure of the
+            # inference service. Ignore malformed or oversized backend lines.
+            pass
+
     async def unload(self):
         if self.process and self.process.returncode is None:
             self._activity("unloading", self.active)
@@ -713,6 +735,10 @@ class Worker:
             except asyncio.TimeoutError:
                 self.process.kill()
                 await self.process.wait()
+        if self.backend_log_task is not None:
+            self.backend_log_task.cancel()
+            await asyncio.gather(self.backend_log_task, return_exceptions=True)
+            self.backend_log_task = None
         self.process, self.active = None, None
 
     async def load(self, mid):
@@ -741,8 +767,10 @@ class Worker:
             "-t", str(min(int(os.getenv("WORKER_THREADS", "4")), cpu_count())),
             "-c", str(CATALOG[mid]["ctx"]), "-np", "1", "-ngl", "0",
             "--no-webui", "--no-mmproj", "--jinja", "--reasoning", REASONING_MODE,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
+        self.backend_log_task = asyncio.create_task(
+            self._capture_backend_errors(self.process, mid))
         self.active = mid
         async with httpx.AsyncClient(timeout=10) as client:
             for _ in range(180):

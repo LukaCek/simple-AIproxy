@@ -89,6 +89,8 @@ def compose_text(settings: dict[str, Any]) -> str:
         "    cap_drop: [ALL]\n",
         "    security_opt: [no-new-privileges:true]\n",
         "    pids_limit: 256\n",
+        "    # Prefer killing this disposable worker over essential host services under OOM.\n",
+        "    oom_score_adj: 500\n",
         f"    mem_limit: {ram}\n",
         f"    memswap_limit: {ram}\n",
         f"    cpus: {cpu}\n",

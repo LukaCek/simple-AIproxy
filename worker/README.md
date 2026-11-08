@@ -424,3 +424,25 @@ table. The TUI requires a real interactive terminal for live mode; use
   explicit Public requests, revocation, and disabling Private access.
 - Keep the PR unmerged until those checks are complete, as merging into main
   triggers the existing production deployment workflow.
+
+### Isolated live acceptance (before production merge)
+
+The normal pytest suite mocks Hugging Face metadata. To validate the
+**real** GGUF discovery, checksum-pinned download, WSS policy propagation,
+ARM64 CPU self-test and streamed chat response, rebuild the **isolated**
+Oblak staging proxy and worker from this PR revision (never `:latest`).
+Then run inside the staging proxy:
+
+```bash
+cd ~/docker/test-proxy-worker
+docker compose exec -T proxy python compute_staging_dynamic_smoke.py
+```
+
+The script refuses to run unless `ADMIN_USERNAME=staging-admin` and the
+isolated `/state/admin-password` exists. It imports
+`unsloth/Qwen3.5-0.8B-GGUF` `Q3_K_M`, waits for real worker inference,
+tests streaming through the API, restores the original staging model policy
+and deletes the temporary catalog entry. Downloaded weights can remain in
+the worker's bounded LRU cache. This **must** be run on the real staging
+ARM worker; passing unit/CI tests is not a substitute. Do not merge to
+production until the output is captured and reviewed.

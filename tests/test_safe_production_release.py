@@ -116,3 +116,35 @@ def test_release_scripts_do_not_restore_db_automatically():
     workflow = (ROOT / ".github/workflows/deploy.yml").read_text()
     assert "server_deployment/backup_release.py" in workflow
     assert "server_deployment/check_release.py" in workflow
+
+
+def test_proxy_release_publishes_verified_native_architectures_before_deploy():
+    import yaml
+    workflow = yaml.safe_load((ROOT / ".github/workflows/deploy.yml").read_text())
+    jobs = workflow["jobs"]
+    build, publish, deploy = (jobs[name] for name in
+                              ("build-and-push", "publish-image", "deploy"))
+    assert build["runs-on"] == "${{ matrix.runner }}"
+    matrix = {
+        (item["platform"], item["runner"], item["arch"])
+        for item in build["strategy"]["matrix"]["include"]
+    }
+    assert matrix == {
+        ("linux/amd64", "ubuntu-24.04", "amd64"),
+        ("linux/arm64", "ubuntu-24.04-arm", "arm64"),
+    }
+    assert not any("setup-qemu" in step.get("uses", "") for step in build["steps"])
+    push_step = next(step["with"] for step in build["steps"]
+                     if step.get("uses", "").startswith("docker/build-push-action"))
+    assert "push-by-digest=true" in push_step["outputs"]
+    assert ":latest" not in push_step["outputs"]
+    assert "scope=simpleai-proxy-${{ matrix.arch }}" in push_step["cache-from"]
+    assert "scope=simpleai-proxy-${{ matrix.arch }}" in push_step["cache-to"]
+    assert publish["needs"] == "build-and-push"
+    assert deploy["needs"] == "publish-image"
+    cmd = next(step["run"] for step in publish["steps"] if "run" in step)
+    assert "docker buildx imagetools inspect --raw" in cmd
+    assert "-t \"$IMAGE:latest\"" in cmd
+    assert cmd.index("docker buildx imagetools inspect --raw") < cmd.index(
+        "-t \"$IMAGE:latest\""
+    )

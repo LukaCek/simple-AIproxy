@@ -141,6 +141,7 @@ def hardware():
         "memory_available_bytes": memory_available(),
         "disk_free_bytes": disk.free, "disk_total_bytes": disk.total,
         "version": "0.1.0", "backend": "llama.cpp-cpu",
+        "catalog_protocol": 1,
         "build_revision": os.getenv("WORKER_BUILD_REVISION", "local-dev")[:64],
     }
 
@@ -751,7 +752,8 @@ class Worker:
         while True:
             try:
                 async with connect(url, max_size=2 * 1024 * 1024, ping_interval=20) as ws:
-                    await self.send(ws, {"type": "auth", **identity, "protocol": 1})
+                    await self.send(ws, {"type": "auth", **identity, "protocol": 1,
+                                         "catalog_protocol": 1})
                     msg = json.loads(await asyncio.wait_for(ws.recv(), 20))
                     if msg.get("type") != "auth_ok":
                         raise RuntimeError("Authentication rejected")

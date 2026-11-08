@@ -3,6 +3,27 @@
 CPU-only GGUF worker for Linux Docker hosts, amd64 or arm64. Requires outbound
 HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
 
+## Faster CI builds and distribution
+
+Production GitHub Actions build CPU worker images for **AMD64 and ARM64 in
+parallel on native runners**, without QEMU. BuildKit caches are kept separately
+per architecture and reused by PR smoke tests and future main-branch releases.
+The pinned llama.cpp C++ build and Python dependencies remain in unchanged
+layers when only worker source code or the informational build revision changes.
+
+Each architecture is pushed to GHCR by **immutable digest**. Only after both
+builds have succeeded does a separate publish job create the combined
+\`ghcr.io/lukacek/simple-aiproxy-worker:latest\` and
+\`ghcr.io/lukacek/simple-aiproxy-worker:<commit-sha>\` tags. A failed ARM64
+build can therefore never replace the previous working \`:latest\` with an
+AMD64-only image.
+
+Worker hosts normally **pull the published image** from GHCR; they do not
+compile llama.cpp locally. A first native build or a change to the pinned
+llama.cpp revision can still be comparatively slow; later builds should
+reuse dependencies and C++ binaries. Actual elapsed time depends on runner
+availability, network speeds, and cache retention.
+
 ## One-line Linux installation (recommended)
 
 Open /admin/compute-setup on the proxy. Choose a worker name (for example

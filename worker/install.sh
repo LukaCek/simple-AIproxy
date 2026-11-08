@@ -224,6 +224,23 @@ info "Check Compute Nodes in the proxy; public requests are allowed by default,"
 info "but PRIVATE access remains disabled until explicitly approved."
 info "Inspect logs: cd '$INSTALL_DIR' && docker compose logs --tail=80 compute-worker"
 
+# Host-side updater: no Docker socket is mounted into the worker container.
+# A user systemd timer survives SSH logouts via one-time linger approval.
+# Skip auto updates for the isolated local-test image.
+if grep -Fq 'simpleai-home-test/worker:local' docker-compose.yml; then
+  info "Local-test image: automatic production-image updates are disabled."
+else
+  info "Configuring unattended updates (this may request one-time sudo for systemd linger)..."
+  if curl -fsSL --connect-timeout 10 --max-time 30 "$PROXY_ORIGIN/compute/auto-update.sh" |
+       bash -s -- --install "$(basename "$INSTALL_DIR")" "$PROXY_ORIGIN"; then
+    info "Automatic updates active: checks four times per day with rollback on failure."
+  else
+    info "WARNING: automatic updates are NOT active. Worker still runs normally."
+    info "Review systemd setup above; automated updates must be enabled once."
+  fi
+fi
+
+
 # Install an unprivileged, one-word launcher. It reads worker folders from the
 # existing per-user registry; no credentials or Docker socket are embedded.
 install_tui_shortcut() {

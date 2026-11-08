@@ -74,3 +74,37 @@ def test_build_revision_changes_only_tail_layer_not_expensive_build_dependencies
     assert dockerfile.index("RUN pip install") < dockerfile.index("COPY compute_catalog.py")
     assert dockerfile.index("COPY compute_catalog.py") < dockerfile.index("ARG WORKER_BUILD_REVISION")
     assert dockerfile.index("ARG WORKER_BUILD_REVISION") < dockerfile.index('CMD ["python", "agent.py"]')
+
+
+def test_docs_and_installer_only_changes_skip_expensive_native_build():
+    import re
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/compute-worker.yml").read_text())
+    jobs = workflow["jobs"]
+    gate = jobs["image-changes"]
+    smoke = jobs["docker-smoke"]
+    release = jobs["build-worker"]
+    assert "image-changes" in smoke["needs"]
+    assert "image-changes" in release["needs"]
+    assert "needs.image-changes.outputs.rebuild == 'true'" in smoke["if"]
+    assert "needs.image-changes.outputs.rebuild == 'true'" in release["if"]
+
+    script = next(step["run"] for step in gate["steps"] if step.get("id") == "paths")
+    match = re.search(r"grep -Eq '([^']+)'", script)
+    assert match is not None
+    pattern = re.compile(match.group(1))
+    for changed in (
+        "worker/Dockerfile", "worker/agent.py", "worker/tui.py",
+        "worker/requirements.txt", "compute_catalog.py",
+        "compute_worker_storage.py", "compute_worker_snapshot.py",
+        ".github/workflows/compute-worker.yml",
+    ):
+        assert pattern.search(changed), changed
+    for unchanged_image in (
+        "worker/install.sh", "worker/auto-update.sh", "worker/README.md",
+        "compute_plane.py", "templates/compute_setup.html",
+        "tests/test_worker_build_pipeline.py",
+    ):
+        assert not pattern.search(unchanged_image), unchanged_image
+    assert "EVENT_NAME" in script and "workflow_dispatch" in script
+    assert "rebuild=true" in script and "rebuild=false" in script

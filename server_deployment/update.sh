@@ -82,7 +82,10 @@ for i in $(seq 1 45); do
   fi
   sleep 2
 done
-if [[ "$ready" != 1 ]]; then\n  log "New container failed HTTP readiness"\n  false  # Trigger ERR trap and immutable-image rollback.\nfi
+if [[ "$ready" != 1 ]]; then
+  log "New container failed HTTP readiness"
+  false  # Trigger ERR trap and immutable-image rollback.
+fi
 
 log "Checking admin UI, compute policy and authenticated /v1/models."
 docker compose -f docker-compose.yml exec -T llm-proxy python - < check_release.py

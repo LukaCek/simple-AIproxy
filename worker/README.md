@@ -22,6 +22,38 @@ after successful registration, and recreates that one container without it.
 The worker cannot access the host's Docker socket. Newly enrolled workers
 are untrusted for private prompts until approved in the admin dashboard.
 
+### One-word TUI command
+
+After successful enrollment, the Linux installer creates the executable
+`~/.local/bin/simpleai-tui` (mode 0700) and **automatically opens** the live
+terminal dashboard. Press `q` to leave the TUI; the worker keeps running.
+
+From any directory in a new terminal, run:
+
+```bash
+simpleai-tui
+```
+
+If multiple workers are installed for the same Linux user, pick one:
+
+```bash
+simpleai-tui my-worker
+```
+
+For a static status snapshot, use `simpleai-tui --once` (or
+`simpleai-tui my-worker --once`). This calls `docker compose exec`
+in the worker's existing isolated Compose project. It does **not** start or
+stop services and does not need to see worker API keys.
+
+On systems where `~/.local/bin` was not in PATH when setup ran, the
+installer adds it to the current user's Bash/Zsh startup file; open a
+**new terminal** first. You can always use
+`~/.local/bin/simpleai-tui` directly. Existing unmanaged shortcut files
+are never overwritten. The installer opens the dashboard only when
+a real interactive terminal is available; non-interactive installs skip
+this optional step.
+
+
 **Auto Maximum** sets the worker Docker RAM ceiling to approximately
 85% of the target Linux host's total physical RAM (minimum 2 GiB reserved for
 the host), and permits all host CPU cores. This is a *hard ceiling*, not RAM
@@ -52,7 +84,7 @@ a new installation is performed; they are not dynamically recalculated.
 Update and rebuild the isolated deploy/home-compute-test.compose.yml stack.
 Open http://127.0.0.1:18180/admin/compute-setup on that computer. Set a
 distinct name, e.g. oblak-vps-1, and use the default internal HTTPS worker
-URL. Copy the generated one-line command and enter its code on the SAME host.
+URL. Copy the generated one-line command (which includes its code) to the SAME host.
 It uses the existing home-test image, the public staging CA and network,
 but gets its own Compose project, model cache and identity. The original
 home-test-worker and production services are not changed by this installer.

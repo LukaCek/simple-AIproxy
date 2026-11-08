@@ -13,9 +13,8 @@ RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /src/llama.cpp
     && cmake --build build --target llama-server -j 2
 
 FROM python:3.11-slim-bookworm
-# Build revision is informational only: remote WSS cannot modify host Docker.
-ARG WORKER_BUILD_REVISION=local-dev
-ENV WORKER_BUILD_REVISION=${WORKER_BUILD_REVISION}
+# Keep build revision OUT of dependency and llama.cpp layers. Otherwise every
+# commit invalidates apt and pip install layers even when nothing else changed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4 libgomp1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -26,5 +25,9 @@ COPY worker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY compute_catalog.py compute_worker_storage.py compute_worker_snapshot.py worker/agent.py worker/tui.py /app/
 RUN mkdir /data /models && chown -R 10001:10001 /data /models
+# Runtime metadata is the only layer that changes for a new source revision.
+# Remote WSS messages cannot modify the host Docker image.
+ARG WORKER_BUILD_REVISION=local-dev
+ENV WORKER_BUILD_REVISION=${WORKER_BUILD_REVISION}
 USER 10001:10001
 CMD ["python", "agent.py"]

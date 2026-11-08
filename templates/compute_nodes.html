@@ -25,12 +25,41 @@
       </select>
       <button type="button" id="save-placement" class="rounded-lg border px-3 py-2">Save placement mode</button>
     </div>
-    <p class="mt-2 text-sm text-slate-600">Approve the GGUF models workers may use. In Manual mode every selected model is assigned; in Automatic mode each worker receives <strong>all</strong> approved models fitting its RAM and cumulative model-cache budget (largest model is warmed first). A single CPU worker loads only one model in RAM at a time. Model files can be evicted if the configured disk quota is exceeded.</p>
+    <p class="mt-2 text-sm text-slate-600">Approve GGUF models here; selected models are automatically delivered to connected workers over WSS and CPU-tested (when assigned). Auto placement considers each worker's RAM/disk limits. Models are checksum pinned, so changing the repository does not silently change deployed weights. A worker runs one model at a time.</p>
+    <div class="mt-4 rounded-xl border border-slate-200 p-4 space-y-3">
+      <h3 class="text-sm font-semibold">Add GGUF model from Hugging Face</h3>
+      <p class="text-xs text-slate-600">Paste a public Hugging Face repository or GGUF file link. SimpleAI discovers files, pins the commit and SHA-256, and never runs repository scripts. Newly added models are assigned and tested automatically when enabled; results depend on each worker's RAM, disk, and llama.cpp compatibility.</p>
+      <div class="flex flex-wrap gap-2">
+        <input id="hf-source" type="text" autocomplete="off" placeholder="https://huggingface.co/owner/repository" class="min-w-0 flex-1 rounded-lg border p-2 text-sm">
+        <button type="button" id="inspect-hf" class="rounded-lg border px-3 py-2 text-sm">Find GGUF files</button>
+      </div>
+      <div id="hf-options" class="hidden space-y-2">
+        <label class="block text-sm">Available GGUF variants
+          <select id="hf-file" class="mt-1 w-full rounded-lg border p-2 text-sm"></select>
+        </label>
+        <div class="flex flex-wrap gap-3 items-end">
+          <label class="text-sm">Display name (optional)
+            <input id="hf-name" type="text" maxlength="96" class="mt-1 block rounded-lg border p-2" placeholder="Use filename">
+          </label>
+          <label class="text-sm">Context tokens
+            <input id="hf-ctx" type="number" min="256" max="262144" step="1" value="4096" class="mt-1 block w-28 rounded-lg border p-2">
+          </label>
+        </div>
+        <label class="flex items-center gap-2 text-sm">
+          <input id="hf-enable" type="checkbox" checked>
+          Add to active policy and automatically self-test on eligible workers
+        </label>
+        <button type="button" id="add-hf" class="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white">Add model</button>
+      </div>
+    </div>
     <form id="model-policy" class="mt-4 space-y-3">
       {% for mid, info in catalog.items() %}
       <label class="flex items-center gap-3 text-sm">
         <input type="checkbox" name="models" value="{{ mid }}" {{ 'checked' if mid in policy.models else '' }} class="h-4 w-4">
-        <span>{{ info.name }} <span class="text-xs text-slate-500">({{ (info.size / 1073741824) | round(2) }} GiB)</span></span>
+        <span class="flex-1">{{ info.name }} <span class="text-xs text-slate-500">({{ (info.size / 1073741824) | round(2) }} GiB · {{ info.repo }})</span></span>
+        {% if mid not in built_in_models %}
+        <button type="button" onclick="removeCustomModel('{{ mid }}')" class="rounded-lg border border-red-300 px-2 py-1 text-xs text-red-700">Remove from catalog</button>
+        {% endif %}
       </label>
       {% endfor %}
       <div class="flex flex-wrap gap-3 items-center">
@@ -84,7 +113,7 @@
             <span data-model-label>{{ catalog[mid].name }}{% if mid in node.models.get('installed', []) %} · saved{% endif %}</span>
             <span data-model-status class="{{ 'text-green-700' if test.status == 'supported' else 'text-amber-700' if test else 'text-slate-500' }}">
               {% if test %}
-                {{ test.status | capitalize }}{% if test.benchmark is defined and test.benchmark.generation_tps is defined %} · {{ test.benchmark.generation_tps }} tok/s{% endif %}
+                {{ test.status | capitalize }}{% if test.benchmark is defined and test.benchmark.generation_tps is defined %} · {{ test.benchmark.generation_tps }} tok/s{% endif %}{% if test.reason is defined and test.reason %} · {{ test.reason }}{% endif %}
               {% else %}
                 {{ recommendation.grade | replace('_',' ') | capitalize }} (estimate)
               {% endif %}
@@ -104,6 +133,7 @@
           {{ 'Disable private access' if node.allow_private else 'Approve private access' }}
         </button>
         <button onclick="revoke('{{ node.id }}')" class="rounded-lg border border-red-300 px-3 py-2 text-xs text-red-700">Revoke node</button>
+        <button onclick="removeNode('{{ node.id }}')" class="rounded-lg border border-red-300 px-3 py-2 text-xs text-red-700">Remove worker permanently</button>
       </div>
       {% if node.online %}
       <div class="mt-4 flex flex-wrap gap-2">
@@ -112,13 +142,14 @@
           <option value="{{ mid }}">{{ info.name }}</option>
           {% endfor %}
         </select>
-        {% for action in ['install','load','unload','delete'] %}
+        {% for action in ['test','install','load','unload','delete'] %}
           <button onclick="manage('{{ node.id }}','{{ action }}')" class="rounded-lg bg-slate-900 px-3 py-2 text-xs text-white">{{ action | capitalize }}</button>
         {% endfor %}
       </div>
       {% endif %}
       {% else %}
         <p class="mt-3 text-xs font-semibold text-red-600">Access revoked</p>
+        <button onclick="removeNode('{{ node.id }}')" class="mt-2 rounded-lg border border-red-300 px-3 py-2 text-xs text-red-700">Remove worker permanently</button>
       {% endif %}
     </article>
   {% else %}
@@ -149,6 +180,64 @@ async function post(path, data) {
   const body = await res.json();
   if(!res.ok) throw new Error(body.detail || "Request failed");
   return body;
+}
+let hfInspection = null;
+document.getElementById("inspect-hf").onclick = async () => {
+  const source = document.getElementById("hf-source").value.trim();
+  try {
+    const result = await post("/admin/api/compute/catalog/inspect", {source});
+    hfInspection = result;
+    const select = document.getElementById("hf-file");
+    select.replaceChildren();
+    for(const model of result.files || []) {
+      const option = document.createElement("option");
+      option.value = model.file;
+      option.textContent = model.file+" ("+(model.size/1073741824).toFixed(2)+" GiB)";
+      select.append(option);
+    }
+    document.getElementById("hf-options").classList.remove("hidden");
+    show((result.files||[]).length+" verified GGUF file(s) found at commit "+result.revision.slice(0,12));
+  } catch(err) {
+    hfInspection = null;
+    document.getElementById("hf-options").classList.add("hidden");
+    show(err.message);
+  }
+};
+document.getElementById("add-hf").onclick = async () => {
+  if(!hfInspection) return;
+  const file = document.getElementById("hf-file").value;
+  const source = "https://huggingface.co/"+hfInspection.repo+"/resolve/"+hfInspection.revision+"/"+file;
+  try {
+    const result = await post("/admin/api/compute/catalog/custom", {
+      source, file,
+      name: document.getElementById("hf-name").value.trim() || null,
+      ctx: Number(document.getElementById("hf-ctx").value),
+      enable: document.getElementById("hf-enable").checked
+    });
+    show("Added "+result.id+(result.enabled?"; distributed for worker self-tests":"; not yet enabled"));
+    setTimeout(()=>location.reload(), 1200);
+  } catch(err) { show(err.message); }
+};
+async function removeCustomModel(id) {
+  if(!confirm("Remove "+id+" from the catalog and disable it for all workers? Existing cached weights are preserved.")) return;
+  try {
+    const response = await fetch("/admin/api/compute/catalog/custom/"+encodeURIComponent(id),
+      {method:"DELETE", credentials:"same-origin", headers:{"X-SimpleAI-Admin-Action":"1"}});
+    const body = await response.json();
+    if(!response.ok) throw new Error(body.detail||"Removal failed");
+    location.reload();
+  } catch(err) { show(err.message); }
+}
+async function removeNode(id) {
+  if(!confirm("Remove this worker's registration, test results and history from the proxy? This will revoke access but does NOT stop Docker or delete models on the remote PC.")) return;
+  if(prompt('Type REMOVE to permanently delete this worker registration:') !== "REMOVE") return;
+  try {
+    const response = await fetch("/admin/api/compute/nodes/"+encodeURIComponent(id),
+      {method:"DELETE", credentials:"same-origin", headers:{"X-SimpleAI-Admin-Action":"1"}});
+    const body = await response.json();
+    if(!response.ok) throw new Error(body.detail||"Worker removal failed");
+    location.reload();
+  } catch(err) { show(err.message); }
 }
 document.getElementById("model-policy").onsubmit = async (event) => {
   event.preventDefault();
@@ -247,7 +336,7 @@ async function refreshNodeStatuses() {
         if(name) name.textContent = baseName + (installed.includes(mid) ? " · saved" : "");
         if(status && state.status) {
           const speed = state.benchmark?.generation_tps;
-          status.textContent = state.status + (typeof speed === "number" && speed > 0 ? " · " + speed + " tok/s" : "");
+          status.textContent = state.status + (typeof speed === "number" && speed > 0 ? " · " + speed + " tok/s" : "") + (state.reason ? " · " + state.reason : "");
           status.className = state.status === "supported" ? "text-green-700" : "text-amber-700";
         }
       }

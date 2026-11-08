@@ -24,11 +24,14 @@ On recent **Omarchy** releases, non-root Docker access may be intentionally
 disabled. The installer explains that the `docker` group grants
 **root-equivalent** access and explicitly asks you to type `YES` before
 adding the account. The one-liner can then activate the new group in a
-temporary `sg docker` shell and continue without a full reboot; future
-logins will have the group. Declining the prompt leaves the account's
-security settings unchanged and stops installation before claiming the
-enrollment token. This choice affects the security of the host, not just
-SimpleAI.
+temporary `sg docker` shell and continue installation without an
+immediate reboot. The original terminal keeps its old group membership, so
+**log out and log back in** before running `simpleai-tui` there. A **reboot
+once after setup** is recommended so the long-running systemd user manager
+also inherits the new Docker group for scheduled auto-updates. Declining
+the prompt leaves the account's security settings unchanged and stops
+installation before claiming the enrollment token. This choice affects the
+security of the host, not just SimpleAI.
 
 `curl` is the minimum preinstalled dependency because it launches the
 one-liner; an interactive terminal plus sudo/root privileges are required

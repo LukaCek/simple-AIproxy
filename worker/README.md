@@ -3,6 +3,43 @@
 CPU-only GGUF worker for Linux Docker hosts, amd64 or arm64. Requires outbound
 HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
 
+## Central diagnostics in SimpleAI Proxy
+
+The administrator can open `/admin/compute-nodes` and scroll to **Compute
+worker events** to see model download/startup/self-test failures, inference
+issues, WSS reconnects and actual resource limits. Filter events by a worker
+(e.g. Vid's Omarchy PC) and severity; the view refreshes automatically.
+
+Starting with diagnostic-capable worker images, each worker forwards **safe
+structured event codes** with RAM/disk figures over the existing authenticated
+outbound WSS connection. If the connection is interrupted, up to 120 sanitized
+events remain in `/data/diagnostics.json`, retained in the worker identity
+volume and replayed after reconnect. The proxy acknowledges persisted events.
+The same 30-day, maximum-1000-events-per-node retention already used by worker
+audit events limits database growth.
+
+For safety, the proxy **does not** ingest arbitrary Docker logs or llama.cpp
+stderr. They may contain private prompts, model responses and credentials.
+The worker extracts known safe backend failure categories (out of memory,
+unsupported architecture, failed model load, invalid chat template) without
+sending raw lines, source URLs, paths, secrets or free-form exceptions. The
+worker still exposes complete local logs to its host operator using Docker.
+Without a working Docker container or outbound connection, proxy-side
+diagnostics cannot arrive until the worker reconnects.
+
+For an existing installed worker, update that host's `compute-worker` image
+once (from its own installed Compose directory) to enable the new protocol,
+without changing the registration or model cache:
+
+```bash
+docker compose pull compute-worker
+docker compose up -d --no-deps compute-worker
+```
+
+Workers already enrolled with the safe host-side auto-updater receive this
+release during their next normal idle update. The proxy has no Docker-root
+access to a friend's computer and cannot force an update on their host.
+
 ## Proxy-managed GGUF models (no per-model Docker rebuild)
 
 The admin console at `/admin/compute-nodes` now supports **Add GGUF model

@@ -6,6 +6,7 @@ worker nodes after explicit admin approval.
 """
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import quote, unquote, urlsplit
 
@@ -58,11 +59,21 @@ async def lookup_gguf_models(source: str) -> dict:
            f"{quote(repo, safe='/')}/revision/{quote(ref, safe='')}")
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
-            response = await client.get(url, params={"blobs": "true"})
-            response.raise_for_status()
-            if len(response.content) > MAX_METADATA_BYTES:
-                raise ValueError("Hugging Face repository metadata is too large")
-            info = response.json()
+            # Do not buffer an untrusted Hugging Face JSON response unbounded.
+            # The legacy client.get() materialized the entire body before the
+            # MAX_METADATA_BYTES check, allowing large responses to consume
+            # arbitrary proxy RAM. Refuse oversized headers and chunks.
+            async with client.stream("GET", url, params={"blobs": "true"}) as response:
+                response.raise_for_status()
+                length = response.headers.get("content-length")
+                if length is not None and int(length) > MAX_METADATA_BYTES:
+                    raise ValueError("Hugging Face repository metadata is too large")
+                body = bytearray()
+                async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                    if len(body) + len(chunk) > MAX_METADATA_BYTES:
+                        raise ValueError("Hugging Face repository metadata is too large")
+                    body.extend(chunk)
+            info = json.loads(body)
     except (httpx.HTTPError, ValueError) as exc:
         raise ValueError("Cannot fetch public Hugging Face metadata") from exc
     if not isinstance(info, dict):

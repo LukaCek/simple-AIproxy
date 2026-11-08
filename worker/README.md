@@ -73,6 +73,59 @@ other containers/processes also consume large amounts. The worker is marked as
 a preferred OOM-kill candidate, but that is not a substitute for coordinating
 total memory budgets across services.
 
+
+### Unattended Linux worker updates
+
+New production workers configure a per-user **systemd timer** automatically
+during the one-line installation. It checks the trusted GHCR worker `latest`
+image four times daily, using Docker **on the host only**. Nothing grants the
+worker container access to the host Docker socket. An unattended update runs
+only while the worker is idle, preserving model downloads, identity, data and
+enrollment policy through the existing named volumes. It verifies the worker
+reconnects within 3 minutes and rolls back to the previous image if not.
+A previously failed image is skipped until GHCR publishes a different image.
+The updater does not modify the proxy or unrelated Compose projects.
+
+The installer may ask for **one-time sudo approval** to run
+`loginctl enable-linger USER`, keeping the user's systemd timers active after
+the SSH session closes. If the host cannot provide systemd, linger, or Docker
+permissions, setup reports that automatic updates are **not enabled** rather
+than silently claiming success. On Linux without systemd, configure a
+supported host scheduler separately.
+
+For a **previously installed** production worker, add the updater once
+without removing the worker's volumes. From the worker's own Compose
+directory, using the same public HTTPS proxy origin the worker already
+uses:
+
+```bash
+ORIGIN="$(sed -n 's/^SIMPLEAI_PROXY_URL=//p' .env)"
+curl -fsSL "$ORIGIN/compute/auto-update.sh" | bash -s -- --install "$(basename "$PWD")" "$ORIGIN"
+```
+
+To also migrate an older Auto Maximum installation from its outdated,
+one-time-free-RAM limit, append `--recalculate-auto-max` to the above
+command. This recalculates the maximum cap from physical host RAM, recreates
+only that worker's container and checks reconnection; the former limit is
+restored if it fails. Use the flag only if the worker was previously created
+with **Auto Maximum**, not Manual or Auto Shared. A new auto installation
+already uses the corrected formula and does not need migration.
+
+Check the schedule:
+`systemctl --user status simpleai-compute-update@WORKER_NAME.timer`.
+
+Review updater activity:
+`journalctl --user -u simpleai-compute-update@WORKER_NAME.service -n 60`.
+
+Disable automatic updates without stopping the worker:
+`systemctl --user disable --now simpleai-compute-update@WORKER_NAME.timer`.
+
+The host always retains a Docker memory ceiling. Automatic **image**
+updates intentionally do **not** silently modify previously chosen CPU/RAM
+settings. Major feature changes can still require manual configuration.
+If an update begins just as an external request arrives, that request can be
+interrupted; the timer checks idle state twice to minimize this risk.
+
 Auto profiles also set a model-storage budget based on free space in Docker's
 filesystem (with disk headroom). These are conservative resource budgets, not
 guarantees that any particular model will fit. The auto values are stored

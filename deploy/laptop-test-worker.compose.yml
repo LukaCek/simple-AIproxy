@@ -1,0 +1,47 @@
+# Laptop x86_64 -> isolated SimpleAI staging proxy on Oblak.
+# All worker settings live in THIS FILE. Nothing to install on the worker
+# except Docker Compose. The proxy controls the model selection and tests.
+#
+# Change exactly TWO values before first start:
+#   SIMPLEAI_PROXY_URL: public HTTPS staging hostname, NOT production
+#   WORKER_ENROLLMENT_TOKEN: one-time staging token generated in admin
+#
+# A staging HTTPS host must expose /compute/enroll and WSS /compute/ws.
+# NEVER point this laptop at a production URL while PR #24 is a draft.
+name: simpleai-laptop-test
+services:
+  worker:
+    build:
+      context: https://github.com/LukaCek/simple-AIproxy.git#02ebf798937b3c6a14e9222ce257a2bb740ea365
+      dockerfile: worker/Dockerfile
+    image: simpleai-laptop-test/worker:staging
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    # 19-GiB laptop: keep substantial RAM and CPU capacity for normal use.
+    mem_limit: 6g
+    memswap_limit: 6g
+    cpus: 2.0
+    environment:
+      SIMPLEAI_PROXY_URL: https://REPLACE_WITH_STAGING_HOSTNAME
+      WORKER_ENROLLMENT_TOKEN: REPLACE_WITH_ONE_TIME_STAGING_TOKEN
+      WORKER_NAME: luka-laptop-test-worker
+      WORKER_THREADS: "2"
+      WORKER_REASONING: "on"
+      # Application-controlled model storage limit, not a filesystem quota.
+      # 3 GiB encourages LRU eviction between 4B and 2B GGUF models.
+      WORKER_DISK_LIMIT_GB: "3"
+    volumes:
+      - worker-data:/data
+      - worker-models:/models
+    tmpfs:
+      - /tmp:size=128m
+    # No published ports: all worker connections are outbound WSS only.
+
+volumes:
+  worker-data:
+  worker-models:

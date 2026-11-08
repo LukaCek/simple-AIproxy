@@ -7,3 +7,7 @@ venv/
 .env*
 app.db
 cache/
+
+# Local compute staging secrets and state
+deploy/compute-staging.env
+staging-runtime/

@@ -346,7 +346,18 @@ async def chat_completions(
             detail="Missing model in request payload",
         )
 
-    endpoints = _impl.resolve_requested_model(requested_model)
+    from compute_scheduler import order_candidates
+    if requested_model == "local/auto":
+        from compute_plane import automatic_endpoints
+        try:
+            candidates = automatic_endpoints(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not candidates:
+            raise HTTPException(status_code=404, detail="No worker model supports the requested automatic tier")
+    else:
+        candidates = _impl.resolve_requested_model(requested_model)
+    endpoints = order_candidates(candidates, payload)
     api_key_value = api_key_record["key"]
     api_key_name = api_key_record["name"] if "name" in api_key_record.keys() else None
     prompt_text = _impl.extract_prompt(payload)
@@ -441,6 +452,82 @@ async def chat_completions(
         number, attempt_started_at, attempt_started_monotonic = begin_attempt()
         response: Optional[httpx.Response] = None
         try:
+            if endpoint.get("api_mode") == "compute_worker":
+                # Preserve the default-private trust boundary for true SSE requests.
+                if not endpoint.get("allow_private") and payload.get("aiproxy_visibility") != "public":
+                    record_attempt(number, provider_name, provider_model, None, "privacy_skip",
+                                   "Compute node is not trusted for private requests",
+                                   attempt_started_at, attempt_started_monotonic)
+                    last_error = "Compute node is not trusted for private requests"
+                    continue
+                from compute_plane import forward as compute_forward
+                compute_response = await compute_forward(endpoint, dict(provider_payload))
+                if isinstance(compute_response, StreamingResponse):
+                    # StreamingResponse is merely *prepared* here. The worker
+                    # may fail or the client may disconnect after headers.
+                    original_iterator = compute_response.body_iterator
+
+                    async def metered_compute_stream():
+                        first_at: Optional[str] = None
+                        completed = False
+                        stream_error: Optional[str] = None
+                        # Bounded SSE prefix for visible assistant text in
+                        # standard Request Logs. Excludes reasoning deltas.
+                        text_capture = bytearray()
+                        try:
+                            async for part in original_iterator:
+                                if first_at is None:
+                                    first_at = datetime.utcnow().isoformat()
+                                if isinstance(part, bytes) and len(text_capture) < 65536:
+                                    text_capture.extend(part[:65536 - len(text_capture)])
+                                yield part
+                            completed = True
+                        except asyncio.CancelledError:
+                            stream_error = "Compute stream cancelled"
+                            raise
+                        except Exception:
+                            stream_error = "Compute stream interrupted"
+                            raise
+                        finally:
+                            code = 200 if completed else 502
+                            action = "success" if completed else "stream_error"
+                            if not completed and stream_error is None:
+                                stream_error = "Compute stream stopped before completion"
+                            ended_at, first_ms, total_ms = timing(first_at)
+                            # No arbitrary worker stream content in log metadata.
+                            record_attempt(number, provider_name, provider_model,
+                                           code, action, stream_error,
+                                           attempt_started_at, attempt_started_monotonic)
+                            try:
+                                output_text = _impl.extract_response_text_from_sse(
+                                    bytes(text_capture)
+                                )
+                            except (ValueError, TypeError):
+                                output_text = ""
+                            _impl.insert_log(
+                                api_key_value, api_key_name, requested_model,
+                                requested_model, provider_name, provider_model,
+                                code, started_at, first_at, ended_at, first_ms,
+                                total_ms, prompt_text, output_text or None,
+                                stream_error, request_id=request_id,
+                            )
+
+                    compute_response.body_iterator = metered_compute_stream()
+                    return compute_response
+
+                # Defensive fallback: compute forward normally returns
+                # StreamingResponse for stream=true.
+                record_attempt(number, provider_name, provider_model, 200,
+                               "success", None, attempt_started_at,
+                               attempt_started_monotonic)
+                ended_at, first_ms, total_ms = timing()
+                _impl.insert_log(
+                    api_key_value, api_key_name, requested_model,
+                    requested_model, provider_name, provider_model, 200,
+                    started_at, None, ended_at, first_ms, total_ms,
+                    prompt_text, None, None, request_id=request_id,
+                )
+                return compute_response
             await _impl.ensure_provider_token(endpoint)
             if _impl.http_client is None:
                 raise RuntimeError("HTTP client is not initialized")

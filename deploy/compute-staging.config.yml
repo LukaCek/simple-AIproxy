@@ -1,0 +1,5 @@
+# Empty, isolated model routing configuration for the compute staging proxy.
+# A compute worker is discovered dynamically once connected and ready.
+providers: []
+groups: {}
+model_profiles: {}

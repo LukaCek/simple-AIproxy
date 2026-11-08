@@ -2,6 +2,10 @@
 import asyncio
 import json
 import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx
 import pytest
@@ -138,3 +142,55 @@ async def test_catalog_refresh_and_etag_are_account_scoped(registry, monkeypatch
     await reg.refresh_catalog("basic")
     assert client.calls[-1][1]["If-None-Match"] == "asic"
     assert client.calls[-1][2]["client_version"] == reg.CLIENT_VERSION
+
+
+def test_live_compute_models_survive_codex_models_route_override(registry, monkeypatch):
+    """Production Codex registry must retain approved/verified compute models."""
+    import compute_plane
+    called = []
+    def compute_candidates(model):
+        called.append(model)
+        if model in ("local/qwen35-0.8b-q4", "local/qwen35-2b-q4"):
+            return [{"name": "compute-fixture", "model": model.split("/", 1)[1]}]
+        return []
+    monkeypatch.setattr(compute_plane, "endpoints", compute_candidates)
+
+    result = asyncio.run(registry.listed_models())
+    ids = {item["id"] for item in result["data"]}
+    assert "local/qwen35-0.8b-q4" in ids
+    assert "local/qwen35-2b-q4" in ids
+    assert "local/auto" in ids
+    assert "local/qwen35-4b-q4" not in ids
+    assert len(called) >= 4
+
+
+def test_codex_model_list_hides_offline_compute_nodes(registry, monkeypatch):
+    import compute_plane
+    monkeypatch.setattr(compute_plane, "endpoints", lambda _mid: [])
+    result = asyncio.run(registry.listed_models())
+    assert not any(model["id"].startswith("local/") for model in result["data"])
+
+
+def test_full_entrypoint_uses_codex_aware_compute_model_list():
+    """Verify production startup in an isolated Python interpreter.
+
+    The full pytest suite starts main_impl.app in TestClient fixtures. Importing
+    full_entrypoint after that mutates middleware and fails under Starlette;
+    real production startup happens in a fresh process instead.
+    """
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    script = """
+import full_entrypoint
+routes = [r for r in full_entrypoint.app.router.routes
+          if getattr(r, "path", None) == "/v1/models"
+          and "GET" in (getattr(r, "methods", None) or set())]
+assert len(routes) == 1
+assert routes[0].endpoint.__name__ == "model_list"
+assert "listed_models" in routes[0].endpoint.__code__.co_names
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]

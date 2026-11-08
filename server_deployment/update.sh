@@ -19,7 +19,7 @@ previous_image="$(docker inspect --format '{{.Image}}' llm-proxy)"
     die "No trusted previous production image. Refusing replacement."
 
 # Take the snapshot before pulling/replacing containers.
-snapshot="$(python3 server_deployment/backup_release.py "$PWD" "$previous_image")"
+snapshot="$(python3 backup_release.py "$PWD" "$previous_image")"
 [[ -f "$snapshot/app.db" && -f "$snapshot/metadata.json" ]] ||
     die "Backup is not complete; refusing deployment"
 log "Verified SQLite snapshot and private config backup: $snapshot"
@@ -82,10 +82,10 @@ for i in $(seq 1 45); do
   fi
   sleep 2
 done
-[[ "$ready" == 1 ]] || die "New container failed HTTP readiness"
+if [[ "$ready" != 1 ]]; then\n  log "New container failed HTTP readiness"\n  false  # Trigger ERR trap and immutable-image rollback.\nfi
 
 log "Checking admin UI, compute policy and authenticated /v1/models."
-docker compose -f docker-compose.yml exec -T llm-proxy python - < server_deployment/check_release.py
+docker compose -f docker-compose.yml exec -T llm-proxy python - < check_release.py
 
 trap - ERR
 phase="complete"

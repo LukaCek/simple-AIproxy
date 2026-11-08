@@ -277,18 +277,18 @@ if [[ -n "$name" ]]; then
 else
   shopt -s nullglob
   configs=( "$root"/*/docker-compose.yml )
-  if (( \${#configs[@]} == 0 )); then
+  if (( ${#configs[@]} == 0 )); then
     printf 'No installed SimpleAI Compute Workers found.\n' >&2
     exit 1
   fi
-  if (( \${#configs[@]} > 1 )); then
+  if (( ${#configs[@]} > 1 )); then
     printf 'More than one worker is installed. Choose one:\n' >&2
-    for config in "\${configs[@]}"; do
+    for config in "${configs[@]}"; do
       printf '  simpleai-tui %s\n' "$(basename "$(dirname "$config")")" >&2
     done
     exit 2
   fi
-  dir="$(dirname "\${configs[0]}")"
+  dir="$(dirname "${configs[0]}")"
 fi
 
 cd "$dir"
@@ -308,7 +308,7 @@ SIMPLEAI_TUI_LAUNCHER
   # login. Add a guarded PATH stanza for *future* Bash/Zsh sessions only.
   if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
     local rc
-    case "\${SHELL:-}" in
+    case "${SHELL:-}" in
       */zsh) rc="$HOME/.zshrc" ;;
       *) rc="$HOME/.bashrc" ;;
     esac

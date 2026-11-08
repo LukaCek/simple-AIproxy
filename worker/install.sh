@@ -200,7 +200,7 @@ ensure_docker_user_access() {
   # No enrollment has happened yet. Quoted arguments were validated above.
   local origin_arg code_arg='' cmd
   printf -v origin_arg '%q' "$PROXY_ORIGIN"
-  if [[ $# -eq 1 ]]; then
+  if [[ -n "${1:-}" ]]; then
     [[ "$1" =~ ^[A-Za-z0-9_-]{32,128}$ ]] ||
       fail "Invalid one-time enrollment code format."
     printf -v code_arg ' %q' "$1"

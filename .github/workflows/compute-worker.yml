@@ -235,12 +235,11 @@ jobs:
             [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || exit 1
             sources+=( "$IMAGE@sha256:$digest" )
           done
+          # Publish immutable commit SHA first and validate the manifest.
+          # Keep the previous working :latest until verification succeeds.
           docker buildx imagetools create \
-            -t "$IMAGE:latest" \
             -t "$IMAGE:$GITHUB_SHA" \
             "${sources[@]}"
-          docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA"
-          # Fail if either architecture is missing.
           docker buildx imagetools inspect --raw "$IMAGE:$GITHUB_SHA" | python3 -c '
           import json, sys
           m = json.load(sys.stdin)
@@ -248,3 +247,6 @@ jobs:
                        for x in m["manifests"] if x.get("platform")}
           assert {("linux", "amd64"), ("linux", "arm64")} <= platforms, platforms
           '
+          # Promote only a validated multiarch image to the live release tag.
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$GITHUB_SHA"
+          docker buildx imagetools inspect "$IMAGE:latest"

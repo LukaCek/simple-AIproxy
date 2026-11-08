@@ -151,7 +151,8 @@ def test_install_script_supports_single_copy_paste_and_legacy_hidden_prompt():
     assert "read -r -s" in script
     assert "</dev/tty" in script
     assert "docker compose" in script
-    assert "docker.sock" not in script
+    assert 'docker.sock:/var/run/docker.sock' not in script
+    assert 'docker.sock:/run/docker.sock' not in script
     assert "/compute/bootstrap" in script
     assert "WORKER_ENROLLMENT_TOKEN=" in script
     assert 'info "$ENROLLMENT_CODE"' not in script
@@ -318,7 +319,9 @@ def test_host_auto_updater_stays_outside_worker_and_is_syntax_valid(tmp_path):
     assert "Persistent=true" in content
     assert "systemctl --user enable --now" in content
     assert "sudo loginctl enable-linger" in content
-    assert "/var/run/docker.sock" not in installer
+    assert 'docker.sock:/var/run/docker.sock' not in installer
+    assert 'docker.sock:/run/docker.sock' not in installer
+    assert "/var/run/docker.sock" not in compose_text(validate_setup(VALID))
     assert 'bash -s -- --install "$(basename "$INSTALL_DIR")" "$PROXY_ORIGIN"' in installer
 
     # The updater cannot auto-pull arbitrary images or modify an unrelated

@@ -553,7 +553,10 @@ def test_installer_host_bootstrap_has_explicit_security_boundaries():
     assert "root-equivalent privileges" in installer
     assert "Type YES" in installer
     assert "usermod -aG docker" in installer
-    assert 'exec sg docker -c "$cmd"' in installer
+    assert 'exec sg docker -c ' in installer
+    assert 'exec sudo -H -u "$(id -un)" -g docker --' in installer
+    assert 'env SIMPLEAI_DOCKER_GROUP_REENTRY=1' in installer
+    assert 'systemctl is-active --quiet docker.service' in installer
     assert 'SIMPLEAI_DOCKER_GROUP_REENTRY' in installer
     assert "sudo -v </dev/tty" in installer
     assert "DOCKER_HOST is set" in installer
@@ -608,6 +611,7 @@ def test_installer_bootstraps_fresh_arch_packages_then_starts_daemon(tmp_path):
     systemctl.write_text(
         "#!/bin/sh\n"
         "printf 'systemctl %s\\n' \"$*\" >> \"$SIMPLEAI_TEST_EVENTS\"\n"
+        "if [ \"$1\" = is-active ]; then exit 1; fi\n"
         "touch \"$SIMPLEAI_TEST_READY\"\n"
     )
     for path in (pacman, systemctl):
@@ -628,5 +632,138 @@ def test_installer_bootstraps_fresh_arch_packages_then_starts_daemon(tmp_path):
     assert "BOOTSTRAP_PASSED" in result.stdout
     assert events.read_text().splitlines() == [
         "pacman -S --needed --noconfirm python docker docker-compose",
+        "systemctl is-active --quiet docker.service",
         "systemctl enable --now docker.service",
+    ]
+
+
+
+def test_installer_falls_back_to_sudo_docker_group_without_sg(tmp_path):
+    """Regression: fresh Omarchy can have Docker but no sg binary.
+
+    Execute the installer group-reentry function with all privileged commands
+    stubbed; the test must never alter the runner's actual groups.
+    """
+    import os
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    function = "ensure_docker_user_access() {" + script.split(
+        "ensure_docker_user_access() {", 1)[1].split(
+        "\n}\n\ninstall_host_packages", 1)[0] + "\n}\n"
+
+    consent = (
+        '  [[ -r /dev/tty && -w /dev/tty ]] ||\n'
+        '    fail "Explicit consent is required to grant the Docker group. Use an interactive terminal."\n'
+        "  local answer=''\n"
+        '  IFS= read -r -p "Allow this Linux user passwordless Docker access? Type YES: " answer </dev/tty ||\n'
+        '    fail "Could not read Docker access decision."'
+    )
+    assert consent in function
+    function = function.replace(consent, "  local answer=YES")
+    assert "sudo -v </dev/tty" in function
+    function = function.replace("sudo -v </dev/tty", "sudo -v </dev/null")
+
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    for cmd in ("tr", "grep"):
+        target = shutil.which(cmd)
+        assert target
+        (stubs / cmd).symlink_to(target)
+    (stubs / "docker").write_text("#!/bin/sh\nexit 1\n")
+    (stubs / "stat").write_text("#!/bin/sh\nprintf 'docker\\n'\n")
+    (stubs / "id").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -un ]; then printf 'vid\\n'; "
+        "else printf 'users\\n'; fi\n"
+    )
+    (stubs / "usermod").write_text(
+        "#!/bin/sh\n"
+        "printf 'USERMOD %s\\n' \"$*\" >> \"$EVENTS\"\n"
+    )
+    (stubs / "sudo").write_text(
+        "#!/bin/sh\n"
+        "printf 'SUDO %s\\n' \"$*\" >> \"$EVENTS\"\n"
+    )
+    for path in stubs.iterdir():
+        if not path.is_symlink():
+            path.chmod(0o755)
+
+    runner = tmp_path / "test.sh"
+    runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        'fail() { printf "%s\\n" "$*" >&2; exit 9; }\n'
+        'info() { :; }\n'
+        'as_root() { "$@"; }\n'
+        'PROXY_ORIGIN="https://proxy.example.com"\n'
+        + function
+        + 'ensure_docker_user_access "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\n'
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(runner)],
+        env={**os.environ, "PATH": str(stubs), "EVENTS": str(tmp_path / "events")},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    events = (tmp_path / "events").read_text().splitlines()
+    assert events[0] == "USERMOD -aG docker vid"
+    assert "SUDO -v" in events
+    assert any(line.startswith("SUDO -H -u vid -g docker -- env "
+                               "SIMPLEAI_DOCKER_GROUP_REENTRY=1 ")
+               for line in events), events
+    assert all("sg " not in line for line in events)
+
+
+def test_installer_does_not_restart_running_docker_for_socket_denial(tmp_path):
+    """A working root daemon with denied user access must not be restarted."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    fn = "start_host_docker() {" + script.split(
+        "start_host_docker() {", 1)[1].split("\n}\n\nensure_docker_user_access", 1)[0] + "\n}\n"
+    mock = tmp_path / "bin"
+    mock.mkdir()
+    (mock / "docker").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = info ]; then\n"
+        "  if [ \"$RUNNING_AS_SUDO\" = yes ]; then exit 0; fi\n"
+        "  exit 1\n"
+        "fi\n"
+    )
+    (mock / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "printf 'systemctl %s\\n' \"$*\" >> \"$EVENTS\"\n"
+        "if [ \"$1\" = is-active ]; then exit 0; fi\n"
+        "exit 8\n"
+    )
+    (mock / "sudo").write_text(
+        "#!/bin/sh\n"
+        "printf 'sudo %s\\n' \"$*\" >> \"$EVENTS\"\n"
+        "RUNNING_AS_SUDO=yes \"$@\"\n"
+    )
+    for p in mock.iterdir():
+        p.chmod(0o755)
+    harness = tmp_path / "script.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+        'fail() { echo "$*" >&2; exit 9; }\n'
+        'info() { :; }\n'
+        'as_root() { echo "UNEXPECTED ROOT" >&2; exit 9; }\n'
+        + fn + "start_host_docker\n"
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(harness)],
+        env={**os.environ, "PATH": str(mock), "EVENTS": str(tmp_path / "events"),
+             "RUNNING_AS_SUDO": "no"},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "events").read_text().splitlines() == [
+        "systemctl is-active --quiet docker.service",
+        "sudo docker info",
     ]

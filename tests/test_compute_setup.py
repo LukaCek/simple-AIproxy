@@ -20,6 +20,7 @@ def test_generated_compose_is_valid_and_has_no_inline_secret():
     assert service["cap_drop"] == ["ALL"]
     assert service["mem_limit"] == "4g"
     assert service["memswap_limit"] == "4g"
+    assert service["oom_score_adj"] == 500
     assert service["environment"]["WORKER_NAME"] == "pi-worker"
     assert "PRIVATE_TOKEN" not in compose
     assert "WORKER_ENROLLMENT_TOKEN" in compose
@@ -174,3 +175,44 @@ def test_local_worker_ca_setup_passed_as_one_command_argument():
     assert "cat /etc/ssl/certs/ca-certificates.crt" in worker["command"][0]
     assert "exec python agent.py" in worker["command"][0]
 
+
+def test_auto_memory_budget_uses_total_ram_not_one_time_free_ram():
+    """Exercise the actual installer Python calculator, not a copied formula."""
+    import ast
+    import math
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    marker = 'INSTALL_DIR="$(python3 - "$TEMP_DIR/bootstrap.json" "$PROXY_ORIGIN" <<\'PY\'\n'
+    embedded = script.split(marker, 1)[1].split("\nPY\n", 1)[0]
+    tree = ast.parse(embedded)
+    calculator = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.FunctionDef) and node.name == "auto_ram_gib")
+    gib = 1024 ** 3
+    scope = {"math": math, "gib": gib}
+    exec(compile(ast.fix_missing_locations(
+        ast.Module(body=[calculator], type_ignores=[])), "<auto-installer>", "exec"), scope)
+    calculate = scope["auto_ram_gib"]
+
+    # Same 23 GiB machine: active miner (low MemAvailable) cannot
+    # freeze the permanent worker Docker limit to 7.25 GiB.
+    assert calculate(23 * gib, False) == 19.5
+    assert calculate(23 * gib, True) == 12.5
+    assert calculate(4 * gib, False) == 2.0
+    assert calculate(2 * gib, False) < 2  # small hosts fail safely
+
+    # The runtime guard remains: no unlimited Docker memory and no
+    # inference when current host/cgroup memory is insufficient.
+    assert "available - " not in embedded
+    assert "available = read_mem('MemAvailable')" in embedded
+    assert "WORKER_MEMORY_LIMIT={memory_gb}g" in embedded
+    assert "if memory_gb < 2:" in embedded
+
+
+def test_wizard_explains_physical_host_ram_budget_and_heavy_loads():
+    from pathlib import Path
+    wizard = (Path(__file__).resolve().parents[1] /
+              "templates" / "compute_setup.html").read_text()
+    assert "85% of total physical RAM" in wizard
+    assert "Running other memory-heavy services" in wizard
+    assert "Auto Shared" in wizard

@@ -47,8 +47,19 @@ rollback() {
   printf 'services:\n  llm-proxy:\n    image: %s\n    pull_policy: never\n' "$rollback_image" > "$override"
   if docker compose -f docker-compose.yml -f "$override" up -d \
       --no-deps --force-recreate llm-proxy; then
-    if docker compose -f docker-compose.yml -f "$override" exec -T llm-proxy \
-        python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5).read()" ; then
+    # Docker reports "Started" before FastAPI has bound port 8000.
+    # Wait for the old image to become healthy instead of reporting a
+    # false rollback failure due to a transient connection-refused.
+    local restored_ready=0
+    for i in $(seq 1 45); do
+      if docker compose -f docker-compose.yml -f "$override" exec -T llm-proxy \
+          python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3).read()" >/dev/null 2>&1; then
+        restored_ready=1
+        break
+      fi
+      sleep 2
+    done
+    if [[ "$restored_ready" == 1 ]]; then
       log "Previous image restored and HTTP health check passed."
     else
       log "URGENT: rollback container started but health check FAILED."

@@ -937,10 +937,139 @@ async def revoke_node(node_id: str):
     return {"revoked": True}
 
 
+@router.delete("/admin/api/compute/nodes/{node_id}", dependencies=[Depends(require_admin_write)])
+async def remove_node_permanently(node_id: str) -> dict[str, Any]:
+    """Delete a disconnected/revoked enrollment from the proxy.
+
+    Never touch Docker or delete models on the remote computer: it could be
+    an untrusted friend's host. A running node loses access immediately.
+    """
+    _setup()
+    async with _registry_lock:
+        conn = _connections.pop(node_id, None)
+        with _db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT id FROM ComputeNodes WHERE id=?", (node_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "Worker not found")
+            db.execute("DELETE FROM ComputeNodes WHERE id=?", (node_id,))
+            db.execute("DELETE FROM ComputeOperations WHERE node_id=?", (node_id,))
+            db.execute("DELETE FROM ComputeEvents WHERE node_id=?", (node_id,))
+        with _reservation_lock:
+            _reservations.pop(node_id, None)
+            _reservation_waiters.pop(node_id, None)
+        if conn:
+            try:
+                await conn.ws.close(code=1008)
+            except Exception:
+                pass
+    return {"removed": True, "node_id": node_id,
+            "remote_container_untouched": True}
+
+
 @router.get("/admin/api/compute/catalog", dependencies=[Depends(core.verify_admin)])
 async def catalog() -> dict[str, Any]:
     _setup()
     return {"models": CATALOG, "built_in": list(BUILTIN_CATALOG)}
+
+
+@router.post("/admin/api/compute/catalog/inspect", dependencies=[Depends(require_admin_write)])
+async def inspect_custom_model(request: Request) -> dict[str, Any]:
+    """Resolve the canonical GGUF metadata using a FIXED Hugging Face host.
+
+    This does not download weights, execute remote code or approve a model.
+    """
+    data = await request.json()
+    source = data.get("source") if isinstance(data, dict) else None
+    try:
+        return await lookup_gguf_models(source)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/admin/api/compute/catalog/custom", dependencies=[Depends(require_admin_write)])
+async def add_custom_model(request: Request) -> dict[str, Any]:
+    """Pin a model and optionally schedule CPU self-tests across workers.
+
+    Model name, expected SHA and size are independently looked up, never
+    trusted from the browser or arbitrary URLs.
+    """
+    data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Expected a model definition")
+    source, filename = data.get("source"), data.get("file")
+    if not isinstance(filename, str) or len(filename) > 240:
+        raise HTTPException(400, "Choose a GGUF file from the inspection results")
+    try:
+        inspection = await lookup_gguf_models(source)
+        definition = next((v for v in inspection["files"] if v["file"] == filename), None)
+        if not definition:
+            raise ValueError("Selected GGUF file is no longer available")
+        custom_name = data.get("name")
+        if custom_name is not None:
+            definition["name"] = custom_name
+        ctx = data.get("ctx", 4096)
+        definition["ctx"] = ctx
+        model_id = data.get("id") or (
+            "custom-" + hashlib.sha256(
+                (definition["repo"] + "/" + filename + "@" + definition["revision"]).encode()
+            ).hexdigest()[:16]
+        )
+        definition = validate_model_entry(model_id, definition)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if type(data.get("enable", True)) is not bool:
+        raise HTTPException(400, "enable must be boolean")
+    _setup()
+    with _db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if len(CATALOG) >= MAX_CATALOG_MODELS:
+            raise HTTPException(409, "Maximum number of catalog models reached")
+        if model_id in CATALOG:
+            raise HTTPException(409, "Model ID already exists; choose a different ID")
+        now = int(time.time())
+        db.execute(
+            "INSERT INTO ComputeCustomModels(id,definition_json,added_at) VALUES(?,?,?)",
+            (model_id, json.dumps(definition), now),
+        )
+        row = db.execute("SELECT revision,models_json FROM ComputePolicy WHERE id=1").fetchone()
+        selected = json.loads(row["models_json"])
+        if data.get("enable", True) and model_id not in selected:
+            selected.append(model_id)
+        db.execute("UPDATE ComputePolicy SET revision=?,models_json=?,updated_at=? WHERE id=1",
+                   (int(row["revision"]) + 1, json.dumps(selected), now))
+    _setup()
+    for conn in list(_connections.values()):
+        try:
+            await _send_node_policy(conn)
+        except Exception:
+            pass
+    return {"id": model_id, "definition": definition,
+            "enabled": model_id in _model_policy()["models"]}
+
+
+@router.delete("/admin/api/compute/catalog/custom/{model_id}", dependencies=[Depends(require_admin_write)])
+async def remove_custom_model(model_id: str) -> dict[str, Any]:
+    """Remove an admin-added catalog entry, keeping cached GGUF data untouched."""
+    _setup()
+    if model_id in BUILTIN_CATALOG:
+        raise HTTPException(400, "Bundled models cannot be deleted")
+    with _db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        deleted = db.execute("DELETE FROM ComputeCustomModels WHERE id=?", (model_id,))
+        if not deleted.rowcount:
+            raise HTTPException(404, "Custom model not found")
+        row = db.execute("SELECT revision,models_json FROM ComputePolicy WHERE id=1").fetchone()
+        selected = [m for m in json.loads(row["models_json"]) if m != model_id]
+        db.execute("UPDATE ComputePolicy SET revision=?,models_json=?,updated_at=? WHERE id=1",
+                   (int(row["revision"]) + 1, json.dumps(selected), int(time.time())))
+    _setup()
+    for conn in list(_connections.values()):
+        try:
+            await _send_node_policy(conn)
+        except Exception:
+            pass
+    return {"removed": True, "id": model_id, "cached_weights_preserved": True}
 
 
 @router.get("/admin/api/compute/model-policy", dependencies=[Depends(core.verify_admin)])

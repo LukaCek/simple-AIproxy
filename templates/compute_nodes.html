@@ -86,6 +86,9 @@
         Worker version {{ node.hardware.get('version', 'unknown') }} ·
         build {{ (node.hardware.get('build_revision') or 'unknown')[:12] }} (reported by worker)
       </p>
+      {% if not node.hardware.get('catalog_protocol') %}
+      <p class="mt-1 text-xs text-amber-700">Older worker image: update required before new custom models can be tested here.</p>
+      {% endif %}
       <p data-node-busy class="mt-1 text-xs text-slate-500">
         Inference: {{ 'Busy' if node.models.get('busy') else 'Idle' }} ·
         {{ node.models.get('running_tasks', 0) }} active slot

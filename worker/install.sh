@@ -223,3 +223,119 @@ info "Identity preserved in its own Docker volume; one-time setup code removed."
 info "Check Compute Nodes in the proxy; public requests are allowed by default,"
 info "but PRIVATE access remains disabled until explicitly approved."
 info "Inspect logs: cd '$INSTALL_DIR' && docker compose logs --tail=80 compute-worker"
+
+# Install an unprivileged, one-word launcher. It reads worker folders from the
+# existing per-user registry; no credentials or Docker socket are embedded.
+install_tui_shortcut() {
+  local bin_dir="$HOME/.local/bin"
+  local launcher="$bin_dir/simpleai-tui"
+  local tmp
+  mkdir -p -- "$bin_dir"
+  if [[ -e "$launcher" || -L "$launcher" ]]; then
+    if ! [[ -f "$launcher" ]] || ! grep -Fq '# SimpleAI Compute Worker managed TUI shortcut' "$launcher"; then
+      info "Shortcut $launcher already exists and is not managed by SimpleAI; leaving it unchanged."
+      return 1
+    fi
+  fi
+  tmp="$(mktemp "$bin_dir/.simpleai-tui.XXXXXXXX")" || return 1
+  cat > "$tmp" <<'SIMPLEAI_TUI_LAUNCHER'
+#!/usr/bin/env bash
+# SimpleAI Compute Worker managed TUI shortcut
+set -euo pipefail
+
+root="$HOME/.local/share/simpleai-compute"
+usage() {
+  printf 'Usage: simpleai-tui [worker-name] [--once]\n' >&2
+}
+name=''
+once=0
+for arg in "$@"; do
+  case "$arg" in
+    --once) once=1 ;;
+    --help|-h) usage; exit 0 ;;
+    -*)
+      usage
+      exit 2
+      ;;
+    *)
+      if [[ -n "$name" ]]; then usage; exit 2; fi
+      name="$arg"
+      ;;
+  esac
+done
+
+if [[ -n "$name" ]]; then
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+    printf 'Invalid worker name.\n' >&2
+    exit 2
+  fi
+  dir="$root/$name"
+  if [[ ! -f "$dir/docker-compose.yml" ]]; then
+    printf 'Worker "%s" not installed at %s\n' "$name" "$dir" >&2
+    exit 1
+  fi
+else
+  shopt -s nullglob
+  configs=( "$root"/*/docker-compose.yml )
+  if (( \${#configs[@]} == 0 )); then
+    printf 'No installed SimpleAI Compute Workers found.\n' >&2
+    exit 1
+  fi
+  if (( \${#configs[@]} > 1 )); then
+    printf 'More than one worker is installed. Choose one:\n' >&2
+    for config in "\${configs[@]}"; do
+      printf '  simpleai-tui %s\n' "$(basename "$(dirname "$config")")" >&2
+    done
+    exit 2
+  fi
+  dir="$(dirname "\${configs[0]}")"
+fi
+
+cd "$dir"
+if (( once )); then
+  exec docker compose exec -T compute-worker python tui.py --once
+fi
+if [[ ! -t 0 || ! -t 1 ]]; then
+  printf 'Interactive dashboard requires a terminal; use --once for a snapshot.\n' >&2
+  exit 2
+fi
+exec docker compose exec compute-worker python tui.py
+SIMPLEAI_TUI_LAUNCHER
+  chmod 700 "$tmp"
+  mv -f -- "$tmp" "$launcher"
+
+  # A new Ubuntu account may not have ~/.local/bin on PATH until the next
+  # login. Add a guarded PATH stanza for *future* Bash/Zsh sessions only.
+  if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+    local rc
+    case "\${SHELL:-}" in
+      */zsh) rc="$HOME/.zshrc" ;;
+      *) rc="$HOME/.bashrc" ;;
+    esac
+    if [[ -f "$rc" ]] && ! grep -Fq '# SimpleAI Compute Worker TUI PATH' "$rc"; then
+      printf '\n# SimpleAI Compute Worker TUI PATH\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
+    elif [[ ! -e "$rc" ]]; then
+      printf '# SimpleAI Compute Worker TUI PATH\nexport PATH="$HOME/.local/bin:$PATH"\n' > "$rc"
+    fi
+    info "Open a NEW shell for the 'simpleai-tui' command; this shell's PATH cannot be changed by an installer."
+  fi
+  return 0
+}
+
+if install_tui_shortcut; then
+  info "TUI shortcut installed: simpleai-tui"
+  info "Later, from any directory, run 'simpleai-tui' (or 'simpleai-tui <worker-name>')."
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    info "Opening interactive TUI automatically. Press q to return to the shell."
+    # The installer was piped to Bash. Reopen the real terminal: Compose and
+    # the TUI both require stdin/stdout to be TTYs, not the curl input pipe.
+    if ! "$HOME/.local/bin/simpleai-tui" "$(basename "$INSTALL_DIR")" </dev/tty >/dev/tty 2>&1; then
+      info "Could not open interactive TUI; try '$HOME/.local/bin/simpleai-tui' manually."
+    fi
+  else
+    info "No interactive terminal available; open the TUI later with 'simpleai-tui'."
+  fi
+else
+  info "Warning: worker registered, but shortcut installation was skipped."
+  info "TUI remains available: cd '$INSTALL_DIR' && docker compose exec compute-worker python tui.py"
+fi

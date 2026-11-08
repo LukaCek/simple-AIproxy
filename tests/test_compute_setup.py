@@ -337,3 +337,64 @@ def test_auto_updater_rejects_invalid_worker_name_without_docker(tmp_path):
                                 capture_output=True, text=True)
         assert output.returncode != 0
         assert "valid worker name" in output.stderr
+
+
+def test_host_updater_only_recreates_worker_for_new_image_when_idle(tmp_path):
+    """Stub Docker API to exercise no-op, busy and upgrade paths safely."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "worker" / "auto-update.sh"
+    root = tmp_path / "home" / ".local/share/simpleai-compute" / "compute-1"
+    root.mkdir(parents=True)
+    (root / "docker-compose.yml").write_text(
+        "services:\n  compute-worker:\n    image: ghcr.io/lukacek/simple-aiproxy-worker:latest\n")
+    mock_bin = tmp_path / "bin"
+    mock_bin.mkdir()
+    docker = mock_bin / "docker"
+    docker.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+a = sys.argv[1:]
+with open(os.environ["MOCK_DOCKER_LOG"], "a") as f:
+    f.write(" ".join(a) + "\n")
+if a[:2] == ["compose", "config"]:
+    print(json.dumps({"services": {"compute-worker": {
+        "image": "ghcr.io/lukacek/simple-aiproxy-worker:latest"}}}))
+elif a[:3] == ["compose", "ps", "-q"]:
+    print("container-1")
+elif a[:2] == ["inspect", "--format"]:
+    print("running" if "State.Status" in a[2] else "sha256:old")
+elif a[:3] == ["compose", "exec", "-T"]:
+    if os.environ.get("MOCK_BUSY") == "1":
+        sys.exit(1)
+elif a[:3] == ["image", "inspect", "--format"]:
+    print("sha256:" + os.environ.get("MOCK_RELEASE", "old"))
+''')
+    docker.chmod(0o700)
+
+    log = tmp_path / "mock-docker.log"
+    env = {**os.environ, "HOME": str(tmp_path / "home"),
+           "PATH": str(mock_bin) + os.pathsep + os.environ.get("PATH", ""),
+           "MOCK_DOCKER_LOG": str(log)}
+    def run(**kwargs):
+        log.write_text("")
+        return subprocess.run(["bash", str(script), "--check", "compute-1"],
+                              env={**env, **kwargs}, capture_output=True,
+                              text=True, timeout=20)
+
+    current = run(MOCK_RELEASE="old")
+    assert current.returncode == 0, current.stderr
+    assert "Already current" in current.stdout
+    assert "compose up " not in log.read_text()
+
+    busy = run(MOCK_RELEASE="new", MOCK_BUSY="1")
+    assert busy.returncode == 0, busy.stderr
+    assert "defer update" in busy.stdout
+    assert "pull --quiet" not in log.read_text()
+
+    upgraded = run(MOCK_RELEASE="new")
+    assert upgraded.returncode == 0, upgraded.stderr
+    assert "Updated successfully" in upgraded.stdout
+    assert "compose up -d --no-build --no-deps --force-recreate" in log.read_text()
+    assert not (root / ".update-rejected-image").exists()

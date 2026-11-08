@@ -3,6 +3,68 @@
 CPU-only GGUF worker for Linux Docker hosts, amd64 or arm64. Requires outbound
 HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
 
+## Proxy-managed GGUF models (no per-model Docker rebuild)
+
+The admin console at `/admin/compute-nodes` now supports **Add GGUF model
+from Hugging Face**. Paste an `owner/repository` name or a public Hugging Face
+`/blob/...` / `/resolve/...` GGUF URL, inspect available quantizations,
+choose one, and press **Add model**. SimpleAI reads Hugging Face's public LFS
+metadata using a fixed HTTPS API endpoint, then records an **immutable
+repository commit, GGUF path, exact file size and SHA256**. Arbitrary URLs,
+unsigned files, executable repository code and mutable download targets are
+not permitted. Weights download only on assigned workers.
+
+Selecting **Add to active policy and automatically self-test** sends the
+updated catalog via authenticated outbound WSS to all connected workers.
+Each eligible node checks real RAM and disk limits, downloads the checksum-
+pinned model, and executes a CPU inference self-test. *Supported*,
+*Unsupported* and *Error* statuses and reasons are shown per node; **Test**
+allows a manual re-test. Automatic placement respects per-node capacity,
+and private-data access remains a separate admin-controlled permission.
+
+New catalog entries do not require Python code changes or new Docker
+builds. Hosts first need **one worker image update supporting the dynamic
+catalog protocol**. Models requiring a newer llama.cpp release can still
+fail the real test. This worker executes GGUF/llama.cpp on CPU, not arbitrary
+weight formats or executable repository code.
+
+Removing a custom catalog entry does not delete cached weights on workers.
+Use the **Delete** operation on an individual node before removing its
+entry if disk needs reclaiming. The proxy cannot safely delete arbitrary
+files on somebody else's host.
+
+### One-time updater setup on each existing worker host
+
+Once this version is live, run once as the Linux user who owns the workers:
+
+```bash
+curl -fsSL https://aiproxy.cekluka.com/compute/enable-auto-updates.sh | \
+  bash -s -- https://aiproxy.cekluka.com
+```
+
+This finds all standard **production** workers owned by that user, enables
+persistent systemd user timers, performs an immediate safe image-update
+check (deferring during active tasks) and installs `simpleai-tui` without
+overwriting an unmanaged shortcut. It does not delete volume data or change
+worker identity; local test workers and other proxies are untouched.
+A one-time sudo prompt may be necessary to keep the user timer active after
+logout. Fresh one-line installations already opt in automatically.
+
+The updater checks GHCR four times daily when the computer is running,
+Docker is accessible, and the worker can safely restart. Failed updates
+trigger a best-effort rollback. New compatible GGUF models arrive via WSS
+immediately, without waiting for a new Docker build. The initial migration
+still needs a host-side action: the unprivileged worker container must never
+be allowed to control its host Docker daemon remotely.
+
+### Removing obsolete worker registrations
+
+**Remove worker permanently** deletes the node registration, past model
+tests, operations and proxy-side history, and prevents its saved secret
+from reconnecting. **Revoke** only disables access, retaining the record.
+Neither action stops Docker or removes the model cache on the remote host.
+The owner must separately decommission that Docker Compose project.
+
 ## One-line Linux installation (recommended)
 
 Open /admin/compute-setup on the proxy. Choose a worker name (for example
@@ -362,3 +424,25 @@ table. The TUI requires a real interactive terminal for live mode; use
   explicit Public requests, revocation, and disabling Private access.
 - Keep the PR unmerged until those checks are complete, as merging into main
   triggers the existing production deployment workflow.
+
+### Isolated live acceptance (before production merge)
+
+The normal pytest suite mocks Hugging Face metadata. To validate the
+**real** GGUF discovery, checksum-pinned download, WSS policy propagation,
+ARM64 CPU self-test and streamed chat response, rebuild the **isolated**
+Oblak staging proxy and worker from this PR revision (never `:latest`).
+Then run inside the staging proxy:
+
+```bash
+cd ~/docker/test-proxy-worker
+docker compose exec -T proxy python compute_staging_dynamic_smoke.py
+```
+
+The script refuses to run unless `ADMIN_USERNAME=staging-admin` and the
+isolated `/state/admin-password` exists. It imports
+`unsloth/Qwen3.5-0.8B-GGUF` `Q3_K_M`, waits for real worker inference,
+tests streaming through the API, restores the original staging model policy
+and deletes the temporary catalog entry. Downloaded weights can remain in
+the worker's bounded LRU cache. This **must** be run on the real staging
+ARM worker; passing unit/CI tests is not a substitute. Do not merge to
+production until the output is captured and reviewed.

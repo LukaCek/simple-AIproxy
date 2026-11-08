@@ -21,7 +21,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 import main_impl as core
-from compute_catalog import CATALOG
+from compute_catalog import (CATALOG, BUILTIN_CATALOG, MAX_CATALOG_MODELS,
+                             apply_custom_catalog, validate_model_entry)
+from compute_hf_catalog import lookup_gguf_models
 from compute_placement import models_for_node
 from compute_scheduler import auto_candidates as select_auto_candidates
 from compute_setup import compose_text, env_text, validate_setup
@@ -139,6 +141,11 @@ def _setup() -> None:
             id INTEGER PRIMARY KEY CHECK(id=1),
             placement_mode TEXT NOT NULL DEFAULT 'manual'
         );
+        CREATE TABLE IF NOT EXISTS ComputeCustomModels (
+            id TEXT PRIMARY KEY,
+            definition_json TEXT NOT NULL,
+            added_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS ComputeEvents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             node_id TEXT NOT NULL,
@@ -153,6 +160,11 @@ def _setup() -> None:
         """)
         db.execute("INSERT OR IGNORE INTO ComputePolicy(id,revision,models_json,updated_at) VALUES(1,1,'[]',?)", (int(time.time()),))
         db.execute("INSERT OR IGNORE INTO ComputeSettings(id,placement_mode) VALUES(1,'manual')")
+        # Keep the module's imported shared dict alive. Restarting the proxy
+        # rebuilds the same catalog from durable DB records, not Python source.
+        rows = db.execute("SELECT id, definition_json FROM ComputeCustomModels").fetchall()
+        custom = {row["id"]: json.loads(row["definition_json"]) for row in rows}
+        apply_custom_catalog(custom)
 
 
 
@@ -164,7 +176,7 @@ _EVENT_TYPES = frozenset({
     "enrolled", "connected", "disconnected", "policy_sent", "model_test",
     "model_loaded", "model_unloaded", "operation_started", "operation_succeeded",
     "operation_failed", "private_access_enabled", "private_access_disabled",
-    "revoked",
+    "revoked", "removed",
 })
 _MODEL_STATES = frozenset({"untested", "testing", "supported", "unsupported", "error"})
 
@@ -180,6 +192,10 @@ def _event(node_id: str, event: str, *, model: str = "",
     clean_detail = detail[:120] if isinstance(detail, str) else ""
     _setup()
     with _db() as db:
+        # Removed workers must never resurrect zombie audit records when a
+        # pending async operation completes or a heartbeat races with delete.
+        if not db.execute("SELECT 1 FROM ComputeNodes WHERE id=?", (node_id,)).fetchone():
+            return
         db.execute(
             "INSERT INTO ComputeEvents(node_id,event,model,status,detail,created_at) "
             "VALUES(?,?,?,?,?,?)",
@@ -230,7 +246,10 @@ def _model_policy() -> dict[str, Any]:
     if not isinstance(selected, list):
         selected = []
     return {"type": "policy", "revision": int(row["revision"]) if row else 1,
-            "models": [mid for mid in selected if isinstance(mid, str) and mid in CATALOG]}
+            "models": [mid for mid in selected if isinstance(mid, str) and mid in CATALOG],
+            # The full catalog is safe metadata, NOT a command to run an
+            # arbitrary remote binary or download URL. Worker revalidates it.
+            "catalog": {mid: dict(info) for mid, info in CATALOG.items()}}
 
 
 def _placement_mode() -> str:
@@ -258,8 +277,17 @@ def _node_policy(node_id: str, global_policy: dict[str, Any] | None = None) -> d
 
 
 async def _send_node_policy(conn: "NodeConnection") -> None:
-    policy = _node_policy(conn.node_id)
-    signature = (policy["revision"], tuple(policy["models"]))
+    if conn.catalog_capable:
+        policy = _node_policy(conn.node_id)
+    else:
+        # Keep pre-upgrade workers operating on their bundled models while
+        # the host auto-updater rolls out the new catalog protocol.
+        legacy = _model_policy()
+        legacy["models"] = [mid for mid in legacy["models"] if mid in BUILTIN_CATALOG]
+        policy = _node_policy(conn.node_id, legacy)
+        policy.pop("catalog", None)
+    signature = (policy["revision"], tuple(policy["models"]),
+                 hashlib.sha256(json.dumps(policy.get("catalog", {}), sort_keys=True).encode()).hexdigest())
     if signature == conn.last_policy_signature:
         return
     if policy["revision"] <= 1 and not policy["models"]:
@@ -350,7 +378,8 @@ class NodeConnection:
     node_id: str
     pending: dict[str, asyncio.Queue] = field(default_factory=dict)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    last_policy_signature: tuple[int, tuple[str, ...]] | None = None
+    catalog_capable: bool = False
+    last_policy_signature: tuple | None = None
 
     async def send(self, message: dict[str, Any]) -> None:
         async with self.write_lock:
@@ -680,6 +709,15 @@ async def linux_auto_update_script():
     })
 
 
+@router.get("/compute/enable-auto-updates.sh", response_class=PlainTextResponse)
+async def legacy_worker_auto_update_setup_script():
+    """Public, token-free helper for adopting existing production workers."""
+    data = (Path(__file__).parent / "worker" / "enable-auto-updates.sh").read_text()
+    return PlainTextResponse(data, headers={
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    })
+
+
 @router.post("/compute/bootstrap")
 async def claim_install_plan(request: Request):
     # The short-lived random token authorizes access to pre-approved setup,
@@ -799,7 +837,9 @@ async def compute_ws(ws: WebSocket):
         if not row or row["revoked"] or not secrets.compare_digest(row["secret_hash"], _hash(secret)):
             await ws.close(code=1008)
             return
-        conn = NodeConnection(ws=ws, node_id=node_id)
+        conn = NodeConnection(ws=ws, node_id=node_id,
+                              catalog_capable=(type(data.get("catalog_protocol")) is int
+                                               and data["catalog_protocol"] == 1))
         async with _registry_lock:
             old = _connections.get(node_id)
             if old:
@@ -824,6 +864,11 @@ async def compute_ws(ws: WebSocket):
                     continue
                 with _db() as db:
                     old = db.execute("SELECT models_json FROM ComputeNodes WHERE id=?", (node_id,)).fetchone()
+                    if old is None:
+                        # The registration was permanently removed while a
+                        # final heartbeat was in flight. Close without events.
+                        await ws.close(code=1008)
+                        break
                     db.execute("UPDATE ComputeNodes SET last_seen=?,hardware_json=?,models_json=? WHERE id=?",
                                (int(time.time()), json.dumps(hardware), json.dumps(models), node_id))
                 try:
@@ -921,9 +966,139 @@ async def revoke_node(node_id: str):
     return {"revoked": True}
 
 
+@router.delete("/admin/api/compute/nodes/{node_id}", dependencies=[Depends(require_admin_write)])
+async def remove_node_permanently(node_id: str) -> dict[str, Any]:
+    """Delete a disconnected/revoked enrollment from the proxy.
+
+    Never touch Docker or delete models on the remote computer: it could be
+    an untrusted friend's host. A running node loses access immediately.
+    """
+    _setup()
+    async with _registry_lock:
+        conn = _connections.pop(node_id, None)
+        with _db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT id FROM ComputeNodes WHERE id=?", (node_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "Worker not found")
+            db.execute("DELETE FROM ComputeNodes WHERE id=?", (node_id,))
+            db.execute("DELETE FROM ComputeOperations WHERE node_id=?", (node_id,))
+            db.execute("DELETE FROM ComputeEvents WHERE node_id=?", (node_id,))
+        with _reservation_lock:
+            _reservations.pop(node_id, None)
+            _reservation_waiters.pop(node_id, None)
+        if conn:
+            try:
+                await conn.ws.close(code=1008)
+            except Exception:
+                pass
+    return {"removed": True, "node_id": node_id,
+            "remote_container_untouched": True}
+
+
 @router.get("/admin/api/compute/catalog", dependencies=[Depends(core.verify_admin)])
 async def catalog() -> dict[str, Any]:
-    return {"models": CATALOG}
+    _setup()
+    return {"models": CATALOG, "built_in": list(BUILTIN_CATALOG)}
+
+
+@router.post("/admin/api/compute/catalog/inspect", dependencies=[Depends(require_admin_write)])
+async def inspect_custom_model(request: Request) -> dict[str, Any]:
+    """Resolve the canonical GGUF metadata using a FIXED Hugging Face host.
+
+    This does not download weights, execute remote code or approve a model.
+    """
+    data = await request.json()
+    source = data.get("source") if isinstance(data, dict) else None
+    try:
+        return await lookup_gguf_models(source)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/admin/api/compute/catalog/custom", dependencies=[Depends(require_admin_write)])
+async def add_custom_model(request: Request) -> dict[str, Any]:
+    """Pin a model and optionally schedule CPU self-tests across workers.
+
+    Model name, expected SHA and size are independently looked up, never
+    trusted from the browser or arbitrary URLs.
+    """
+    data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Expected a model definition")
+    source, filename = data.get("source"), data.get("file")
+    if not isinstance(filename, str) or len(filename) > 240:
+        raise HTTPException(400, "Choose a GGUF file from the inspection results")
+    try:
+        inspection = await lookup_gguf_models(source)
+        definition = next((v for v in inspection["files"] if v["file"] == filename), None)
+        if not definition:
+            raise ValueError("Selected GGUF file is no longer available")
+        custom_name = data.get("name")
+        if custom_name is not None:
+            definition["name"] = custom_name
+        ctx = data.get("ctx", 4096)
+        definition["ctx"] = ctx
+        model_id = data.get("id") or (
+            "custom-" + hashlib.sha256(
+                (definition["repo"] + "/" + filename + "@" + definition["revision"]).encode()
+            ).hexdigest()[:16]
+        )
+        definition = validate_model_entry(model_id, definition)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if type(data.get("enable", True)) is not bool:
+        raise HTTPException(400, "enable must be boolean")
+    _setup()
+    with _db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if len(CATALOG) >= MAX_CATALOG_MODELS:
+            raise HTTPException(409, "Maximum number of catalog models reached")
+        if model_id in CATALOG:
+            raise HTTPException(409, "Model ID already exists; choose a different ID")
+        now = int(time.time())
+        db.execute(
+            "INSERT INTO ComputeCustomModels(id,definition_json,added_at) VALUES(?,?,?)",
+            (model_id, json.dumps(definition), now),
+        )
+        row = db.execute("SELECT revision,models_json FROM ComputePolicy WHERE id=1").fetchone()
+        selected = json.loads(row["models_json"])
+        if data.get("enable", True) and model_id not in selected:
+            selected.append(model_id)
+        db.execute("UPDATE ComputePolicy SET revision=?,models_json=?,updated_at=? WHERE id=1",
+                   (int(row["revision"]) + 1, json.dumps(selected), now))
+    _setup()
+    for conn in list(_connections.values()):
+        try:
+            await _send_node_policy(conn)
+        except Exception:
+            pass
+    return {"id": model_id, "definition": definition,
+            "enabled": model_id in _model_policy()["models"]}
+
+
+@router.delete("/admin/api/compute/catalog/custom/{model_id}", dependencies=[Depends(require_admin_write)])
+async def remove_custom_model(model_id: str) -> dict[str, Any]:
+    """Remove an admin-added catalog entry, keeping cached GGUF data untouched."""
+    _setup()
+    if model_id in BUILTIN_CATALOG:
+        raise HTTPException(400, "Bundled models cannot be deleted")
+    with _db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        deleted = db.execute("DELETE FROM ComputeCustomModels WHERE id=?", (model_id,))
+        if not deleted.rowcount:
+            raise HTTPException(404, "Custom model not found")
+        row = db.execute("SELECT revision,models_json FROM ComputePolicy WHERE id=1").fetchone()
+        selected = [m for m in json.loads(row["models_json"]) if m != model_id]
+        db.execute("UPDATE ComputePolicy SET revision=?,models_json=?,updated_at=? WHERE id=1",
+                   (int(row["revision"]) + 1, json.dumps(selected), int(time.time())))
+    _setup()
+    for conn in list(_connections.values()):
+        try:
+            await _send_node_policy(conn)
+        except Exception:
+            pass
+    return {"removed": True, "id": model_id, "cached_weights_preserved": True}
 
 
 @router.get("/admin/api/compute/model-policy", dependencies=[Depends(core.verify_admin)])
@@ -935,6 +1110,7 @@ async def read_model_policy() -> dict[str, Any]:
 async def change_model_policy(request: Request) -> dict[str, Any]:
     data = await request.json()
     selected = data.get("models") if isinstance(data, dict) else None
+    _setup()
     if (not isinstance(selected, list) or len(selected) > len(CATALOG)
             or any(not isinstance(mid, str) or mid not in CATALOG for mid in selected)
             or len(set(selected)) != len(selected)):
@@ -983,7 +1159,8 @@ async def start_operation(node_id: str, request: Request):
     data = await request.json()
     action = str(data.get("action") or "")
     model = str(data.get("model") or "")
-    if action not in ("install", "load", "unload", "delete") or model not in CATALOG:
+    _setup()
+    if action not in ("install", "load", "unload", "delete", "test") or model not in CATALOG:
         raise HTTPException(400, "Invalid model or operation")
     if node_id not in _connections:
         raise HTTPException(409, "Node is offline")
@@ -1030,6 +1207,7 @@ async def admin_page(request: Request):
     return core.templates.TemplateResponse(
         request, "compute_nodes.html",
         {"nodes": [_public_node(dict(r)) for r in rows], "catalog": CATALOG,
+         "built_in_models": frozenset(BUILTIN_CATALOG),
          "policy": global_policy, "placement_mode": mode,
          "assignments": {r["id"]: _node_policy(r["id"], global_policy)["models"] for r in rows},
          "recommendations": {r["id"]: model_recommendations(dict(r)) for r in rows}},

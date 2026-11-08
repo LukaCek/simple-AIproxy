@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from websockets.asyncio.client import connect
-from compute_catalog import CATALOG
+from compute_catalog import CATALOG, BUILTIN_CATALOG, MAX_CATALOG_MODELS, validate_model_entry
 from compute_worker_snapshot import STATUS_FILE, write_snapshot
 from compute_worker_storage import (disk_limit_bytes, used_bytes, install_model, remove_model, verify_model, target_path, prune_to_limit)
 
@@ -141,6 +141,7 @@ def hardware():
         "memory_available_bytes": memory_available(),
         "disk_free_bytes": disk.free, "disk_total_bytes": disk.total,
         "version": "0.1.0", "backend": "llama.cpp-cpu",
+        "catalog_protocol": 1,
         "build_revision": os.getenv("WORKER_BUILD_REVISION", "local-dev")[:64],
     }
 
@@ -196,11 +197,9 @@ class Worker:
         self.last_used = {}
         self.capabilities = {}
         self.state_path = DATA / "model-test-results.json"
-        self.fingerprint = hashlib.sha256(
-            (str(DISK_LIMIT_BYTES) + ":" + str(memory_limit()) + ":" +
-             str(cpu_count()) + ":" + json.dumps(CATALOG, sort_keys=True) +
-             ":autotest-v3-timing-sample").encode()
-        ).hexdigest()
+        self.catalog_path = DATA / "approved-model-catalog.json"
+        self._restore_catalog()
+        self.fingerprint = self._catalog_fingerprint()
         self._read_state()
         # No download is running before the worker main loop starts. Clean
         # orphaned partial downloads so a crash cannot strand the disk quota.
@@ -218,6 +217,70 @@ class Worker:
         self.phase_started_at = int(time.time())
         self.job_started_at = None
         self._publish_snapshot()
+
+    def _catalog_fingerprint(self):
+        return hashlib.sha256(
+            (str(DISK_LIMIT_BYTES) + ":" + str(memory_limit()) + ":" +
+             str(cpu_count()) + ":" + json.dumps(CATALOG, sort_keys=True) +
+             ":autotest-v3-timing-sample").encode()
+        ).hexdigest()
+
+    def _validated_catalog(self, source):
+        if (not isinstance(source, dict) or not 1 <= len(source) <= MAX_CATALOG_MODELS):
+            raise ValueError("Invalid remote catalog size")
+        clean = {}
+        for mid, definition in source.items():
+            verified = validate_model_entry(mid, definition)
+            if mid in BUILTIN_CATALOG and verified != BUILTIN_CATALOG[mid]:
+                raise ValueError("Bundled model identity cannot be overwritten")
+            clean[mid] = verified
+        if not set(BUILTIN_CATALOG).issubset(clean):
+            raise ValueError("Remote catalog must retain bundled models")
+        return clean
+
+    def _restore_catalog(self):
+        # Retain the central admin catalog across worker container restarts.
+        # This avoids re-testing unchanged models at every image update.
+        try:
+            if self.catalog_path.stat().st_size > 128 * 1024:
+                return
+            cached = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+            clean = self._validated_catalog(cached)
+        except (OSError, ValueError, TypeError):
+            return
+        CATALOG.clear()
+        CATALOG.update(clean)
+
+    def _save_catalog(self):
+        data = json.dumps(CATALOG, sort_keys=True, separators=(",", ":"))
+        if len(data.encode("utf-8")) > 128 * 1024:
+            raise ValueError("Catalog too large")
+        temp = self.catalog_path.with_suffix(".tmp")
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(data)
+        os.replace(temp, self.catalog_path)
+
+    def _apply_remote_catalog(self, payload):
+        if payload is None:
+            return False
+        fresh = self._validated_catalog(payload)
+        if fresh == CATALOG:
+            return False
+        changed = {mid for mid in set(CATALOG) | set(fresh)
+                   if CATALOG.get(mid) != fresh.get(mid)}
+        CATALOG.clear()
+        CATALOG.update(fresh)
+        # Re-test only changed/new models, retaining verified results for
+        # unchanged models (also across image updates).
+        for mid in changed:
+            self.capabilities.pop(mid, None)
+            self.last_used.pop(mid, None)
+        self.fingerprint = self._catalog_fingerprint()
+        self._save_catalog()
+        self._save_state()
+        self._publish_snapshot()
+        return True
 
     def _publish_snapshot(self):
         """Local TUI observability only: never serialize credentials or prompts."""
@@ -424,7 +487,15 @@ class Worker:
         selected = message.get("models")
         version = message.get("revision")
         if (type(version) is not int or version < 1 or not isinstance(selected, list)
-                or len(selected) > len(CATALOG) or len(set(str(x) for x in selected)) != len(selected)
+                or len(set(str(x) for x in selected)) != len(selected)):
+            return
+        try:
+            async with self.lock:
+                catalog_changed = self._apply_remote_catalog(message.get("catalog"))
+        except (ValueError, OSError, TypeError):
+            # Never allow an unpinned or malformed remote download target.
+            return
+        if (len(selected) > len(CATALOG)
                 or any(not isinstance(x, str) or x not in CATALOG for x in selected)):
             return
         previous = self.policy
@@ -435,9 +506,44 @@ class Worker:
         if previous != selected:
             # A node may get a new model assignment at the same global revision.
             self.policy_generation += 1
-        self.force_retest = previous == selected and old_version not in (0, version)
+        # Re-saving an unchanged policy deliberately re-tests; merely
+        # inspecting/adding a disabled catalog entry must not re-run expensive
+        # benchmarks for every already verified model.
+        self.force_retest = (not catalog_changed and previous == selected
+                             and old_version not in (0, version))
         if self.reconcile_task is None or self.reconcile_task.done():
             self.reconcile_task = asyncio.create_task(self.reconcile(ws))
+
+    async def test_model(self, mid):
+        """Perform actual CPU load and inference, with caller holding self.lock."""
+        if mid not in CATALOG:
+            raise ValueError("Model not in approved catalog")
+        started = time.monotonic()
+        self.mark_model(mid, "testing")
+        model = CATALOG[mid]
+        max_file = max(model["size"] + 16 * 1024**2, int(model["size"] * 1.15))
+        required_ram = model_ram_requirement(int(model["size"]))
+        if max_file > DISK_LIMIT_BYTES:
+            self.mark_model(mid, "unsupported", "Exceeds configured model disk limit")
+        elif required_ram + memory_safety_margin() > memory_limit():
+            self.mark_model(mid, "unsupported",
+                            "Model plus runtime safety margin exceeds configured cgroup RAM")
+        else:
+            try:
+                await self.unload()
+                await self.ensure_installed(mid)
+                await self.load(mid)
+                measured = await self.benchmark(mid)
+                await self.unload()
+                self.mark_model(mid, "supported", "Actual inference passed",
+                                time.monotonic() - started, benchmark=measured)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.unload()
+                self.mark_model(mid, "error", str(exc),
+                                time.monotonic() - started)
+        return self.capabilities[mid]
 
     async def reconcile(self, ws):
         """Test requested models, report capacity, and warm the preferred one.
@@ -460,35 +566,8 @@ class Worker:
                 previous = self.capabilities.get(mid, {})
                 if not retest and previous.get("status") in ("supported", "unsupported", "error"):
                     continue
-                started = time.monotonic()
-                self.mark_model(mid, "testing")
-                await self.telemetry(ws)
-                model = CATALOG[mid]
-                max_file = max(model["size"] + 16 * 1024**2, int(model["size"] * 1.15))
-                required_ram = model_ram_requirement(int(model["size"]))
-                if max_file > DISK_LIMIT_BYTES:
-                    self.mark_model(mid, "unsupported", "Exceeds configured model disk limit")
-                elif required_ram + memory_safety_margin() > memory_limit():
-                    self.mark_model(mid, "unsupported",
-                                    "Model plus runtime safety margin exceeds configured cgroup RAM")
-                else:
-                    try:
-                        async with self.lock:
-                            await self.unload()
-                            await self.ensure_installed(mid)
-                            await self.load(mid)
-                            measured = await self.benchmark(mid)
-                            await self.unload()
-                        self.mark_model(mid, "supported", "Actual inference passed",
-                                        time.monotonic() - started, benchmark=measured)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        await self.unload()
-                        # Failed downloads / inference can be retried by saving
-                        # model policy again; don't claim the model is supported.
-                        self.mark_model(mid, "error", str(exc),
-                                        time.monotonic() - started)
+                async with self.lock:
+                    await self.test_model(mid)
                 await self.telemetry(ws)
             if version != self.policy_revision or generation != self.policy_generation:
                 continue
@@ -579,6 +658,22 @@ class Worker:
                 self._activity("command", mid, action)
                 if action == "install":
                     await self.ensure_installed(mid)
+                elif action == "test":
+                    previous_active = self.active if self.status()["ready"] else None
+                    try:
+                        result = await self.test_model(mid)
+                    finally:
+                        # Preserve normal serving behavior after an explicit
+                        # admin benchmark, including failed experiments.
+                        if previous_active and previous_active in CATALOG:
+                            try:
+                                await self.ensure_installed(previous_active)
+                                await self.load(previous_active)
+                            except Exception as exc:
+                                self.mark_model(previous_active, "error",
+                                                "Restore after test: " + str(exc))
+                    if result["status"] != "supported":
+                        raise RuntimeError(result.get("reason") or "Model failed CPU self-test")
                 elif action == "load":
                     # Never evict the currently working models to download a
                     # GGUF that cannot fit the configured container RAM cap.
@@ -674,7 +769,8 @@ class Worker:
         while True:
             try:
                 async with connect(url, max_size=2 * 1024 * 1024, ping_interval=20) as ws:
-                    await self.send(ws, {"type": "auth", **identity, "protocol": 1})
+                    await self.send(ws, {"type": "auth", **identity, "protocol": 1,
+                                         "catalog_protocol": 1})
                     msg = json.loads(await asyncio.wait_for(ws.recv(), 20))
                     if msg.get("type") != "auth_ok":
                         raise RuntimeError("Authentication rejected")

@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from websockets.asyncio.client import connect
 from compute_catalog import CATALOG, BUILTIN_CATALOG, MAX_CATALOG_MODELS, validate_model_entry
+from compute_worker_diagnostics import error_code, validate as validate_diagnostic
 from compute_worker_snapshot import STATUS_FILE, write_snapshot
 from compute_worker_storage import (disk_limit_bytes, used_bytes, install_model, remove_model, verify_model, target_path, prune_to_limit)
 
@@ -198,6 +199,10 @@ class Worker:
         self.capabilities = {}
         self.state_path = DATA / "model-test-results.json"
         self.catalog_path = DATA / "approved-model-catalog.json"
+        self._diag_path = DATA / "diagnostics.json"
+        self._diag_seq = 0
+        self._diag_pending = []
+        self._load_diagnostics()
         self._restore_catalog()
         self.fingerprint = self._catalog_fingerprint()
         self._read_state()
@@ -325,6 +330,82 @@ class Worker:
             # Diagnostics must never prevent inference or reconnects.
             pass
 
+    def _load_diagnostics(self):
+        """Keep a small private local buffer through WSS disconnects/restarts."""
+        try:
+            if self._diag_path.stat().st_size > 96 * 1024:
+                return
+            state = json.loads(self._diag_path.read_text(encoding="utf-8"))
+            last = state.get("last_seq", 0)
+            if type(last) is int and 0 <= last < 2**53:
+                self._diag_seq = last
+            entries = state.get("pending", [])
+            if isinstance(entries, list):
+                for item in entries[-120:]:
+                    try:
+                        safe = validate_diagnostic(item)
+                    except ValueError:
+                        continue
+                    if safe["seq"] <= self._diag_seq:
+                        self._diag_pending.append(safe)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def _persist_diagnostics(self):
+        # Only validated enums, numbers and catalog model IDs are written.
+        target = self._diag_path.with_suffix(".tmp")
+        try:
+            data = json.dumps({"last_seq": self._diag_seq,
+                               "pending": self._diag_pending}, separators=(",", ":"))
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(data)
+            os.replace(target, self._diag_path)
+        except OSError:
+            # Diagnostic disk I/O must never make a working inference fail.
+            pass
+
+    def _diag(self, kind, code, *, level="info", model=None, metrics=None):
+        """Append only a strict, privacy-safe diagnostic entry."""
+        self._diag_seq += 1
+        entry = {"seq": self._diag_seq, "kind": kind, "code": code,
+                 "level": level, "model": model if model in CATALOG else "",
+                 "occurred_at": int(time.time()), "metrics": metrics or {}}
+        try:
+            self._diag_pending.append(validate_diagnostic(entry))
+        except ValueError:
+            return
+        self._diag_pending = self._diag_pending[-120:]
+        self._persist_diagnostics()
+
+    def _ack_diag(self, seq):
+        if type(seq) is not int:
+            return
+        remaining = [entry for entry in self._diag_pending if entry["seq"] != seq]
+        if len(remaining) != len(self._diag_pending):
+            self._diag_pending = remaining
+            self._persist_diagnostics()
+
+    async def _send_diagnostics(self, ws):
+        """Replay pending structured entries after reconnect, with server ack."""
+        sent = set()
+        while True:
+            pending = [item for item in self._diag_pending if item["seq"] not in sent]
+            for item in pending[:16]:
+                await self.send(ws, {"type": "diagnostic", **item})
+                sent.add(item["seq"])
+            await asyncio.sleep(2)
+
+    def _resource_metrics(self, mid):
+        mib = 1024 ** 2
+        return {
+            "ram_limit_mib": max(0, memory_limit() // mib),
+            "ram_available_mib": max(0, memory_available() // mib),
+            "disk_limit_mib": max(0, DISK_LIMIT_BYTES // mib),
+            "disk_used_mib": max(0, used_bytes(MODELS) // mib),
+            "model_size_mib": max(0, int(CATALOG[mid]["size"]) // mib),
+        }
+
     def _activity(self, phase, model=None, kind=None):
         now = time.time()
         if phase in ("idle", "starting", "connecting", "disconnected"):
@@ -337,9 +418,24 @@ class Worker:
             self.current_model = model
             if kind is not None:
                 self.current_kind = kind
+        old_phase = self.phase
         self.phase = phase
         self.phase_started_at = now
         self._publish_snapshot()
+        transitions = {
+            "starting": ("lifecycle", "starting"),
+            "connecting": ("network", "connecting"),
+            "disconnected": ("network", "disconnected"),
+            "checking disk / downloading": ("model", "download_start"),
+            "loading into RAM": ("model", "load_start"),
+            "unloading": ("model", "unload_start"),
+            "benchmarking": ("model", "benchmark_start"),
+            "command": ("operation", "operation_start"),
+            "preparing inference": ("inference", "inference_start"),
+        }
+        if phase != old_phase and phase in transitions:
+            kind, code = transitions[phase]
+            self._diag(kind, code, model=model)
 
     def _read_state(self):
         try:
@@ -433,6 +529,21 @@ class Worker:
             self.capabilities[mid]["benchmark"] = benchmark
         self._save_state()
         self._publish_snapshot()
+        if status == "testing":
+            code, level = "test_start", "info"
+        elif status == "supported":
+            code, level = "test_supported", "info"
+        elif status == "unsupported":
+            code, level = error_code(reason), "warning"
+            if code == "unknown_error":
+                code = "test_unsupported"
+        else:
+            code, level = error_code(reason), "error"
+            if code == "unknown_error":
+                code = "test_failed"
+        self._diag("model_test", code, level=level, model=mid,
+                   metrics=self._resource_metrics(mid)
+                   if status in ("unsupported", "error") else {}) 
 
     async def ensure_installed(self, mid):
         self._activity("checking disk / downloading", mid)
@@ -502,6 +613,7 @@ class Worker:
         old_version = self.policy_revision
         self.policy = selected
         self.policy_revision = version
+        self._diag("policy", "policy_received")
         self._publish_snapshot()
         if previous != selected:
             # A node may get a new model assignment at the same global revision.
@@ -697,9 +809,13 @@ class Worker:
                     self._save_state()
                 else:
                     raise ValueError("Invalid action")
+            self._diag("operation", "operation_succeeded", model=mid)
             await self.send(ws, {"type": "result", "id": cid, "ok": True})
             await self.send(ws, {"type": "telemetry", "hardware": hardware(), "models": self.status()})
         except Exception as exc:
+            self._diag("operation", error_code(exc)
+                       if error_code(exc) != "unknown_error" else "operation_failed",
+                       level="error", model=mid)
             await self.send(ws, {"type": "error", "id": cid, "error": str(exc)[:400]})
         finally:
             self.tasks.pop(cid, None)
@@ -729,9 +845,12 @@ class Worker:
                 self._save_state()
                 self._activity("generating", mid, "inference")
                 await self._inference_stream(ws, cid, mid, payload)
+                self._diag("inference", "inference_end", model=mid)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._diag("inference", "inference_failed", level="error", model=mid)
+            self._diag("inference", error_code(exc), level="error", model=mid)
             await self.send(ws, {"type": "error", "id": cid, "error": str(exc)[:400]})
         finally:
             self.tasks.pop(cid, None)
@@ -776,13 +895,17 @@ class Worker:
                         raise RuntimeError("Authentication rejected")
                     self.connected = True
                     self._activity("idle")
+                    self._diag("network", "connected")
                     delay = 2
                     heart = asyncio.create_task(self.heartbeat(ws))
+                    diagnostics = asyncio.create_task(self._send_diagnostics(ws))
                     try:
                         async for raw in ws:
                             cmd = json.loads(raw)
                             cid, kind = str(cmd.get("id") or ""), cmd.get("type")
-                            if kind == "policy":
+                            if kind == "diagnostic_ack":
+                                self._ack_diag(cmd.get("seq"))
+                            elif kind == "policy":
                                 await self.receive_policy(ws, cmd)
                             elif kind == "cancel":
                                 task = self.tasks.get(cid)
@@ -798,20 +921,24 @@ class Worker:
                                 self.tasks[cid] = task
                     finally:
                         heart.cancel()
+                        diagnostics.cancel()
                         if self.reconcile_task and not self.reconcile_task.done():
                             self.reconcile_task.cancel()
                             await asyncio.gather(self.reconcile_task, return_exceptions=True)
                         self.reconcile_task = None
                         for task in self.tasks.values():
                             task.cancel()
-                        await asyncio.gather(heart, *list(self.tasks.values()), return_exceptions=True)
+                        await asyncio.gather(heart, diagnostics, *list(self.tasks.values()),
+                                             return_exceptions=True)
                         self.tasks.clear()
                         self.connected = False
                         self._activity("disconnected")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print(f"Disconnected: {exc}", flush=True)
+                code = error_code(exc)
+                self._diag("network", code, level="warning")
+                print(f"Disconnected: {code}", flush=True)
             self.connected = False
             self._activity("disconnected")
             await asyncio.sleep(delay)

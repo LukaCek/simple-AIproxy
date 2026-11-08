@@ -1178,6 +1178,7 @@ async def admin_page(request: Request):
     return core.templates.TemplateResponse(
         request, "compute_nodes.html",
         {"nodes": [_public_node(dict(r)) for r in rows], "catalog": CATALOG,
+         "built_in_models": frozenset(BUILTIN_CATALOG),
          "policy": global_policy, "placement_mode": mode,
          "assignments": {r["id"]: _node_policy(r["id"], global_policy)["models"] for r in rows},
          "recommendations": {r["id"]: model_recommendations(dict(r)) for r in rows}},

@@ -654,7 +654,19 @@ class Worker:
                 if action == "install":
                     await self.ensure_installed(mid)
                 elif action == "test":
-                    result = await self.test_model(mid)
+                    previous_active = self.active if self.status()["ready"] else None
+                    try:
+                        result = await self.test_model(mid)
+                    finally:
+                        # Preserve normal serving behavior after an explicit
+                        # admin benchmark, including failed experiments.
+                        if previous_active and previous_active in CATALOG:
+                            try:
+                                await self.ensure_installed(previous_active)
+                                await self.load(previous_active)
+                            except Exception as exc:
+                                self.mark_model(previous_active, "error",
+                                                "Restore after test: " + str(exc))
                     if result["status"] != "supported":
                         raise RuntimeError(result.get("reason") or "Model failed CPU self-test")
                 elif action == "load":

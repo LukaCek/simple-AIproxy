@@ -28,7 +28,7 @@ def test_release_uses_parallel_native_amd64_and_arm64_runners():
     # Production must not compile arm64 C++ through QEMU on an x86 runner.
     release_uses = [step.get("uses", "") for step in release["steps"]]
     assert not any("setup-qemu" in action for action in release_uses)
-    assert release["needs"] == "verify"
+    assert release["needs"] == ["verify", "image-changes"]
     assert publish["needs"] == "build-worker"
     assert not any("setup-qemu" in step.get("uses", "") for step in publish["steps"])
 

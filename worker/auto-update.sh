@@ -41,7 +41,7 @@ migrate_auto_max() {
     fi
   fi
   cp -p -- .env .env.before-auto-max
-  python3 - ".env" <<'PY'
+  if ! python3 - ".env" <<'PY'
 from pathlib import Path
 import math, os, sys
 
@@ -75,7 +75,7 @@ os.replace(tmp, p)
 print(f"Auto Maximum: {limit} GiB Docker ceiling on {total/gib:.2f} GiB host RAM; "
       f"{cpus} CPU cores")
 PY
-  if [[ $? -ne 0 ]]; then
+  then
     cp -p -- .env.before-auto-max .env
     rm -f -- .env.before-auto-max
     die "Unable to calculate Auto Maximum."

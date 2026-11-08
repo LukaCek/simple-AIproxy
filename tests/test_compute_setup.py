@@ -611,6 +611,7 @@ def test_installer_bootstraps_fresh_arch_packages_then_starts_daemon(tmp_path):
     systemctl.write_text(
         "#!/bin/sh\n"
         "printf 'systemctl %s\\n' \"$*\" >> \"$SIMPLEAI_TEST_EVENTS\"\n"
+        "if [ \"$1\" = is-active ]; then exit 1; fi\n"
         "touch \"$SIMPLEAI_TEST_READY\"\n"
     )
     for path in (pacman, systemctl):
@@ -631,6 +632,7 @@ def test_installer_bootstraps_fresh_arch_packages_then_starts_daemon(tmp_path):
     assert "BOOTSTRAP_PASSED" in result.stdout
     assert events.read_text().splitlines() == [
         "pacman -S --needed --noconfirm python docker docker-compose",
+        "systemctl is-active --quiet docker.service",
         "systemctl enable --now docker.service",
     ]
 

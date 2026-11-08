@@ -408,6 +408,12 @@ docker compose up -d --no-build --force-recreate >/dev/null \
 
 info "Worker installed: $INSTALL_DIR"
 info "Identity preserved in its own Docker volume; one-time setup code removed."
+if [[ "${SIMPLEAI_DOCKER_GROUP_REENTRY:-}" == 1 ]]; then
+  info "IMPORTANT: the new Docker group is active inside this installer session."
+  info "Log out and log back in (or reboot once) before using 'simpleai-tui' from"
+  info "your original terminal. A reboot is recommended so the persistent"
+  info "systemd user auto-update timer also inherits the new Docker group."
+fi
 info "Check Compute Nodes in the proxy; public requests are allowed by default,"
 info "but PRIVATE access remains disabled until explicitly approved."
 info "Inspect logs: cd '$INSTALL_DIR' && docker compose logs --tail=80 compute-worker"

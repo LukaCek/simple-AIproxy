@@ -50,22 +50,27 @@ def test_huggingface_inspection_stays_on_fixed_host_and_requires_lfs_hash(monkey
             parse_source(bad)
 
     class FakeResponse:
-        content = b"{}"
+        headers = {}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
         def raise_for_status(self): pass
-        def json(self): return {
-            "sha": SHA,
-            "siblings": [
-                {"rfilename": FAKE_MODEL["file"],
-                 "lfs": {"size": FAKE_MODEL["size"], "sha256": HASH}},
-                {"rfilename": "unsafe.gguf", "size": 1},
-                {"rfilename": "run.py", "lfs": {"size": 20, "sha256": HASH}},
-            ],
-        }
+        async def aiter_bytes(self, chunk_size):
+            assert chunk_size <= 64 * 1024
+            yield json.dumps({
+                "sha": SHA,
+                "siblings": [
+                    {"rfilename": FAKE_MODEL["file"],
+                     "lfs": {"size": FAKE_MODEL["size"], "sha256": HASH}},
+                    {"rfilename": "unsafe.gguf", "size": 1},
+                    {"rfilename": "run.py", "lfs": {"size": 20, "sha256": HASH}},
+                ],
+            }).encode()
 
     class FakeClient:
         async def __aenter__(self): return self
         async def __aexit__(self, *args): return False
-        async def get(self, url, params=None):
+        def stream(self, method, url, params=None):
+            assert method == "GET"
             assert url == "https://huggingface.co/api/models/example/model-GGUF/revision/main"
             assert params == {"blobs": "true"}
             return FakeResponse()
@@ -75,6 +80,30 @@ def test_huggingface_inspection_stays_on_fixed_host_and_requires_lfs_hash(monkey
     result = asyncio.run(lookup_gguf_models("example/model-GGUF"))
     assert result["revision"] == SHA
     assert result["files"] == [FAKE_MODEL | {"name": "example-Q4_K_M"}]
+
+
+def test_hf_streaming_enforces_metadata_size_before_json(monkeypatch):
+    import compute_hf_catalog
+    from compute_hf_catalog import lookup_gguf_models, MAX_METADATA_BYTES
+
+    class TooLargeResponse:
+        headers = {}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        def raise_for_status(self): pass
+        async def aiter_bytes(self, chunk_size):
+            assert chunk_size <= 64 * 1024
+            for _ in range(MAX_METADATA_BYTES // chunk_size + 1):
+                yield b"x" * chunk_size
+
+    class TooLargeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        def stream(self, method, url, params=None): return TooLargeResponse()
+
+    monkeypatch.setattr(compute_hf_catalog.httpx, "AsyncClient", lambda **k: TooLargeClient())
+    with pytest.raises(ValueError, match="metadata"):
+        asyncio.run(lookup_gguf_models("example/model-GGUF"))
 
 
 def test_admin_add_catalog_persists_and_pushes_pinned_metadata(tmp_path, monkeypatch):

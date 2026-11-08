@@ -28,7 +28,7 @@
     <p class="mt-2 text-sm text-slate-600">Approve GGUF models here; selected models are automatically delivered to connected workers over WSS and CPU-tested (when assigned). Auto placement considers each worker's RAM/disk limits. Models are checksum pinned, so changing the repository does not silently change deployed weights. A worker runs one model at a time.</p>
     <div class="mt-4 rounded-xl border border-slate-200 p-4 space-y-3">
       <h3 class="text-sm font-semibold">Add GGUF model from Hugging Face</h3>
-      <p class="text-xs text-slate-600">Paste a public Hugging Face repository or GGUF file link. SimpleAI discovers files, pins the commit and SHA-256, and never runs repository scripts. Newly added models are assigned and tested automatically when enabled; results depend on each worker's RAM, disk, and llama.cpp compatibility.</p>
+      <p class="text-xs text-slate-600">Paste a Hugging Face repository containing actual .gguf files (often ending in -GGUF), not the original model's weights. Open the model's Quantized tab on Hugging Face to find a converted repository. SimpleAI discovers files, pins the commit and SHA-256, and never runs repository scripts. Newly added models are assigned and tested automatically when enabled; results depend on each worker's RAM, disk, and llama.cpp compatibility.</p>
       <div class="flex flex-wrap gap-2">
         <input id="hf-source" type="text" autocomplete="off" placeholder="https://huggingface.co/owner/repository" class="min-w-0 flex-1 rounded-lg border p-2 text-sm">
         <button type="button" id="inspect-hf" class="rounded-lg border px-3 py-2 text-sm">Find GGUF files</button>
@@ -166,10 +166,28 @@
         class="rounded-lg border px-3 py-2 text-xs">Refresh events</button>
     </div>
     <p class="mt-2 text-xs text-slate-600">
-      Connection changes, self-tests, model loading, admin operations and trust decisions.
-      API requests and privacy skips remain in Request Logs and Provider Attempts.
-      No prompts, generated text or credentials are stored here.
+      Live worker diagnostics: model download and self-test, RAM/disk limits,
+      inference failures, network disconnects, admin operations and trust decisions.
+      Offline diagnostics are replayed after the worker reconnects.
+      Prompt text, generated responses, credentials and raw Docker logs are never sent.
     </p>
+    <div class="mt-3 flex flex-wrap items-end gap-3 text-xs">
+      <label class="flex flex-col gap-1">Worker
+        <select id="compute-event-node" class="rounded-lg border border-slate-300 bg-white px-3 py-2">
+          <option value="">All workers</option>
+          {% for node in nodes %}
+            <option value="{{ node.id }}">{{ node.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="flex flex-col gap-1">Severity
+        <select id="compute-event-level" class="rounded-lg border border-slate-300 bg-white px-3 py-2">
+          <option value="">All events</option>
+          <option value="error">Errors</option>
+          <option value="warning">Warnings</option>
+        </select>
+      </label>
+    </div>
     <div id="compute-events" class="mt-4 space-y-2 text-xs text-slate-700"
       aria-live="polite">Loading worker events…</div>
   </div>
@@ -351,9 +369,15 @@ async function refreshNodeStatuses() {
 async function refreshComputeEvents() {
   const container = document.getElementById("compute-events");
   try {
-    const response = await fetch("/admin/api/compute/events?limit=60", {cache:"no-store"});
+    const node = document.getElementById("compute-event-node").value;
+    const level = document.getElementById("compute-event-level").value;
+    const query = new URLSearchParams({limit: "150"});
+    if(node) query.set("node_id", node);
+    const response = await fetch("/admin/api/compute/events?" + query.toString(),
+                                 {cache:"no-store"});
     if(!response.ok) throw new Error("Unable to load worker event history");
-    const entries = (await response.json()).events || [];
+    const entries = ((await response.json()).events || []).filter(
+      event => !level || event.status === level);
     container.replaceChildren();
     if(entries.length === 0) {
       container.textContent = "No worker events recorded yet.";
@@ -363,7 +387,9 @@ async function refreshComputeEvents() {
       const card = document.querySelector('[data-node-id="' + event.node_id + '"]');
       const name = card?.querySelector("h3")?.textContent || "Worker";
       const row = document.createElement("div");
-      row.className = "flex flex-wrap gap-x-3 gap-y-1 border-b border-slate-100 py-1";
+      row.className = "flex flex-wrap gap-x-3 gap-y-1 border-b border-slate-100 py-1 " +
+        (event.status === "error" ? "text-red-700" :
+         event.status === "warning" ? "text-amber-800" : "text-slate-700");
       const date = new Date(event.created_at * 1000);
       const parts = [
         Number.isFinite(date.getTime()) ? date.toLocaleString() : "Unknown time",
@@ -385,6 +411,8 @@ async function refreshComputeEvents() {
     container.textContent = "Worker event history temporarily unavailable.";
   }
 }
+document.getElementById("compute-event-node").onchange = refreshComputeEvents;
+document.getElementById("compute-event-level").onchange = refreshComputeEvents;
 refreshComputeEvents();
 setInterval(refreshComputeEvents, 10000);
 setInterval(refreshNodeStatuses, 5000);

@@ -110,6 +110,11 @@ def test_installer_is_public_but_bootstrap_requires_unused_matching_token(tmp_pa
         assert public.status_code == 200
         assert "SimpleAI Compute Worker" in public.text
         assert "no-store" in public.headers["cache-control"]
+        updater = client.get("/compute/auto-update.sh")
+        assert updater.status_code == 200
+        assert "# SimpleAI Managed Worker Updater v1" in updater.text
+        assert updater.headers["cache-control"] == "no-store"
+
         assert client.post("/compute/bootstrap", json={"token": "not-valid"}).status_code == 401
         request = {**VALID, "name": "oblak-vps-1"}
         generated = client.post("/admin/api/compute/setup", json=request,
@@ -292,3 +297,43 @@ def test_installer_auto_opens_live_tui_and_installs_private_shortcut():
     assert '"$HOME/.local/bin/simpleai-tui" "$(basename "$INSTALL_DIR")" </dev/tty >/dev/tty 2>&1' in script
     assert 'docker compose exec compute-worker python tui.py' in script
     assert 'docker compose exec -T compute-worker python tui.py --once' in script
+
+
+def test_host_auto_updater_stays_outside_worker_and_is_syntax_valid(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    script = repo / "worker" / "auto-update.sh"
+    result = subprocess.run(["bash", "-n", str(script)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    content = script.read_text()
+    installer = (repo / "worker" / "install.sh").read_text()
+    assert "flock -n 9" in content
+    assert "docker pull --quiet" in content
+    assert 'docker image tag "$old" "$image"' in content
+    assert "wait_connected" in content
+    assert "worker_idle" in content
+    assert "Persistent=true" in content
+    assert "systemctl --user enable --now" in content
+    assert "sudo loginctl enable-linger" in content
+    assert "/var/run/docker.sock" not in installer
+    assert 'bash -s -- --install "$(basename "$INSTALL_DIR")" "$PROXY_ORIGIN"' in installer
+
+    # The updater cannot auto-pull arbitrary images or modify an unrelated
+    # Compose project; docker compose config is validated.
+    assert 'actual=="ghcr.io/lukacek/simple-aiproxy-worker:latest"' in content
+
+
+def test_auto_updater_rejects_invalid_worker_name_without_docker(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] /
+              "worker" / "auto-update.sh")
+    for name in ("../other", "bad/name", "bad name", "-force"):
+        output = subprocess.run(["bash", str(script), "--check", name],
+                                capture_output=True, text=True)
+        assert output.returncode != 0
+        assert "valid worker name" in output.stderr

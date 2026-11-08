@@ -8,8 +8,9 @@ HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
 Open /admin/compute-setup on the proxy. Choose a worker name (for example
 oblak-vps-1), a publicly reachable HTTPS proxy URL, and Manual limits or an
 Auto resource profile. Copy the one-line Linux command into a terminal on the
-target machine. Paste the separately generated, short-lived setup code when
-asked. No token is placed into the shell command or history.
+target machine. The command already contains the 15-minute, single-use
+setup code; there is no second prompt. Treat the entire command as a secret:
+it may appear in terminal history, clipboard managers or process listings.
 
 Requirements: Linux AMD64 or ARM64; Docker Engine + Compose v2, Python 3,
 curl, and outbound HTTPS/WSS. Docker is not installed or configured silently.
@@ -21,9 +22,30 @@ after successful registration, and recreates that one container without it.
 The worker cannot access the host's Docker socket. Newly enrolled workers
 are untrusted for private prompts until approved in the admin dashboard.
 
-Auto Shared and Auto Maximum measure resources on the target Linux machine,
-including free memory and Docker's filesystem. These are conservative resource
-budgets, not guarantees that a particular model will fit.
+**Auto Maximum** sets the worker Docker RAM ceiling to approximately
+85% of the target Linux host's total physical RAM (minimum 2 GiB reserved for
+the host), and permits all host CPU cores. This is a *hard ceiling*, not RAM
+preallocation. It does **not** shrink based on `MemAvailable` at installation:
+a running Bitcoin miner or other temporary process cannot permanently limit
+the worker to the memory that was free at setup. Before actually loading a
+GGUF model, the worker checks live host memory availability and its own cgroup
+headroom. If another process is consuming RAM, the worker may wait/fail the
+model test until resources become available. Model tests previously marked
+failed can be explicitly retried by saving the model policy again.
+
+**Auto Shared** reserves approximately 45% of total RAM (at least 2 GiB) for
+other workloads and limits worker CPU to 65%. For machines where a memory-heavy
+miner or other services may run concurrently, prefer Auto Shared or Manual:
+even an 85% cap does **not** guarantee the host cannot run out of memory if
+other containers/processes also consume large amounts. The worker is marked as
+a preferred OOM-kill candidate, but that is not a substitute for coordinating
+total memory budgets across services.
+
+Auto profiles also set a model-storage budget based on free space in Docker's
+filesystem (with disk headroom). These are conservative resource budgets, not
+guarantees that any particular model will fit. The auto values are stored
+in the worker's private `.env` and remain fixed until explicitly changed or
+a new installation is performed; they are not dynamically recalculated.
 
 ### Test a second worker on the same computer
 

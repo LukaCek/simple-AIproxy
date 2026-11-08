@@ -35,6 +35,9 @@ jobs:
           ruff check --ignore BLE001,RUF100 main.py free_model_registry.py tests/test_proxy.py tests/test_free_model_registry.py
           pytest -q
 
+      - name: Real Docker production rollback fault injection
+        run: bash tests/release_docker_fault_injection.sh
+
       - name: Start services with docker compose
         run: docker compose up -d
 

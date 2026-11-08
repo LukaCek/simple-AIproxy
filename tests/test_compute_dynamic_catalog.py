@@ -104,7 +104,8 @@ def test_admin_add_catalog_persists_and_pushes_pinned_metadata(tmp_path, monkeyp
         assert mid in read["models"]
         assert set(BUILTIN_CATALOG) <= set(read["models"])
         with client.websocket_connect("/compute/ws") as ws:
-            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            ws.send_json({"type": "auth", "protocol": 1, "catalog_protocol": 1,
+                          **identity})
             assert ws.receive_json()["type"] == "auth_ok"
             policy = ws.receive_json()
             assert mid in policy["models"]
@@ -177,3 +178,24 @@ def test_one_time_update_adoption_helper_is_public_but_does_not_touch_worker_dat
         assert public.status_code == 200
         assert "SimpleAI Compute legacy adoption helper" in public.text
         assert public.headers["cache-control"] == "no-store"
+
+
+
+def test_old_worker_receives_only_legacy_models_during_migration(tmp_path, monkeypatch):
+    import compute_plane
+    async def lookup(_source):
+        return {"repo": FAKE_MODEL["repo"], "revision": SHA, "files": [dict(FAKE_MODEL)]}
+    monkeypatch.setattr(compute_plane, "lookup_gguf_models", lookup)
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        resp = client.post("/admin/api/compute/catalog/custom", auth=ADMIN,
+                           headers=WRITE,
+                           json={"source": "example/model-GGUF", "file": FAKE_MODEL["file"],
+                                 "enable": True})
+        assert resp.status_code == 200, resp.text
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type":"auth", "protocol":1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            policy = ws.receive_json()
+            assert "catalog" not in policy
+            assert resp.json()["id"] not in policy["models"]

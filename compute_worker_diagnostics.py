@@ -102,7 +102,10 @@ def describe(entry: dict) -> str:
     """Only proxy-generated labels, numbers and known codes reach the UI."""
     fields = [entry["kind"] + "/" + entry["code"]]
     metrics = entry["metrics"]
+    aliases = {"ram_limit_mib": "ram_cap", "ram_available_mib": "ram_free",
+               "disk_limit_mib": "disk_cap", "disk_used_mib": "disk_used",
+               "model_size_mib": "weights"}
     if metrics:
-        fields.extend(key + "=" + str(metrics[key]) + "MiB"
+        fields.extend(aliases[key] + "=" + str(metrics[key]) + "MiB"
                       for key in sorted(metrics))
     return " ".join(fields)

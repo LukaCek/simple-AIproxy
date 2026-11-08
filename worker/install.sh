@@ -145,12 +145,18 @@ install_host_packages() {
 }
 
 start_host_docker() {
-  # Only start a service if the daemon is not already reachable as this user.
+  # A running daemon may be inaccessible to the current unprivileged user.
+  # Don't restart or reconfigure the service just because docker info was
+  # denied by the socket's group permissions.
   if docker info >/dev/null 2>&1; then return 0; fi
   if command -v systemctl >/dev/null 2>&1; then
-    info "Starting and enabling Docker Engine so workers survive reboot."
-    as_root systemctl enable --now docker.service ||
-      fail "Could not start docker.service. Inspect: sudo journalctl -u docker.service -n 80"
+    if systemctl is-active --quiet docker.service; then
+      info "Docker Engine is already running; checking user permissions."
+    else
+      info "Starting and enabling Docker Engine so workers survive reboot."
+      as_root systemctl enable --now docker.service ||
+        fail "Could not start docker.service. Inspect: sudo journalctl -u docker.service -n 80"
+    fi
   fi
   # A valid daemon running as root is distinct from permission to use it.
   if ! docker info >/dev/null 2>&1; then
@@ -172,9 +178,10 @@ ensure_docker_user_access() {
   socket_group="$(stat -c %G /var/run/docker.sock 2>/dev/null || :)"
   [[ "$socket_group" == "docker" ]] ||
     fail "Docker is available via sudo but its socket is not owned by docker group. Resolve nonstandard socket permissions manually."
-  command -v sg >/dev/null 2>&1 ||
-    fail "The sg tool is needed to activate new Docker group access in the current terminal."
-
+  # The sg utility (usually from shadow/login) is not guaranteed to be
+  # installed on a minimal Arch/Omarchy host. The already-authorized sudo
+  # command can launch a fresh shell with docker as its effective group.
+  # Do not block first-time installation merely because sg is missing.
   if [[ "${SIMPLEAI_DOCKER_GROUP_REENTRY:-}" == 1 ]]; then
     fail "Docker still inaccessible after group activation. Log out/in or reboot, then rerun the one-liner."
   fi
@@ -205,11 +212,27 @@ ensure_docker_user_access() {
       fail "Invalid one-time enrollment code format."
     printf -v code_arg ' %q' "$1"
   fi
-  export SIMPLEAI_DOCKER_GROUP_REENTRY=1
-  cmd="bash -o pipefail -c 'curl -fsSL ${origin_arg}/compute/install.sh | bash -s -- ${origin_arg}${code_arg}'"
+  cmd="curl -fsSL ${origin_arg}/compute/install.sh | bash -s -- ${origin_arg}${code_arg}"
   info "Activating Docker group access in a temporary shell and continuing installation..."
   info "The enrollment code may be visible to local users in process arguments during this step."
-  exec sg docker -c "$cmd"
+  if command -v sg >/dev/null 2>&1; then
+    export SIMPLEAI_DOCKER_GROUP_REENTRY=1
+    exec sg docker -c "bash -o pipefail -c '$cmd'"
+  fi
+
+  # Minimal Linux images can omit sg even when Docker is already installed.
+  # sudo -u/-g starts a one-off process as the SAME user and with the docker
+  # group, requiring no reboot and no newly installed helper packages.
+  command -v sudo >/dev/null 2>&1 ||
+    fail "Neither sg nor sudo is available to activate Docker group access."
+  info "The sg utility is unavailable; using sudo to activate the docker group temporarily."
+  sudo -v </dev/tty ||
+    fail "sudo approval required to activate the Docker group."
+  local runtime_env=()
+  [[ -z "${XDG_RUNTIME_DIR:-}" ]] || runtime_env+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+  exec sudo -H -u "$(id -un)" -g docker -- \
+    env SIMPLEAI_DOCKER_GROUP_REENTRY=1 "${runtime_env[@]}" \
+    bash -o pipefail -c "$cmd"
 }
 
 install_host_packages

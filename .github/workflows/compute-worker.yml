@@ -81,9 +81,176 @@ jobs:
           # contexts resolve from deploy/, not the shell's working directory.
           docker compose -f deploy/home-compute-test.compose.yml config --format json | python -c 'import json,pathlib,sys; cfg=json.load(sys.stdin); root=pathlib.Path.cwd().resolve(); assert all(pathlib.Path(cfg["services"][service]["build"]["context"]).resolve()==root for service in ("proxy","worker")), "Home test build context does not resolve to repository root"'
 
-  docker-smoke:
-    needs: verify
+  # Pure installer/docs/proxy changes do not change the worker Docker image.
+  # Avoid spending minutes recompiling llama.cpp for those PRs and pushes.
+  image-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rebuild: ${{ steps.paths.outputs.rebuild }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Determine whether worker image contents changed
+        id: paths
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Explicit dispatch, new branches, and unknown diffs build safely.
+          if [[ "$EVENT_NAME" == workflow_dispatch ||
+                -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] ||
+             ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/worker-changes.txt"
+          cat "$RUNNER_TEMP/worker-changes.txt"
+          if grep -Eq '^(worker/(Dockerfile|agent\.py|tui\.py|requirements\.txt)|compute_(catalog|worker_snapshot|worker_storage)\.py|\.github/workflows/compute-worker\.yml)    needs: verify
     if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    name: docker-smoke (${{ matrix.arch }} native)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build native ${{ matrix.arch }} worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: WORKER_BUILD_REVISION=${{ github.sha }}
+          push: false
+          cache-from: type=gha,scope=compute-worker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=compute-worker-${{ matrix.arch }}
+
+  # Build each architecture on a native runner, not through QEMU.
+  # Reuse the same per-architecture cache scopes as PR smoke tests.
+  build-worker:
+    needs: [verify, image-changes]
+    if: github.event_name != 'pull_request' && needs.image-changes.outputs.rebuild == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    name: build-worker (${{ matrix.arch }} native)
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push ${{ matrix.arch }} by immutable digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: WORKER_BUILD_REVISION=${{ github.sha }}
+          # Do not move :latest until BOTH architectures pass.
+          outputs: type=image,name=ghcr.io/lukacek/simple-aiproxy-worker,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=compute-worker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=compute-worker-${{ matrix.arch }}
+      - name: Save platform digest for manifest assembly
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Update public release tags atomically only when both native jobs succeed.
+  publish-worker:
+    needs: build-worker
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish amd64 and arm64 release manifests
+        env:
+          IMAGE: ghcr.io/lukacek/simple-aiproxy-worker
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/digests"
+          shopt -s nullglob
+          digests=( * )
+          if [[ "${#digests[@]}" -ne 2 ]]; then
+            echo "Expected TWO native platform digests; refusing to update latest."
+            exit 1
+          fi
+          sources=()
+          for digest in "${digests[@]}"; do
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || exit 1
+            sources+=( "$IMAGE@sha256:$digest" )
+          done
+          docker buildx imagetools create \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:$GITHUB_SHA" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA"
+          # Fail if either architecture is missing.
+          docker buildx imagetools inspect --raw "$IMAGE:$GITHUB_SHA" | python3 -c '
+          import json, sys
+          m = json.load(sys.stdin)
+          platforms = {(x["platform"]["os"], x["platform"]["architecture"])
+                       for x in m["manifests"] if x.get("platform")}
+          assert {("linux", "amd64"), ("linux", "arm64")} <= platforms, platforms
+          '
+ "$RUNNER_TEMP/worker-changes.txt"; then
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+            echo "No image source changed: skip expensive worker Docker compilation."
+          fi
+
+  docker-smoke:
+    needs: [verify, image-changes]
+    if: github.event_name == 'pull_request' && needs.image-changes.outputs.rebuild == 'true'
     strategy:
       fail-fast: false
       matrix:

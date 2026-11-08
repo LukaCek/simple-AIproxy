@@ -9,6 +9,7 @@ on:
       - "codex_registry.py"
       - "tests/test_codex_registry.py"
       - "tests/test_compute_worker_tui.py"
+      - "tests/test_worker_build_pipeline.py"
       - "tests/test_compute_playground.py"
       - "templates/playground.html"
       - "main_impl.py"
@@ -36,6 +37,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "tests/test_worker_build_pipeline.py"
       - "worker/**"
       - "compute_catalog.py"
       - "compute_plane.py"
@@ -63,7 +65,7 @@ jobs:
           bash -n worker/install.sh
           bash -n worker/auto-update.sh
           python -m pip install -r requirements.txt -r worker/requirements.txt pytest pytest-asyncio
-          pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py tests/test_compute_worker_storage.py tests/test_oblak_compose.py tests/test_compute_scheduler.py tests/test_compute_placement.py tests/test_compute_setup.py tests/test_compute_worker_tui.py
+          pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py tests/test_compute_worker_storage.py tests/test_oblak_compose.py tests/test_compute_scheduler.py tests/test_compute_placement.py tests/test_compute_setup.py tests/test_compute_worker_tui.py tests/test_worker_build_pipeline.py
           pytest -q tests/test_compute_playground.py
           # The production full_entrypoint installs a Codex-aware /v1/models
           # replacement; exercise it to prevent silently losing local models.

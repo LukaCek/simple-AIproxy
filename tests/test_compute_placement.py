@@ -1,7 +1,10 @@
 """Deterministic test coverage for automatic per-node placement and model tiers."""
 import pytest
 
-from compute_catalog import CATALOG
+# Placement baseline tests only the immutable bundled models. Dynamic models
+# are tested independently and may have been added to the process-wide catalog
+# by preceding admin API tests.
+from compute_catalog import BUILTIN_CATALOG as CATALOG
 from compute_placement import models_for_node
 from compute_scheduler import auto_candidates, auto_tier
 

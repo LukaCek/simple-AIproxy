@@ -23,7 +23,8 @@ CODES = frozenset((
     "disk_full", "download_forbidden", "download_not_found",
     "download_failed", "checksum_mismatch", "llama_crashed",
     "llama_not_ready", "llama_http_error", "timeout", "transport_error",
-    "worker_busy", "unknown_error",
+    "worker_busy", "unknown_error", "backend_unsupported", "backend_load_failed",
+    "backend_out_of_memory", "backend_chat_template_error",
 ))
 METRICS = frozenset(("ram_limit_mib", "ram_available_mib", "disk_limit_mib",
                      "disk_used_mib", "model_size_mib"))
@@ -62,6 +63,25 @@ def error_code(reason: object) -> str:
     if "busy" in s:
         return "worker_busy"
     return "unknown_error"
+
+
+def backend_error_code(line: bytes) -> str | None:
+    """Extract known llama.cpp failure classes without ever exposing stderr."""
+    # Backend output can contain chat prompts or generated tokens. Do not
+    # persist, transmit or display any raw line, even after redaction.
+    text = line[:2048].decode("utf-8", "replace").lower()
+    if "out of memory" in text or "bad_alloc" in text or "failed to allocate" in text:
+        return "backend_out_of_memory"
+    if ("unknown model architecture" in text or "unsupported model" in text
+            or "unknown tensor" in text or "unsupported architecture" in text
+            or "not supported by" in text):
+        return "backend_unsupported"
+    if ("chat template" in text and ("error" in text or "failed" in text)
+            or "jinja" in text and "error" in text):
+        return "backend_chat_template_error"
+    if "failed to load model" in text or "error loading model" in text:
+        return "backend_load_failed"
+    return None
 
 
 def validate(entry: dict, *, now: int | None = None) -> dict:

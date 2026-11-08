@@ -156,3 +156,24 @@ def test_approved_model_can_be_cpu_tested_on_a_selected_worker(tmp_path, monkeyp
         assert "Find GGUF files" in page.text
         assert "Remove worker permanently" in page.text
         assert "state.reason" in page.text
+
+
+
+def test_one_time_update_adoption_helper_is_public_but_does_not_touch_worker_data(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1] / "worker" / "enable-auto-updates.sh"
+    result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    content = script.read_text()
+    assert "simpleai-tui" in content
+    assert "--install" in content
+    assert "docker compose config" in content
+    assert "docker compose down" not in content
+    assert "rm -rf" not in content
+    assert "WORKER_ENROLLMENT_TOKEN" not in content
+    with fixture_client(tmp_path, monkeypatch) as client:
+        public = client.get("/compute/enable-auto-updates.sh")
+        assert public.status_code == 200
+        assert "SimpleAI Compute legacy adoption helper" in public.text
+        assert public.headers["cache-control"] == "no-store"

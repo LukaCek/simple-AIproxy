@@ -27,11 +27,199 @@ case "$(uname -m)" in
   x86_64|aarch64|arm64) ;;
   *) fail "Only 64-bit AMD64 and ARM64 are supported." ;;
 esac
-command -v python3 >/dev/null 2>&1 || fail "Python 3 is required for the installer."
-command -v curl >/dev/null 2>&1 || fail "curl is required for the installer."
-command -v docker >/dev/null 2>&1 || fail "Install Docker Engine and the Compose v2 plugin first."
-docker compose version >/dev/null 2>&1 || fail "The Docker Compose v2 plugin is missing."
-docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable. Start Docker or configure access for this user."
+# Docker setup runs on the HOST as the requesting user. Docker never gets
+# mounted into the unprivileged worker container. No enrollment code is used
+# until all host prerequisites have been verified.
+command -v curl >/dev/null 2>&1 ||
+  fail "curl is required to run the one-liner itself. Install curl or use a machine with curl."
+[[ -z "${DOCKER_HOST:-}" ]] ||
+  fail "DOCKER_HOST is set. This installer configures LOCAL Docker only; unset DOCKER_HOST first."
+
+as_root() {
+  if (( EUID == 0 )); then
+    "$@"
+  else
+    command -v sudo >/dev/null 2>&1 ||
+      fail "This machine needs sudo to set up Docker: $*"
+    # sudo reads passwords from the REAL terminal, not from the curl pipe.
+    [[ -r /dev/tty && -w /dev/tty ]] ||
+      fail "Host setup needs a terminal for sudo approval. Run the one-liner in an interactive terminal."
+    sudo -v </dev/tty || fail "sudo authorization denied; host setup not changed further."
+    sudo "$@"
+  fi
+}
+
+install_host_packages() {
+  # Only run a package manager if a dependency is actually missing.
+  local need_docker=0 need_compose=0 need_python=0
+  command -v docker >/dev/null 2>&1 || need_docker=1
+  { command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; } || need_compose=1
+  command -v python3 >/dev/null 2>&1 || need_python=1
+  (( need_docker || need_compose || need_python )) || return 0
+
+  info "Missing host prerequisites: Docker=$need_docker Compose-v2=$need_compose Python3=$need_python"
+  info "Installing only missing components; administrator approval may be required."
+  local distro='' distro_like='' candidates=()
+  if [[ -r /etc/os-release ]]; then
+    # Standard Linux distribution release file; not retrieved from the network.
+    . /etc/os-release
+    distro="${ID:-}"
+    distro_like="${ID_LIKE:-}"
+  fi
+  if [[ "$distro" == "arch" || " $distro_like " == *" arch "* ]]; then
+    command -v pacman >/dev/null 2>&1 || fail "Arch Linux package manager pacman is missing."
+    # No -Sy: never risk a partial upgrade of an Arch/Omarchy machine.
+    candidates=(python docker docker-compose)
+    info "Arch/Omarchy: installing packages with pacman (no system-wide upgrade)."
+    as_root pacman -S --needed --noconfirm "${candidates[@]}" ||
+      fail "pacman failed. Resolve package database / mirror errors before retrying (possibly sudo pacman -Syu)."
+  elif [[ "$distro" == "ubuntu" || "$distro" == "debian" ||
+          " $distro_like " == *" debian "* ]]; then
+    command -v apt-get >/dev/null 2>&1 || fail "apt-get is missing."
+    info "Debian/Ubuntu: updating package indexes and installing needed packages."
+    as_root apt-get update || fail "Could not update APT package indexes."
+    candidates=(ca-certificates curl)
+    if (( need_python )); then candidates+=(python3); fi
+    if (( need_docker )); then candidates+=(docker.io); fi
+    if (( need_compose )); then
+      if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+        candidates+=(docker-compose-v2)
+      elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+        candidates+=(docker-compose-plugin)
+      else
+        info "Compose v2 not present in configured APT repositories; using checksum-verified upstream plugin."
+      fi
+    fi
+    as_root apt-get install -y "${candidates[@]}" ||
+      fail "APT Docker installation failed. Resolve repository/package conflicts before retrying."
+  elif [[ "$distro" == "fedora" || " $distro_like " == *" fedora "* ]]; then
+    command -v dnf >/dev/null 2>&1 || fail "Fedora package manager dnf is missing."
+    candidates=()
+    if (( need_python )); then candidates+=(python3); fi
+    if (( need_docker )); then candidates+=(moby-engine); fi
+    if (( need_compose )) && dnf info docker-compose-plugin >/dev/null 2>&1; then
+      candidates+=(docker-compose-plugin)
+    fi
+    if (( ${#candidates[@]} )); then
+      info "Fedora: installing ${candidates[*]}."
+      as_root dnf install -y "${candidates[@]}" ||
+        fail "DNF Docker installation failed. Resolve package repositories before retrying."
+    fi
+  else
+    fail "Unsupported distribution '${distro:-unknown}'. Automatic host bootstrap supports Arch/Omarchy, Debian/Ubuntu and Fedora. Existing Docker installations on other distros still work."
+  fi
+
+  command -v docker >/dev/null 2>&1 ||
+    fail "Docker CLI is still missing after package installation."
+  command -v python3 >/dev/null 2>&1 ||
+    fail "Python 3 is still missing after package installation."
+
+  if ! docker compose version >/dev/null 2>&1; then
+    # Old Debian/Ubuntu and some Fedora repos lack Compose v2. Download a
+    # specific official release and verify its published SHA256 before use.
+    # Do not replace any existing, unmanaged user CLI plugin file.
+    command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required to verify Compose."
+    local version='v5.7.0' arch plugin_dir tmp expected actual
+    arch="$(uname -m)"
+    case "$arch" in x86_64|aarch64|arm64) ;; *) fail "No Compose plugin for $arch.";; esac
+    [[ "$arch" == "arm64" ]] && arch='aarch64'
+    plugin_dir="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins"
+    [[ ! -e "$plugin_dir/docker-compose" && ! -L "$plugin_dir/docker-compose" ]] ||
+      fail "Existing but unusable Compose plugin in $plugin_dir; resolve manually before retrying."
+    mkdir -p -- "$plugin_dir"
+    tmp="$(mktemp -d)" || fail "Cannot create temporary Compose download directory."
+    local base="https://github.com/docker/compose/releases/download/$version/docker-compose-linux-$arch"
+    curl -fsSL --retry 2 "$base" -o "$tmp/docker-compose" ||
+      fail "Could not download official Docker Compose plugin ($version)."
+    curl -fsSL --retry 2 "$base.sha256" -o "$tmp/checksum" ||
+      fail "Could not download Docker Compose SHA256 checksum."
+    expected="$(awk 'NR==1 {print $1}' "$tmp/checksum")"
+    actual="$(sha256sum "$tmp/docker-compose" | awk '{print $1}')"
+    [[ "$expected" =~ ^[a-fA-F0-9]{64}$ && "$expected" == "$actual" ]] ||
+      fail "Docker Compose checksum mismatch: refusing to install."
+    chmod 755 "$tmp/docker-compose"
+    mv -n -- "$tmp/docker-compose" "$plugin_dir/docker-compose"
+    rm -rf -- "$tmp"
+    info "Installed official, SHA256-verified Docker Compose $version (user CLI plugin)."
+  fi
+}
+
+start_host_docker() {
+  # Only start a service if the daemon is not already reachable as this user.
+  if docker info >/dev/null 2>&1; then return 0; fi
+  if command -v systemctl >/dev/null 2>&1; then
+    info "Starting and enabling Docker Engine so workers survive reboot."
+    as_root systemctl enable --now docker.service ||
+      fail "Could not start docker.service. Inspect: sudo journalctl -u docker.service -n 80"
+  fi
+  # A valid daemon running as root is distinct from permission to use it.
+  if ! docker info >/dev/null 2>&1; then
+    if (( EUID == 0 )); then
+      fail "Docker daemon still unavailable as root. Inspect Docker logs; no worker installed."
+    fi
+    command -v sudo >/dev/null 2>&1 ||
+      fail "Docker daemon is not accessible and sudo is unavailable."
+    if ! sudo docker info >/dev/null 2>&1; then
+      fail "Docker daemon is still unavailable even with sudo. Inspect: sudo systemctl status docker"
+    fi
+  fi
+}
+
+ensure_docker_user_access() {
+  if docker info >/dev/null 2>&1; then return 0; fi
+  (( EUID != 0 )) || fail "Docker still inaccessible despite running as root."
+  local socket_group
+  socket_group="$(stat -c %G /var/run/docker.sock 2>/dev/null || :)"
+  [[ "$socket_group" == "docker" ]] ||
+    fail "Docker is available via sudo but its socket is not owned by docker group. Resolve nonstandard socket permissions manually."
+  command -v sg >/dev/null 2>&1 ||
+    fail "The sg tool is needed to activate new Docker group access in the current terminal."
+
+  if [[ "${SIMPLEAI_DOCKER_GROUP_REENTRY:-}" == 1 ]]; then
+    fail "Docker still inaccessible after group activation. Log out/in or reboot, then rerun the one-liner."
+  fi
+  info "Docker is running, but your account cannot access the Docker socket."
+  info "The Docker group grants root-equivalent privileges. Omarchy may disable this intentionally."
+  info "SimpleAI requires non-interactive Docker access for the TUI and its automatic updater."
+  [[ -r /dev/tty && -w /dev/tty ]] ||
+    fail "Explicit consent is required to grant the Docker group. Use an interactive terminal."
+  local answer=''
+  IFS= read -r -p "Allow this Linux user passwordless Docker access? Type YES: " answer </dev/tty ||
+    fail "Could not read Docker access decision."
+  [[ "$answer" == "YES" ]] ||
+    fail "Docker group access declined. No worker was installed. Configure rootless Docker or group access manually."
+
+  if ! id -nG | tr ' ' '\n' | grep -qx docker; then
+    info "Adding $(id -un) to Docker group (one-time admin action)."
+    as_root usermod -aG docker "$(id -un)" ||
+      fail "Could not add the current user to Docker group."
+  fi
+
+  # Group changes normally require a new login. Re-run the trusted, validated
+  # public installer in a NEW Docker-group shell, preserving the one-line UX.
+  # No enrollment has happened yet. Quoted arguments were validated above.
+  local origin_arg code_arg='' cmd
+  printf -v origin_arg '%q' "$PROXY_ORIGIN"
+  if [[ -n "${1:-}" ]]; then
+    [[ "$1" =~ ^[A-Za-z0-9_-]{32,128}$ ]] ||
+      fail "Invalid one-time enrollment code format."
+    printf -v code_arg ' %q' "$1"
+  fi
+  export SIMPLEAI_DOCKER_GROUP_REENTRY=1
+  cmd="bash -o pipefail -c 'curl -fsSL ${origin_arg}/compute/install.sh | bash -s -- ${origin_arg}${code_arg}'"
+  info "Activating Docker group access in a temporary shell and continuing installation..."
+  info "The enrollment code may be visible to local users in process arguments during this step."
+  exec sg docker -c "$cmd"
+}
+
+install_host_packages
+start_host_docker
+ensure_docker_user_access "${2:-}"
+docker compose version >/dev/null 2>&1 ||
+  fail "Docker Compose v2 is still unavailable after setup."
+docker info >/dev/null 2>&1 ||
+  fail "Docker daemon is still unavailable to this user after setup."
+
 info "SimpleAI Compute Worker — isolated Linux installation"
 info "Proxy: $PROXY_ORIGIN"
 info "Your existing proxy/worker containers will not be changed."
@@ -220,6 +408,12 @@ docker compose up -d --no-build --force-recreate >/dev/null \
 
 info "Worker installed: $INSTALL_DIR"
 info "Identity preserved in its own Docker volume; one-time setup code removed."
+if [[ "${SIMPLEAI_DOCKER_GROUP_REENTRY:-}" == 1 ]]; then
+  info "IMPORTANT: the new Docker group is active inside this installer session."
+  info "Log out and log back in (or reboot once) before using 'simpleai-tui' from"
+  info "your original terminal. A reboot is recommended so the persistent"
+  info "systemd user auto-update timer also inherits the new Docker group."
+fi
 info "Check Compute Nodes in the proxy; public requests are allowed by default,"
 info "but PRIVATE access remains disabled until explicitly approved."
 info "Inspect logs: cd '$INSTALL_DIR' && docker compose logs --tail=80 compute-worker"

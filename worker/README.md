@@ -12,8 +12,37 @@ target machine. The command already contains the 15-minute, single-use
 setup code; there is no second prompt. Treat the entire command as a secret:
 it may appear in terminal history, clipboard managers or process listings.
 
-Requirements: Linux AMD64 or ARM64; Docker Engine + Compose v2, Python 3,
-curl, and outbound HTTPS/WSS. Docker is not installed or configured silently.
+Requirements: Linux AMD64 or ARM64, `curl`, outbound HTTPS/WSS and
+administrator approval when host packages/services are missing. The same
+one-liner can **bootstrap Docker Engine, Compose v2 and Python 3** on
+Arch/Omarchy, Ubuntu/Debian or Fedora, start/enable `docker.service` for
+restart-after-reboot, and continue installation. If the machine already has
+working Docker, it skips these changes. It does not install Docker inside the
+worker container or mount the host Docker socket.
+
+On recent **Omarchy** releases, non-root Docker access may be intentionally
+disabled. The installer explains that the `docker` group grants
+**root-equivalent** access and explicitly asks you to type `YES` before
+adding the account. The one-liner can then activate the new group in a
+temporary `sg docker` shell and continue installation without an
+immediate reboot. The original terminal keeps its old group membership, so
+**log out and log back in** before running `simpleai-tui` there. A **reboot
+once after setup** is recommended so the long-running systemd user manager
+also inherits the new Docker group for scheduled auto-updates. Declining
+the prompt leaves the account's security settings unchanged and stops
+installation before claiming the enrollment token. This choice affects the
+security of the host, not just SimpleAI.
+
+`curl` is the minimum preinstalled dependency because it launches the
+one-liner; an interactive terminal plus sudo/root privileges are required
+to install missing host packages. The installer refuses unsupported
+Linux distributions, inaccessible package repositories, nonstandard Docker
+socket permissions and unresolvable package conflicts with a clear error.
+It does not overwrite existing worker folders or interfere with other
+Compose stacks. Where distribution repositories lack Compose v2, it
+can install a **specific SHA256-verified official Compose CLI plugin** in the
+current user's `~/.docker/cli-plugins` instead of replacing Docker packages.
+That manual fallback must later be updated by the OS administrator.
 
 The installer creates a new, isolated Compose project in
 ~/.local/share/simpleai-compute/<worker-name>. It preserves its own model and

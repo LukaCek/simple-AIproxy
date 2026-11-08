@@ -151,7 +151,8 @@ def test_install_script_supports_single_copy_paste_and_legacy_hidden_prompt():
     assert "read -r -s" in script
     assert "</dev/tty" in script
     assert "docker compose" in script
-    assert "docker.sock" not in script
+    assert 'docker.sock:/var/run/docker.sock' not in script
+    assert 'docker.sock:/run/docker.sock' not in script
     assert "/compute/bootstrap" in script
     assert "WORKER_ENROLLMENT_TOKEN=" in script
     assert 'info "$ENROLLMENT_CODE"' not in script
@@ -318,7 +319,9 @@ def test_host_auto_updater_stays_outside_worker_and_is_syntax_valid(tmp_path):
     assert "Persistent=true" in content
     assert "systemctl --user enable --now" in content
     assert "sudo loginctl enable-linger" in content
-    assert "/var/run/docker.sock" not in installer
+    assert 'docker.sock:/var/run/docker.sock' not in installer
+    assert 'docker.sock:/run/docker.sock' not in installer
+    assert "/var/run/docker.sock" not in compose_text(validate_setup(VALID))
     assert 'bash -s -- --install "$(basename "$INSTALL_DIR")" "$PROXY_ORIGIN"' in installer
 
     # The updater cannot auto-pull arbitrary images or modify an unrelated
@@ -494,3 +497,136 @@ with open(os.environ["MOCK_ACTIONS"], "a") as f:
     assert "Persistent=true" in timer
     assert "OnCalendar=" in timer
     assert "enable --now simpleai-compute-update@demo.timer" in actions.read_text()
+
+
+def test_installer_bootstraps_docker_without_breaking_existing_working_docker(tmp_path):
+    """Execute real installer host preflight with a mocked working Docker CLI."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    original = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    assert "SimpleAI Compute Worker — isolated Linux installation" in original
+    prefix = original.split('info "SimpleAI Compute Worker — isolated Linux installation"', 1)[0]
+    script = tmp_path / "preflight.sh"
+    script.write_text(prefix + '\nprintf "BOOTSTRAP_PASSED\\n"\n')
+    mock = tmp_path / "bin"
+    mock.mkdir()
+    log = tmp_path / "root-changes.log"
+    docker = mock / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        "case \"$1 $2\" in\n"
+        "  'compose version'|'info ' ) exit 0 ;;\n"
+        "  * ) exit 99 ;;\n"
+        "esac\n"
+    )
+    docker.chmod(0o755)
+    for tool in ("sudo", "systemctl", "pacman", "apt-get", "dnf", "usermod", "sg"):
+        stub = mock / tool
+        stub.write_text("#!/bin/sh\nprintf '%s\\n' '" + tool +
+                        "' >> \"$SIMPLEAI_TEST_CHANGES\"\nexit 99\n")
+        stub.chmod(0o755)
+    env = {**os.environ, "HOME": str(tmp_path),
+           "PATH": str(mock) + os.pathsep + os.environ.get("PATH", ""),
+           "SIMPLEAI_TEST_CHANGES": str(log)}
+    finished = subprocess.run(["bash", str(script), "https://proxy.example.com"],
+                              env=env, capture_output=True, text=True, timeout=15)
+    assert finished.returncode == 0, finished.stderr
+    assert "BOOTSTRAP_PASSED" in finished.stdout
+    assert not log.exists(), "Existing working Docker must never trigger sudo/pacman/systemctl"
+
+
+def test_installer_host_bootstrap_has_explicit_security_boundaries():
+    """Check fail-closed defaults for privileged operations and distro support."""
+    from pathlib import Path
+    installer = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+
+    assert 'install_host_packages\nstart_host_docker\nensure_docker_user_access' in installer
+    assert installer.index("install_host_packages\nstart_host_docker") < installer.index(
+        "ENROLLMENT_CODE=\"$2\""), "Never claim a short-lived code before host prerequisites"
+    assert "pacman -S --needed --noconfirm" in installer
+    assert "No -Sy: never risk a partial upgrade" in installer
+    assert "apt-get update" in installer and "apt-get install -y" in installer
+    assert "dnf install -y" in installer
+    assert "systemctl enable --now docker.service" in installer
+    assert "root-equivalent privileges" in installer
+    assert "Type YES" in installer
+    assert "usermod -aG docker" in installer
+    assert 'exec sg docker -c "$cmd"' in installer
+    assert 'SIMPLEAI_DOCKER_GROUP_REENTRY' in installer
+    assert "sudo -v </dev/tty" in installer
+    assert "DOCKER_HOST is set" in installer
+    assert "$base.sha256" in installer
+    assert '[[ "$expected" =~ ^[a-fA-F0-9]{64}$ && "$expected" == "$actual" ]]' in installer
+    assert 'Docker daemon is unavailable. Start Docker or configure access' not in installer
+
+
+def test_installer_bootstraps_fresh_arch_packages_then_starts_daemon(tmp_path):
+    """Run the real preflight against a fake fresh Arch host without root."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    original = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    prefix = original.split('info "SimpleAI Compute Worker — isolated Linux installation"', 1)[0]
+    prefix = prefix.replace(". /etc/os-release", '. "$SIMPLEAI_TEST_OS_RELEASE"')
+    root_function_start = prefix.index("as_root() {")
+    root_function_end = prefix.index("\n}\n\ninstall_host_packages()", root_function_start)
+    # Only the test stubs the root authorization. The real installer retains
+    # the mandatory interactive sudo confirmation.
+    prefix = (prefix[:root_function_start] + 'as_root() { "$@"; }' +
+              prefix[root_function_end + 2:])
+    script = tmp_path / "preflight.sh"
+    script.write_text(prefix + '\nprintf "BOOTSTRAP_PASSED\\n"\n')
+
+    os_release = tmp_path / "os-release"
+    os_release.write_text("ID=arch\nID_LIKE=arch\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # Keep the runner's real Docker CLI out of PATH: emulate a fresh host.
+    import shutil
+    for command in ("uname", "curl", "python3", "cp", "chmod", "touch"):
+        target = shutil.which(command)
+        assert target
+        (bin_dir / command).symlink_to(target)
+    docker_template = tmp_path / "docker-template"
+    docker_template.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1 $2\" = 'compose version' ]; then exit 0; fi\n"
+        "if [ \"$1\" = info ]; then test -f \"$SIMPLEAI_TEST_READY\"; exit; fi\n"
+        "exit 93\n"
+    )
+    pacman = bin_dir / "pacman"
+    pacman.write_text(
+        "#!/bin/sh\n"
+        "printf 'pacman %s\\n' \"$*\" >> \"$SIMPLEAI_TEST_EVENTS\"\n"
+        "cp \"$SIMPLEAI_TEST_DOCKER_TEMPLATE\" \"$SIMPLEAI_TEST_BIN/docker\"\n"
+        "chmod 755 \"$SIMPLEAI_TEST_BIN/docker\"\n"
+    )
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        "printf 'systemctl %s\\n' \"$*\" >> \"$SIMPLEAI_TEST_EVENTS\"\n"
+        "touch \"$SIMPLEAI_TEST_READY\"\n"
+    )
+    for path in (pacman, systemctl):
+        path.chmod(0o755)
+
+    ready = tmp_path / "docker.started"
+    events = tmp_path / "events.log"
+    env = {**os.environ, "HOME": str(tmp_path),
+           "PATH": str(bin_dir),
+           "SIMPLEAI_TEST_OS_RELEASE": str(os_release),
+           "SIMPLEAI_TEST_BIN": str(bin_dir),
+           "SIMPLEAI_TEST_READY": str(ready),
+           "SIMPLEAI_TEST_DOCKER_TEMPLATE": str(docker_template),
+           "SIMPLEAI_TEST_EVENTS": str(events)}
+    result = subprocess.run(["/bin/bash", str(script), "https://proxy.example.com"],
+                            env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert "BOOTSTRAP_PASSED" in result.stdout
+    assert events.read_text().splitlines() == [
+        "pacman -S --needed --noconfirm python docker docker-compose",
+        "systemctl enable --now docker.service",
+    ]

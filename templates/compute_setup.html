@@ -4,7 +4,7 @@
   <div class="rounded-2xl border border-slate-200 bg-white p-6">
     <h2 class="text-xl font-semibold">Add a Compute Worker</h2>
     <p class="mt-2 text-sm text-slate-600">Install another isolated CPU worker on a Linux AMD64/ARM64 computer. The worker makes an outbound HTTPS/WSS connection; no incoming ports need to be opened.</p>
-    <p class="mt-2 text-sm text-slate-600">The installer requires Docker Engine, Docker Compose v2, Python 3 and curl. It never installs Docker silently, modifies existing Compose projects or receives Docker socket access inside the worker.</p>
+    <p class="mt-2 text-sm text-slate-600">The installer needs Linux AMD64/ARM64, curl and a network connection. On Arch/Omarchy, Ubuntu/Debian and Fedora it can install missing Docker Engine, Compose v2 and Python 3, start and enable the Docker service, and request one-time sudo approval. If non-root Docker access is missing, it asks you explicitly before granting the root-equivalent docker group membership. It does not modify existing Compose projects or mount the host Docker socket into the worker.</p>
   </div>
 
   <form id="setup" class="rounded-2xl border bg-white p-6 space-y-5">

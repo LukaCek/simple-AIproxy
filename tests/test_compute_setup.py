@@ -560,3 +560,67 @@ def test_installer_host_bootstrap_has_explicit_security_boundaries():
     assert "$base.sha256" in installer
     assert '[[ "$expected" =~ ^[a-fA-F0-9]{64}$ && "$expected" == "$actual" ]]' in installer
     assert 'Docker daemon is unavailable. Start Docker or configure access' not in installer
+
+
+def test_installer_bootstraps_fresh_arch_packages_then_starts_daemon(tmp_path):
+    """Run the real preflight against a fake fresh Arch host without root."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    original = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    prefix = original.split('info "SimpleAI Compute Worker — isolated Linux installation"', 1)[0]
+    prefix = prefix.replace(". /etc/os-release", '. "$SIMPLEAI_TEST_OS_RELEASE"')
+    root_function_start = prefix.index("as_root() {")
+    root_function_end = prefix.index("\n}\n\ninstall_host_packages()", root_function_start)
+    # Only the test stubs the root authorization. The real installer retains
+    # the mandatory interactive sudo confirmation.
+    prefix = (prefix[:root_function_start] + 'as_root() { "$@"; }' +
+              prefix[root_function_end + 2:])
+    script = tmp_path / "preflight.sh"
+    script.write_text(prefix + '\nprintf "BOOTSTRAP_PASSED\\n"\n')
+
+    os_release = tmp_path / "os-release"
+    os_release.write_text("ID=arch\nID_LIKE=arch\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_template = tmp_path / "docker-template"
+    docker_template.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1 $2\" = 'compose version' ]; then exit 0; fi\n"
+        "if [ \"$1\" = info ]; then test -f \"$SIMPLEAI_TEST_READY\"; exit; fi\n"
+        "exit 93\n"
+    )
+    pacman = bin_dir / "pacman"
+    pacman.write_text(
+        "#!/bin/sh\n"
+        "printf 'pacman %s\\n' \"$*\" >> \"$SIMPLEAI_TEST_EVENTS\"\n"
+        "cp \"$SIMPLEAI_TEST_DOCKER_TEMPLATE\" \"$SIMPLEAI_TEST_BIN/docker\"\n"
+        "chmod 755 \"$SIMPLEAI_TEST_BIN/docker\"\n"
+    )
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        "printf 'systemctl %s\\n' \"$*\" >> \"$SIMPLEAI_TEST_EVENTS\"\n"
+        "touch \"$SIMPLEAI_TEST_READY\"\n"
+    )
+    for path in (pacman, systemctl):
+        path.chmod(0o755)
+
+    ready = tmp_path / "docker.started"
+    events = tmp_path / "events.log"
+    env = {**os.environ, "HOME": str(tmp_path),
+           "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+           "SIMPLEAI_TEST_OS_RELEASE": str(os_release),
+           "SIMPLEAI_TEST_BIN": str(bin_dir),
+           "SIMPLEAI_TEST_READY": str(ready),
+           "SIMPLEAI_TEST_DOCKER_TEMPLATE": str(docker_template),
+           "SIMPLEAI_TEST_EVENTS": str(events)}
+    result = subprocess.run(["bash", str(script), "https://proxy.example.com"],
+                            env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert "BOOTSTRAP_PASSED" in result.stdout
+    assert events.read_text().splitlines() == [
+        "pacman -S --needed --noconfirm python docker docker-compose",
+        "systemctl enable --now docker.service",
+    ]

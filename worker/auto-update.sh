@@ -47,7 +47,7 @@ install_timer() {
   trap 'rm -f -- "$tmp"' EXIT
   curl -fsSL --connect-timeout 10 --max-time 45 \
     "$origin/compute/auto-update.sh" -o "$tmp" ||
-    die "Unable to fetch the signed-in HTTPS proxy's auto-update helper."
+    die "Unable to fetch the trusted HTTPS proxy's auto-update helper."
   head -n 5 "$tmp" | grep -Fq '# SimpleAI Managed Worker Updater v1' ||
     die "Proxy returned an unexpected updater file."
   bash -n "$tmp" || die "Downloaded updater failed bash syntax validation."
@@ -215,7 +215,7 @@ check_update() {
 
 case "$mode" in
   --install)
-    [[ $# -eq 4 ]] || die "Usage: updater --install WORKER_NAME https://YOUR_PROXY"
+    [[ $# -eq 3 ]] || die "Usage: updater --install WORKER_NAME https://YOUR_PROXY"
     install_timer "$3"
     ;;
   --check)

@@ -25,8 +25,82 @@ check_service_image() {
       die "Refusing update: this is not a standard production Compute Worker."
 }
 
+
+# Optional one-time transition for pre-fix Auto Maximum installations.
+# A new Docker cap changes model test eligibility but does not allocate RAM.
+# This is explicit and never done during a scheduled image update.
+migrate_auto_max() {
+  [[ -f "$dir/.env" ]] || die "Missing existing worker .env."
+  cd "$dir"
+  local cid status started
+  cid="$(docker compose ps -q compute-worker 2>/dev/null || :)"
+  if [[ -n "$cid" ]]; then
+    status="$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || :)"
+    if [[ "$status" == "running" ]] && ! worker_idle; then
+      die "Worker is active; wait until it is idle before migrating its RAM limit."
+    fi
+  fi
+  cp -p -- .env .env.before-auto-max
+  python3 - ".env" <<'PY'
+from pathlib import Path
+import math, os, sys
+
+p = Path(sys.argv[1])
+lines = p.read_text(encoding='utf-8').splitlines(keepends=True)
+required = {"WORKER_MEMORY_LIMIT", "WORKER_CPU_LIMIT", "WORKER_THREADS"}
+found = {line.split("=", 1)[0] for line in lines if "=" in line}
+if not required <= found:
+    raise SystemExit("Not an Auto installer .env; refusing to change Manual settings.")
+gib = 1024 ** 3
+with open("/proc/meminfo", encoding="ascii") as stream:
+    total = next(int(line.split()[1]) * 1024 for line in stream
+                 if line.startswith("MemTotal:"))
+reserve = max(2 * gib, total * 0.15)
+limit = math.floor(max(0, total - reserve) / gib * 4) / 4
+if limit < 2:
+    raise SystemExit("Not enough total host RAM to safely run Auto Maximum.")
+cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+new = {"WORKER_MEMORY_LIMIT": f"{limit}g",
+       "WORKER_CPU_LIMIT": str(float(cpus)),
+       "WORKER_THREADS": str(cpus)}
+out = []
+for line in lines:
+    key = line.split("=", 1)[0]
+    out.append(f"{key}={new[key]}\n" if key in new else line)
+tmp = p.with_name(".env.auto-max.tmp")
+fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    stream.writelines(out)
+os.replace(tmp, p)
+print(f"Auto Maximum: {limit} GiB Docker ceiling on {total/gib:.2f} GiB host RAM; "
+      f"{cpus} CPU cores")
+PY
+  if [[ $? -ne 0 ]]; then
+    cp -p -- .env.before-auto-max .env
+    rm -f -- .env.before-auto-max
+    die "Unable to calculate Auto Maximum."
+  fi
+  started="$(date +%s)"
+  if docker compose config --quiet &&
+     docker compose up -d --no-build --no-deps --force-recreate --pull never compute-worker &&
+     wait_connected "$started"; then
+    rm -f -- .env.before-auto-max
+    log "New resource limit active; original worker identity and model volumes retained."
+    return 0
+  fi
+  log "RAM migration failed; restoring previous Compose settings."
+  cp -p -- .env.before-auto-max .env
+  rm -f -- .env.before-auto-max
+  started="$(date +%s)"
+  docker compose up -d --no-build --no-deps --force-recreate --pull never compute-worker ||
+    die "Could not restore original worker container; check Compose logs."
+  wait_connected "$started" ||
+    die "Original RAM limit restored, but worker not connected. Check Docker logs."
+  die "Auto Maximum migration rolled back; original RAM limit is restored."
+}
+
 install_timer() {
-  [[ $# -eq 1 ]] || die "Usage: updater --install WORKER_NAME https://YOUR_PROXY"
+  [[ $# -eq 1 || $# -eq 2 ]] || die "Usage: updater --install WORKER_NAME https://YOUR_PROXY"
   local origin="$1"
   [[ "$origin" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] ||
     die "Installer endpoint must be a trusted public HTTPS origin."
@@ -37,6 +111,9 @@ install_timer() {
     die "Automatic updates require Docker, flock, Python 3 and curl."
   docker info >/dev/null 2>&1 || die "Cannot contact the host Docker daemon."
   check_service_image
+  if [[ "${2:-}" == "--recalculate-auto-max" ]]; then
+    migrate_auto_max
+  fi
 
   local dest="$dir/auto-update.sh" tmp
   if [[ -e "$dest" && ! -f "$dest" ]] ||
@@ -215,8 +292,11 @@ check_update() {
 
 case "$mode" in
   --install)
-    [[ $# -eq 3 ]] || die "Usage: updater --install WORKER_NAME https://YOUR_PROXY"
-    install_timer "$3"
+    [[ $# -eq 3 || $# -eq 4 ]] ||
+      die "Usage: updater --install WORKER_NAME https://YOUR_PROXY [--recalculate-auto-max]"
+    [[ $# -ne 4 || "$4" == "--recalculate-auto-max" ]] ||
+      die "Unknown install option."
+    install_timer "$3" "${4:-}"
     ;;
   --check)
     [[ $# -eq 2 ]] || die "Usage: updater --check WORKER_NAME"

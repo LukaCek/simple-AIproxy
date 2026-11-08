@@ -439,3 +439,48 @@ def test_explicit_model_self_test_reports_supported_or_disk_error(tmp_path, monk
                    for m in ws.messages), ws.messages
         assert worker.capabilities["test-model"]["status"] == "unsupported"
     asyncio.run(run())
+
+
+def test_private_worker_diagnostics_survive_restarts_without_secrets(tmp_path, monkeypatch):
+    worker = isolated_worker(tmp_path, monkeypatch)
+    worker._diag("model_test", "ram_limit", level="error", model="test-model",
+                 metrics={"ram_limit_mib": 2048, "model_size_mib": 4035})
+    worker._diag("network", agent.error_code(
+        "connection failed: https://proxy.example/?token=PRIVATE_SECRET"),
+        level="warning")
+    source = worker._diag_path.read_text()
+    assert "PRIVATE_SECRET" not in source
+    assert "https://" not in source
+    assert len(worker._diag_pending) == 2
+    assert all(record["model"] in ("", "test-model") for record in worker._diag_pending)
+
+    restarted = agent.Worker()
+    assert len(restarted._diag_pending) == 2
+    assert restarted._diag_seq == worker._diag_seq
+    restarted._ack_diag(restarted._diag_pending[0]["seq"])
+    assert len(restarted._diag_pending) == 1
+    assert len(agent.Worker()._diag_pending) == 1
+
+
+def test_worker_diagnostic_delivery_only_acks_after_proxy_response(tmp_path, monkeypatch):
+    worker = isolated_worker(tmp_path, monkeypatch)
+    worker._diag("model_test", "disk_limit", level="warning", model="test-model")
+    class Socket:
+        def __init__(self): self.messages = []
+        async def send(self, payload): self.messages.append(json.loads(payload))
+
+    async def run():
+        socket = Socket()
+        task = asyncio.create_task(worker._send_diagnostics(socket))
+        await asyncio.sleep(0.03)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert len(socket.messages) == 1
+        msg = socket.messages[0]
+        assert msg["type"] == "diagnostic"
+        assert msg["code"] == "disk_limit"
+        assert len(worker._diag_pending) == 1  # not acked yet
+        worker._ack_diag(msg["seq"])
+        assert not worker._diag_pending
+
+    asyncio.run(run())

@@ -115,5 +115,5 @@ async def lookup_gguf_models(source: str) -> dict:
     if filename and not files:
         raise ValueError("GGUF file not found with trustworthy SHA256/size metadata")
     if not files:
-        raise ValueError("No downloadable SHA256-pinned GGUF files found")
+        raise ValueError("No verified GGUF files here. This may be the original model repository, not a GGUF conversion. On Hugging Face open its Quantizations or Model tree and choose a GGUF repository (often ending -GGUF), then paste that link.")
     return {"repo": repo, "revision": sha, "files": files}

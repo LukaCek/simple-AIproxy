@@ -418,3 +418,79 @@ elif a[:3] == ["image", "inspect", "--format"]:
     assert blocked.returncode == 0, blocked.stderr
     assert "Previously failed image" in blocked.stdout
     assert "compose up " not in log.read_text()
+
+
+def test_auto_updater_install_enables_persistent_user_timer_without_real_docker(tmp_path):
+    """One-time adoption works for existing identity/model volumes."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "worker" / "auto-update.sh"
+    home = tmp_path / "home"
+    root = home / ".local/share/simpleai-compute/demo"
+    root.mkdir(parents=True)
+    (root / "docker-compose.yml").write_text(
+        "services:\n  compute-worker:\n    image: ghcr.io/lukacek/simple-aiproxy-worker:latest\n")
+    (root / ".env").write_text("SIMPLEAI_PROXY_URL=https://proxy.example.com\n")
+    (root / "models.marker").write_text("KEEP MODEL STATE")
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    actions = tmp_path / "actions.log"
+
+    docker = commands / "docker"
+    docker.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+a=sys.argv[1:]
+if a[:2]==["compose","config"]:
+    print(json.dumps({"services":{"compute-worker":{"image":
+      "ghcr.io/lukacek/simple-aiproxy-worker:latest"}}}))
+sys.exit(0)
+''')
+    docker.chmod(0o700)
+
+    curl = commands / "curl"
+    curl.write_text(r'''#!/usr/bin/env python3
+import os, shutil, sys
+args=sys.argv[1:]
+shutil.copyfile(os.environ["MOCK_UPDATE_SOURCE"], args[args.index("-o")+1])
+''')
+    curl.chmod(0o700)
+
+    systemctl = commands / "systemctl"
+    systemctl.write_text(r'''#!/usr/bin/env python3
+import os, sys
+with open(os.environ["MOCK_ACTIONS"], "a") as f:
+    f.write("systemctl " + " ".join(sys.argv[1:]) + "\n")
+''')
+    systemctl.chmod(0o700)
+
+    loginctl = commands / "loginctl"
+    loginctl.write_text("#!/bin/sh\nprintf 'yes\\n'\n")
+    loginctl.chmod(0o700)
+
+    sudo = commands / "sudo"
+    sudo.write_text("#!/bin/sh\nexit 19\n")
+    sudo.chmod(0o700)
+
+    env = {**os.environ,
+           "HOME": str(home),
+           "PATH": str(commands) + os.pathsep + os.environ.get("PATH", ""),
+           "MOCK_UPDATE_SOURCE": str(script),
+           "MOCK_ACTIONS": str(actions)}
+    completed = subprocess.run(
+        ["bash", str(script), "--install", "demo", "https://proxy.example.com"],
+        env=env, capture_output=True, text=True, timeout=25)
+    assert completed.returncode == 0, completed.stderr
+    assert "Automatic updates enabled" in completed.stdout
+    assert (root / "models.marker").read_text() == "KEEP MODEL STATE"
+    copied = root / "auto-update.sh"
+    assert copied.read_bytes() == script.read_bytes()
+    assert copied.stat().st_mode & 0o777 == 0o700
+    units = home / ".config/systemd/user"
+    service = (units / "simpleai-compute-update@.service").read_text()
+    timer = (units / "simpleai-compute-update@.timer").read_text()
+    assert "ExecStart=%h/.local/share/simpleai-compute/%i/auto-update.sh" in service
+    assert "Persistent=true" in timer
+    assert "OnCalendar=" in timer
+    assert "enable --now simpleai-compute-update@demo.timer" in actions.read_text()

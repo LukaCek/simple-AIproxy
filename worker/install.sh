@@ -121,16 +121,23 @@ if profile != 'manual':
         free = shutil.disk_usage(root).free
     except OSError:
         free = shutil.disk_usage('/').free
-    # Conservative caps, based on actual free host memory and Docker storage.
+    # A stable Docker hard cap is based on TOTAL host RAM, not MemAvailable
+    # sampled once while another workload (e.g. a miner) is running.
+    # Keep 45% host reserve for Shared or 15% (minimum 2 GiB) for Maximum.
+    # This is a *ceiling*, not preallocated RAM. The worker independently
+    # checks real-time host MemAvailable before loading each model.
+    def auto_ram_gib(total_bytes, shared):
+        reserve = max(2 * gib, total_bytes * (0.45 if shared else 0.15))
+        return math.floor(max(0, total_bytes - reserve) / gib * 4) / 4
+
     share = profile == 'auto_shared'
-    fraction = 0.55 if share else 0.78
-    memory = min(total * fraction, max(0, available - (1.5 if share else 1) * gib))
-    memory_gb = math.floor(memory / gib * 4) / 4
+    memory_gb = auto_ram_gib(total, share)
     if memory_gb < 2:
-        raise SystemExit('Insufficient free host RAM: auto profile requires 2 GiB. '
-                         'Free memory or select a custom/manual limit.')
-    cpu_fraction = 0.65 if share else 0.90
-    cpu_limit = max(0.5, math.floor(cpus * cpu_fraction * 2) / 2)
+        raise SystemExit('Host has too little physical RAM for a safe auto worker. '
+                         'Auto requires at least 2 GiB for the worker plus host reserve.')
+    # Auto Maximum can use all physical CPU cores; Linux still schedules other
+    # services fairly. Shared deliberately caps CPU at 65% of host capacity.
+    cpu_limit = max(0.5, math.floor(cpus * 0.65 * 2) / 2) if share else float(cpus)
     threads = max(1, min(cpus, math.ceil(cpu_limit)))
     # Leave at least 4 GiB on the Docker volume filesystem; disk budget is
     # application-enforced and not an OS-level quota.
@@ -142,8 +149,17 @@ if profile != 'manual':
             f'WORKER_CPU_LIMIT={cpu_limit}\n'
             f'WORKER_THREADS={threads}\n'
             f'WORKER_DISK_BUDGET_GB={disk_gb}\n')
-    print(f'Auto limits: RAM {memory_gb} GiB, CPU {cpu_limit}, '
-          f'threads {threads}, disk budget {disk_gb} GiB', file=sys.stderr)
+    print(f'Auto {"Shared" if share else "Maximum"}: physical RAM {total / gib:.2f} GiB; '
+          f'Docker RAM ceiling {memory_gb:.2f} GiB; '
+          f'host reserve {total / gib - memory_gb:.2f} GiB; '
+          f'CPU {cpu_limit:g}; threads {threads}; '
+          f'model disk budget {disk_gb} GiB', file=sys.stderr)
+    if available < (memory_gb + 1) * gib:
+        print(f'NOTE: Current available host RAM is only {available / gib:.2f} GiB. '
+              'Auto RAM ceilings do not shrink because another process is busy. '
+              'The worker will check live available RAM before loading models; '
+              'do not run competing heavy workloads without reducing their budgets.',
+              file=sys.stderr)
 
 target.mkdir(mode=0o700)
 for filename, content in [('docker-compose.yml', compose), ('.env', env)]:

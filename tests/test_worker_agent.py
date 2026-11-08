@@ -360,3 +360,82 @@ def test_reclaimable_file_cache_never_counts_dirty_or_tmpfs(tmp_path):
     assert agent._reclaimable_file_cache(str(stat), "inactive_file") == 24
     stat.write_text("inactive_file 123\n")
     assert agent._reclaimable_file_cache(str(stat), "inactive_file") == 123
+
+
+
+def test_worker_accepts_only_checksum_pinned_remote_catalog_and_persists(tmp_path, monkeypatch):
+    from compute_catalog import BUILTIN_CATALOG
+    fake = {"test-model": {"name": "Demo", "repo": "test/repo", "file": "demo.gguf",
+                           "revision": "a"*40, "size": 21, "sha256": "b"*64, "ctx":4096}}
+    worker = isolated_worker(tmp_path, monkeypatch)
+    worker.mark_model("test-model", "supported")
+    custom = {"custom-1": {"name": "New GGUF", "repo": "owner/repo",
+                           "file": "model.gguf", "revision": "c"*40,
+                           "size": 100, "sha256": "d"*64, "ctx":4096}}
+    catalog = {**BUILTIN_CATALOG, **custom}
+
+    class Ws:
+        async def send(self, raw): pass
+
+    async def run():
+        await worker.receive_policy(Ws(), {"type":"policy", "revision":2,
+                                           "catalog":catalog,"models":[]})
+        assert "custom-1" in agent.CATALOG
+        assert "test-model" not in worker.capabilities
+        assert (agent.DATA / "approved-model-catalog.json").exists()
+        if worker.reconcile_task:
+            await asyncio.wait_for(worker.reconcile_task, 5)
+
+        bad = {**catalog, "custom-1": {**custom["custom-1"], "revision": "main"}}
+        await worker.receive_policy(Ws(), {"type":"policy", "revision":3,
+                                           "catalog":bad,"models":[]})
+        assert agent.CATALOG["custom-1"]["revision"] == "c"*40
+        assert worker.policy_revision == 2, "Malformed catalog must not update policy"
+
+    asyncio.run(run())
+
+    restored = agent.Worker()
+    assert "custom-1" in agent.CATALOG
+    assert restored.catalog_path.exists()
+    assert restored.catalog_path.read_text().find('"node_secret"') < 0
+
+
+def test_explicit_model_self_test_reports_supported_or_disk_error(tmp_path, monkeypatch):
+    worker = isolated_worker(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "memory_limit", lambda: 8 * 1024**3)
+    monkeypatch.setattr(agent, "memory_available", lambda: 8 * 1024**3)
+
+    class Ws:
+        def __init__(self): self.messages = []
+        async def send(self, raw): self.messages.append(json.loads(raw))
+
+    async def fake_unload():
+        worker.active = worker.process = None
+
+    async def fake_install(mid):
+        return []
+
+    async def fake_load(mid):
+        worker.active = mid
+        worker.process = type("Proc", (), {"returncode": None})()
+
+    async def fake_benchmark(mid):
+        return {"generation_tps": 13.0}
+
+    monkeypatch.setattr(worker, "unload", fake_unload)
+    monkeypatch.setattr(worker, "ensure_installed", fake_install)
+    monkeypatch.setattr(worker, "load", fake_load)
+    monkeypatch.setattr(worker, "benchmark", fake_benchmark)
+
+    async def run():
+        ws = Ws()
+        await worker.command(ws, {"id":"test-good","model":"test-model","action":"test"})
+        assert ws.messages[0]["type"] == "result", ws.messages
+        assert worker.capabilities["test-model"]["status"] == "supported"
+        assert worker.capabilities["test-model"]["benchmark"]["generation_tps"] == 13.0
+        monkeypatch.setattr(agent, "DISK_LIMIT_BYTES", 1)
+        await worker.command(ws, {"id":"test-small-disk","model":"test-model","action":"test"})
+        assert any(m.get("type")=="error" and "disk" in m.get("error", "").lower()
+                   for m in ws.messages), ws.messages
+        assert worker.capabilities["test-model"]["status"] == "unsupported"
+    asyncio.run(run())

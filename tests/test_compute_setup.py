@@ -407,7 +407,7 @@ elif a[:3] == ["image", "inspect", "--format"]:
     # A failed image triggers rollback; the exact failed image ID is blocked
     # until a different upstream release arrives.
     sleeper = mock_bin / "sleep"
-    sleeper.write_text("#!/bin/sh\\nexit 0\\n")
+    sleeper.write_text("#!/bin/sh\nexit 0\n")
     sleeper.chmod(0o700)
     failed = run(MOCK_RELEASE="new", MOCK_REJECT="1")
     assert failed.returncode == 0, failed.stderr

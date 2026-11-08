@@ -398,14 +398,19 @@ class Worker:
             await asyncio.sleep(2)
 
     def _resource_metrics(self, mid):
+        # Diagnostics are best effort: a broken model mount must not crash
+        # the worker a second time while it is reporting the first error.
         mib = 1024 ** 2
-        return {
-            "ram_limit_mib": max(0, memory_limit() // mib),
-            "ram_available_mib": max(0, memory_available() // mib),
-            "disk_limit_mib": max(0, DISK_LIMIT_BYTES // mib),
-            "disk_used_mib": max(0, used_bytes(MODELS) // mib),
-            "model_size_mib": max(0, int(CATALOG[mid]["size"]) // mib),
-        }
+        try:
+            return {
+                "ram_limit_mib": max(0, memory_limit() // mib),
+                "ram_available_mib": max(0, memory_available() // mib),
+                "disk_limit_mib": max(0, DISK_LIMIT_BYTES // mib),
+                "disk_used_mib": max(0, used_bytes(MODELS) // mib),
+                "model_size_mib": max(0, int(CATALOG[mid]["size"]) // mib),
+            }
+        except (OSError, ValueError, KeyError):
+            return {}
 
     def _activity(self, phase, model=None, kind=None):
         now = time.time()

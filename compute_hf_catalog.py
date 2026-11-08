@@ -26,7 +26,7 @@ def parse_source(source: str) -> tuple[str, str, str | None]:
     if source.startswith("https://"):
         url = urlsplit(source)
         if (url.scheme != "https" or url.hostname != "huggingface.co"
-                or url.username or url.password or url.port or url.fragment):
+                or url.username or url.password or url.port or url.fragment or url.query):
             raise ValueError("Only https://huggingface.co links are accepted")
         parts = [unquote(p) for p in url.path.strip("/").split("/")]
     else:

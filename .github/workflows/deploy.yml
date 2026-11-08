@@ -212,7 +212,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
           TEST_RESULT: ${{ needs.test.result }}
-          BUILD_RESULT: ${{ needs.build-and-push.result }}\n          PUBLISH_RESULT: ${{ needs.publish-image.result }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          PUBLISH_RESULT: ${{ needs.publish-image.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
         run: |
           git config user.name "SimpleAIProxy Deploy Bot"
@@ -240,7 +241,8 @@ jobs:
             "workflow_run_url": "https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}",
             "jobs": {
               "test": "${TEST_RESULT}",
-              "build_and_push": "${BUILD_RESULT}",\n              "publish_image": "${PUBLISH_RESULT}",
+              "build_and_push": "${BUILD_RESULT}",
+              "publish_image": "${PUBLISH_RESULT}",
               "deploy": "${DEPLOY_RESULT}"
             },
             "checks": {

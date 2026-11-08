@@ -58,6 +58,10 @@ assert cfg["services"]["compute-worker"]["image"]=="ghcr.io/lukacek/simple-aipro
   echo "Enabling automatic updates for $name..."
   if bash "$tmp" --install "$name" "$origin"; then
     success=$((success+1))
+    echo "Checking for an available release immediately (busy workers defer safely)..."
+    if ! bash "$tmp" --check "$name"; then
+      echo "Immediate check failed for $name; timer will retry automatically." >&2
+    fi
   else
     failed=$((failed+1))
     echo "Updater FAILED for $name; existing worker remains running." >&2

@@ -5,6 +5,8 @@ on:
     paths:
       - "worker/**"
       - "compute_catalog.py"
+      - "compute_hf_catalog.py"
+      - "tests/test_compute_dynamic_catalog.py"
       - "compute_worker_snapshot.py"
       - "codex_registry.py"
       - "tests/test_codex_registry.py"
@@ -38,6 +40,8 @@ on:
     paths:
       - "worker/**"
       - "compute_catalog.py"
+      - "compute_hf_catalog.py"
+      - "tests/test_compute_dynamic_catalog.py"
       - "compute_plane.py"
       - ".github/workflows/compute-worker.yml"
   workflow_dispatch:
@@ -59,11 +63,11 @@ jobs:
           python-version: "3.11"
       - name: Check Python syntax and test control plane
         run: |
-          python -m compileall -q compute_catalog.py compute_worker_storage.py compute_plane.py compute_scheduler.py compute_placement.py compute_setup.py compute_worker_snapshot.py worker/agent.py worker/tui.py compute_staging_smoke.py compute_staging_auto_smoke.py
+          python -m compileall -q compute_catalog.py compute_hf_catalog.py compute_worker_storage.py compute_plane.py compute_scheduler.py compute_placement.py compute_setup.py compute_worker_snapshot.py worker/agent.py worker/tui.py compute_staging_smoke.py compute_staging_auto_smoke.py
           bash -n worker/install.sh
           bash -n worker/auto-update.sh
           python -m pip install -r requirements.txt -r worker/requirements.txt pytest pytest-asyncio
-          pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py tests/test_compute_worker_storage.py tests/test_oblak_compose.py tests/test_compute_scheduler.py tests/test_compute_placement.py tests/test_compute_setup.py tests/test_compute_worker_tui.py
+          pytest -q tests/test_zz_compute_plane.py tests/test_worker_agent.py tests/test_compute_worker_storage.py tests/test_oblak_compose.py tests/test_compute_scheduler.py tests/test_compute_placement.py tests/test_compute_setup.py tests/test_compute_worker_tui.py tests/test_compute_dynamic_catalog.py
           pytest -q tests/test_compute_playground.py
           # The production full_entrypoint installs a Codex-aware /v1/models
           # replacement; exercise it to prevent silently losing local models.

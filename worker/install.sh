@@ -206,7 +206,7 @@ ensure_docker_user_access() {
     printf -v code_arg ' %q' "$1"
   fi
   export SIMPLEAI_DOCKER_GROUP_REENTRY=1
-  cmd="curl -fsSL ${origin_arg}/compute/install.sh | bash -s -- ${origin_arg}${code_arg}"
+  cmd="bash -o pipefail -c 'curl -fsSL ${origin_arg}/compute/install.sh | bash -s -- ${origin_arg}${code_arg}'"
   info "Activating Docker group access in a temporary shell and continuing installation..."
   info "The enrollment code may be visible to local users in process arguments during this step."
   exec sg docker -c "$cmd"

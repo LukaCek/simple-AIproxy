@@ -553,7 +553,10 @@ def test_installer_host_bootstrap_has_explicit_security_boundaries():
     assert "root-equivalent privileges" in installer
     assert "Type YES" in installer
     assert "usermod -aG docker" in installer
-    assert 'exec sg docker -c "$cmd"' in installer
+    assert 'exec sg docker -c ' in installer
+    assert 'exec sudo -H -u "$(id -un)" -g docker --' in installer
+    assert 'env SIMPLEAI_DOCKER_GROUP_REENTRY=1' in installer
+    assert 'systemctl is-active --quiet docker.service' in installer
     assert 'SIMPLEAI_DOCKER_GROUP_REENTRY' in installer
     assert "sudo -v </dev/tty" in installer
     assert "DOCKER_HOST is set" in installer

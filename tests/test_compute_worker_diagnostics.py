@@ -86,7 +86,7 @@ def test_authenticated_wss_worker_events_are_persisted_without_secrets(tmp_path,
             assert diagnostics[1]["detail"].startswith("model_test/ram_limit")
             assert diagnostics[1]["status"] == "error"
             assert diagnostics[1]["model"] == "qwen35-0.8b-q4"
-            assert "ram_available_mib=422MiB" in diagnostics[1]["detail"]
+            assert "ram_free=422MiB" in diagnostics[1]["detail"]
             blob = repr(diagnostics)
             assert "NEVER_STORE_THIS" not in blob
             assert "PRIVATE" not in blob

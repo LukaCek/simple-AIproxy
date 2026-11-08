@@ -44,7 +44,7 @@
         </label>
       </div>
     </div>
-    <p id="profile-hint" class="text-xs text-slate-600">Auto Maximum measures the actual Linux host's free RAM, CPU and Docker storage. It leaves a safety reserve. Switch to Manual for exact limits.</p>
+    <p id="profile-hint" class="text-xs text-slate-600">Auto Maximum: a stable Docker ceiling based on 85% of total physical RAM (at least 2 GiB left for host processes), not the temporarily free RAM. The worker checks live free RAM before loading models. It uses all CPU cores. For hosts that also run miners or other heavy workloads, choose Auto Shared or Manual.</p>
     <p class="text-xs text-amber-800">New workers cannot process private prompts unless you explicitly enable trust after enrollment. Keep the one-time code confidential.</p>
     <div id="status" role="status" aria-live="polite" class="hidden rounded-lg bg-slate-100 p-3 text-sm"></div>
     <button id="generate" class="rounded-lg bg-slate-900 px-4 py-3 text-sm font-medium text-white" type="submit">Create one-line installation</button>
@@ -102,7 +102,9 @@
     $("manual-fields").style.display = manual ? "contents" : "none";
     $("profile-hint").textContent = manual ?
       "Exact CPU/RAM/disk limits. Defaults suit a small second worker on this computer." :
-      "Resources will be measured on the target Linux host by the installer, not guessed by the proxy.";
+      ($("profile").value === "auto_max" ?
+       "Auto Maximum: up to ~85% of TOTAL host RAM (at least 2 GiB left for other processes); all CPU cores. This is a Docker hard ceiling, not preallocated RAM. Running other memory-heavy services can still exhaust the host." :
+       "Auto Shared: up to ~55% of TOTAL host RAM (at least 2 GiB left for other processes); ~65% CPU. The worker checks live free RAM before model startup. Values are fixed until manually updated.");
   }
   $("profile").addEventListener("change", syncProfile);
   syncProfile();

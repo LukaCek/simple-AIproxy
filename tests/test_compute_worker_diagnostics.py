@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from test_zz_compute_plane import ADMIN, enroll_node, fixture_client
-from compute_worker_diagnostics import CODES, describe, error_code, validate
+from compute_worker_diagnostics import CODES, backend_error_code, describe, error_code, validate
 
 WRITE = {"X-SimpleAI-Admin-Action": "1"}
 
@@ -59,6 +59,14 @@ def test_exception_classifier_never_returns_raw_text():
     assert error_code("Model plus runtime safety margin exceeds configured cgroup RAM") == "ram_limit"
     assert error_code("Exceeds configured model disk limit") == "disk_limit"
     assert error_code("llama-server crashed during startup") == "llama_crashed"
+
+
+def test_backend_stderr_classifier_discards_private_text():
+    raw = b"llama_model: unsupported model architecture gemma4 secret prompt user@email.test"
+    assert backend_error_code(raw) == "backend_unsupported"
+    assert backend_error_code(b"failed to allocate 4096 MiB") == "backend_out_of_memory"
+    assert backend_error_code(b"failed to load model") == "backend_load_failed"
+    assert backend_error_code(b"Hello secret input") is None
 
 
 def test_authenticated_wss_worker_events_are_persisted_without_secrets(tmp_path, monkeypatch):

@@ -65,6 +65,10 @@ def test_manifest_published_only_after_both_immutable_digests_exist():
     assert '-t "$IMAGE:latest"' in commands
     assert '-t "$IMAGE:$GITHUB_SHA"' in commands
     assert "docker buildx imagetools inspect --raw" in commands
+    assert commands.index("docker buildx imagetools inspect --raw") < commands.index(
+        'docker buildx imagetools create -t "$IMAGE:latest"'), (
+        "The live :latest tag must never be updated before manifest validation"
+    )
 
 
 def test_build_revision_changes_only_tail_layer_not_expensive_build_dependencies():

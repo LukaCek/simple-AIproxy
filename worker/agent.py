@@ -508,6 +508,37 @@ class Worker:
         if self.reconcile_task is None or self.reconcile_task.done():
             self.reconcile_task = asyncio.create_task(self.reconcile(ws))
 
+    async def test_model(self, mid):
+        """Perform actual CPU load and inference, with caller holding self.lock."""
+        if mid not in CATALOG:
+            raise ValueError("Model not in approved catalog")
+        started = time.monotonic()
+        self.mark_model(mid, "testing")
+        model = CATALOG[mid]
+        max_file = max(model["size"] + 16 * 1024**2, int(model["size"] * 1.15))
+        required_ram = model_ram_requirement(int(model["size"]))
+        if max_file > DISK_LIMIT_BYTES:
+            self.mark_model(mid, "unsupported", "Exceeds configured model disk limit")
+        elif required_ram + memory_safety_margin() > memory_limit():
+            self.mark_model(mid, "unsupported",
+                            "Model plus runtime safety margin exceeds configured cgroup RAM")
+        else:
+            try:
+                await self.unload()
+                await self.ensure_installed(mid)
+                await self.load(mid)
+                measured = await self.benchmark(mid)
+                await self.unload()
+                self.mark_model(mid, "supported", "Actual inference passed",
+                                time.monotonic() - started, benchmark=measured)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.unload()
+                self.mark_model(mid, "error", str(exc),
+                                time.monotonic() - started)
+        return self.capabilities[mid]
+
     async def reconcile(self, ws):
         """Test requested models, report capacity, and warm the preferred one.
 
@@ -529,35 +560,8 @@ class Worker:
                 previous = self.capabilities.get(mid, {})
                 if not retest and previous.get("status") in ("supported", "unsupported", "error"):
                     continue
-                started = time.monotonic()
-                self.mark_model(mid, "testing")
-                await self.telemetry(ws)
-                model = CATALOG[mid]
-                max_file = max(model["size"] + 16 * 1024**2, int(model["size"] * 1.15))
-                required_ram = model_ram_requirement(int(model["size"]))
-                if max_file > DISK_LIMIT_BYTES:
-                    self.mark_model(mid, "unsupported", "Exceeds configured model disk limit")
-                elif required_ram + memory_safety_margin() > memory_limit():
-                    self.mark_model(mid, "unsupported",
-                                    "Model plus runtime safety margin exceeds configured cgroup RAM")
-                else:
-                    try:
-                        async with self.lock:
-                            await self.unload()
-                            await self.ensure_installed(mid)
-                            await self.load(mid)
-                            measured = await self.benchmark(mid)
-                            await self.unload()
-                        self.mark_model(mid, "supported", "Actual inference passed",
-                                        time.monotonic() - started, benchmark=measured)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        await self.unload()
-                        # Failed downloads / inference can be retried by saving
-                        # model policy again; don't claim the model is supported.
-                        self.mark_model(mid, "error", str(exc),
-                                        time.monotonic() - started)
+                async with self.lock:
+                    await self.test_model(mid)
                 await self.telemetry(ws)
             if version != self.policy_revision or generation != self.policy_generation:
                 continue
@@ -648,6 +652,10 @@ class Worker:
                 self._activity("command", mid, action)
                 if action == "install":
                     await self.ensure_installed(mid)
+                elif action == "test":
+                    result = await self.test_model(mid)
+                    if result["status"] != "supported":
+                        raise RuntimeError(result.get("reason") or "Model failed CPU self-test")
                 elif action == "load":
                     # Never evict the currently working models to download a
                     # GGUF that cannot fit the configured container RAM cap.

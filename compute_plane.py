@@ -669,6 +669,17 @@ async def linux_install_script():
     })
 
 
+@router.get("/compute/auto-update.sh", response_class=PlainTextResponse)
+async def linux_auto_update_script():
+    # Public host-only helper; no secrets or Docker access in the proxy.
+    # Installs a per-user systemd timer; the worker container itself remains
+    # unprivileged and is never given /var/run/docker.sock.
+    data = (Path(__file__).parent / "worker" / "auto-update.sh").read_text()
+    return PlainTextResponse(data, headers={
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    })
+
+
 @router.post("/compute/bootstrap")
 async def claim_install_plan(request: Request):
     # The short-lived random token authorizes access to pre-approved setup,

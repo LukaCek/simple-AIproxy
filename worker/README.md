@@ -8,8 +8,9 @@ HTTPS/WSS, persistent volumes and sufficient local CPU, RAM and disk.
 Open /admin/compute-setup on the proxy. Choose a worker name (for example
 oblak-vps-1), a publicly reachable HTTPS proxy URL, and Manual limits or an
 Auto resource profile. Copy the one-line Linux command into a terminal on the
-target machine. Paste the separately generated, short-lived setup code when
-asked. No token is placed into the shell command or history.
+target machine. The command already contains the 15-minute, single-use
+setup code; there is no second prompt. Treat the entire command as a secret:
+it may appear in terminal history, clipboard managers or process listings.
 
 Requirements: Linux AMD64 or ARM64; Docker Engine + Compose v2, Python 3,
 curl, and outbound HTTPS/WSS. Docker is not installed or configured silently.
@@ -21,16 +22,122 @@ after successful registration, and recreates that one container without it.
 The worker cannot access the host's Docker socket. Newly enrolled workers
 are untrusted for private prompts until approved in the admin dashboard.
 
-Auto Shared and Auto Maximum measure resources on the target Linux machine,
-including free memory and Docker's filesystem. These are conservative resource
-budgets, not guarantees that a particular model will fit.
+### One-word TUI command
+
+After successful enrollment, the Linux installer creates the executable
+`~/.local/bin/simpleai-tui` (mode 0700) and **automatically opens** the live
+terminal dashboard. Press `q` to leave the TUI; the worker keeps running.
+
+From any directory in a new terminal, run:
+
+```bash
+simpleai-tui
+```
+
+If multiple workers are installed for the same Linux user, pick one:
+
+```bash
+simpleai-tui my-worker
+```
+
+For a static status snapshot, use `simpleai-tui --once` (or
+`simpleai-tui my-worker --once`). This calls `docker compose exec`
+in the worker's existing isolated Compose project. It does **not** start or
+stop services and does not need to see worker API keys.
+
+On systems where `~/.local/bin` was not in PATH when setup ran, the
+installer adds it to the current user's Bash/Zsh startup file; open a
+**new terminal** first. You can always use
+`~/.local/bin/simpleai-tui` directly. Existing unmanaged shortcut files
+are never overwritten. The installer opens the dashboard only when
+a real interactive terminal is available; non-interactive installs skip
+this optional step.
+
+
+**Auto Maximum** sets the worker Docker RAM ceiling to approximately
+85% of the target Linux host's total physical RAM (minimum 2 GiB reserved for
+the host), and permits all host CPU cores. This is a *hard ceiling*, not RAM
+preallocation. It does **not** shrink based on `MemAvailable` at installation:
+a running Bitcoin miner or other temporary process cannot permanently limit
+the worker to the memory that was free at setup. Before actually loading a
+GGUF model, the worker checks live host memory availability and its own cgroup
+headroom. If another process is consuming RAM, the worker may wait/fail the
+model test until resources become available. Model tests previously marked
+failed can be explicitly retried by saving the model policy again.
+
+**Auto Shared** reserves approximately 45% of total RAM (at least 2 GiB) for
+other workloads and limits worker CPU to 65%. For machines where a memory-heavy
+miner or other services may run concurrently, prefer Auto Shared or Manual:
+even an 85% cap does **not** guarantee the host cannot run out of memory if
+other containers/processes also consume large amounts. The worker is marked as
+a preferred OOM-kill candidate, but that is not a substitute for coordinating
+total memory budgets across services.
+
+
+### Unattended Linux worker updates
+
+New production workers configure a per-user **systemd timer** automatically
+during the one-line installation. It checks the trusted GHCR worker `latest`
+image four times daily, using Docker **on the host only**. Nothing grants the
+worker container access to the host Docker socket. An unattended update runs
+only while the worker is idle, preserving model downloads, identity, data and
+enrollment policy through the existing named volumes. It verifies the worker
+reconnects within 3 minutes and rolls back to the previous image if not.
+A previously failed image is skipped until GHCR publishes a different image.
+The updater does not modify the proxy or unrelated Compose projects.
+
+The installer may ask for **one-time sudo approval** to run
+`loginctl enable-linger USER`, keeping the user's systemd timers active after
+the SSH session closes. If the host cannot provide systemd, linger, or Docker
+permissions, setup reports that automatic updates are **not enabled** rather
+than silently claiming success. On Linux without systemd, configure a
+supported host scheduler separately.
+
+For a **previously installed** production worker, add the updater once
+without removing the worker's volumes. From the worker's own Compose
+directory, using the same public HTTPS proxy origin the worker already
+uses:
+
+```bash
+ORIGIN="$(sed -n 's/^SIMPLEAI_PROXY_URL=//p' .env)"
+curl -fsSL "$ORIGIN/compute/auto-update.sh" | bash -s -- --install "$(basename "$PWD")" "$ORIGIN"
+```
+
+To also migrate an older Auto Maximum installation from its outdated,
+one-time-free-RAM limit, append `--recalculate-auto-max` to the above
+command. This recalculates the maximum cap from physical host RAM, recreates
+only that worker's container and checks reconnection; the former limit is
+restored if it fails. Use the flag only if the worker was previously created
+with **Auto Maximum**, not Manual or Auto Shared. A new auto installation
+already uses the corrected formula and does not need migration.
+
+Check the schedule:
+`systemctl --user status simpleai-compute-update@WORKER_NAME.timer`.
+
+Review updater activity:
+`journalctl --user -u simpleai-compute-update@WORKER_NAME.service -n 60`.
+
+Disable automatic updates without stopping the worker:
+`systemctl --user disable --now simpleai-compute-update@WORKER_NAME.timer`.
+
+The host always retains a Docker memory ceiling. Automatic **image**
+updates intentionally do **not** silently modify previously chosen CPU/RAM
+settings. Major feature changes can still require manual configuration.
+If an update begins just as an external request arrives, that request can be
+interrupted; the timer checks idle state twice to minimize this risk.
+
+Auto profiles also set a model-storage budget based on free space in Docker's
+filesystem (with disk headroom). These are conservative resource budgets, not
+guarantees that any particular model will fit. The auto values are stored
+in the worker's private `.env` and remain fixed until explicitly changed or
+a new installation is performed; they are not dynamically recalculated.
 
 ### Test a second worker on the same computer
 
 Update and rebuild the isolated deploy/home-compute-test.compose.yml stack.
 Open http://127.0.0.1:18180/admin/compute-setup on that computer. Set a
 distinct name, e.g. oblak-vps-1, and use the default internal HTTPS worker
-URL. Copy the generated one-line command and enter its code on the SAME host.
+URL. Copy the generated one-line command (which includes its code) to the SAME host.
 It uses the existing home-test image, the public staging CA and network,
 but gets its own Compose project, model cache and identity. The original
 home-test-worker and production services are not changed by this installer.

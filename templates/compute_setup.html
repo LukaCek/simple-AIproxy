@@ -44,7 +44,7 @@
         </label>
       </div>
     </div>
-    <p id="profile-hint" class="text-xs text-slate-600">Auto Maximum measures the actual Linux host's free RAM, CPU and Docker storage. It leaves a safety reserve. Switch to Manual for exact limits.</p>
+    <p id="profile-hint" class="text-xs text-slate-600">Auto Maximum: a stable Docker ceiling based on 85% of total physical RAM (at least 2 GiB left for host processes), not the temporarily free RAM. The worker checks live free RAM before loading models. It uses all CPU cores. For hosts that also run miners or other heavy workloads, choose Auto Shared or Manual.</p>
     <p class="text-xs text-amber-800">New workers cannot process private prompts unless you explicitly enable trust after enrollment. Keep the one-time code confidential.</p>
     <div id="status" role="status" aria-live="polite" class="hidden rounded-lg bg-slate-100 p-3 text-sm"></div>
     <button id="generate" class="rounded-lg bg-slate-900 px-4 py-3 text-sm font-medium text-white" type="submit">Create one-line installation</button>
@@ -59,6 +59,8 @@
       <button id="copy-command" type="button" class="rounded-lg border px-3 py-2 text-xs">Copy</button>
     </div>
     <p class="text-xs text-amber-800"><strong>Secret command:</strong> The one-time enrollment token is embedded in this command and may remain in terminal history, clipboard managers or process listings. Use it only on machines you control. It expires after 15 minutes or first enrollment; never publish or share it.</p>
+    <p class="text-sm">After the worker connects, the installer automatically opens the interactive TUI in your terminal. Press <code>q</code> to exit. Any time later, open it from any directory with <code>simpleai-tui</code> (or <code>simpleai-tui WORKER_NAME</code> if multiple workers are installed). Open a new shell if <code>~/.local/bin</code> was not already on your PATH.</p>
+    <p class="text-sm">Automatic updates are configured during installation on Linux hosts with systemd: four checks daily, no SSH session required, and rollback to the previous Docker image if reconnection fails. A one-time <code>sudo</code> prompt may be needed to keep user timers running after logout. Existing workers can opt in without reinstalling or losing models.</p>
     <p class="text-xs text-slate-600">For the isolated home test, run this on the same Linux machine where <code>simpleai-home-test</code> is already running. The installer uses its local CA/network and builds a separate worker project. For real VPS deployments, use the public HTTPS address.</p>
     <p class="text-sm">2. Once completed, open <a href="/admin/compute-nodes" class="underline">Compute Nodes</a>, verify the new name appears independently, then test a harmless public prompt.</p>
     <details class="rounded-lg border p-3 text-sm">
@@ -102,7 +104,9 @@
     $("manual-fields").style.display = manual ? "contents" : "none";
     $("profile-hint").textContent = manual ?
       "Exact CPU/RAM/disk limits. Defaults suit a small second worker on this computer." :
-      "Resources will be measured on the target Linux host by the installer, not guessed by the proxy.";
+      ($("profile").value === "auto_max" ?
+       "Auto Maximum: up to ~85% of TOTAL host RAM (at least 2 GiB left for other processes); all CPU cores. This is a Docker hard ceiling, not preallocated RAM. Running other memory-heavy services can still exhaust the host." :
+       "Auto Shared: up to ~55% of TOTAL host RAM (at least 2 GiB left for other processes); ~65% CPU. The worker checks live free RAM before model startup. Values are fixed until manually updated.");
   }
   $("profile").addEventListener("change", syncProfile);
   syncProfile();

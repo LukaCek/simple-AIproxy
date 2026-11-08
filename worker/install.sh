@@ -121,16 +121,23 @@ if profile != 'manual':
         free = shutil.disk_usage(root).free
     except OSError:
         free = shutil.disk_usage('/').free
-    # Conservative caps, based on actual free host memory and Docker storage.
+    # A stable Docker hard cap is based on TOTAL host RAM, not MemAvailable
+    # sampled once while another workload (e.g. a miner) is running.
+    # Keep 45% host reserve for Shared or 15% (minimum 2 GiB) for Maximum.
+    # This is a *ceiling*, not preallocated RAM. The worker independently
+    # checks real-time host MemAvailable before loading each model.
+    def auto_ram_gib(total_bytes, shared):
+        reserve = max(2 * gib, total_bytes * (0.45 if shared else 0.15))
+        return math.floor(max(0, total_bytes - reserve) / gib * 4) / 4
+
     share = profile == 'auto_shared'
-    fraction = 0.55 if share else 0.78
-    memory = min(total * fraction, max(0, available - (1.5 if share else 1) * gib))
-    memory_gb = math.floor(memory / gib * 4) / 4
+    memory_gb = auto_ram_gib(total, share)
     if memory_gb < 2:
-        raise SystemExit('Insufficient free host RAM: auto profile requires 2 GiB. '
-                         'Free memory or select a custom/manual limit.')
-    cpu_fraction = 0.65 if share else 0.90
-    cpu_limit = max(0.5, math.floor(cpus * cpu_fraction * 2) / 2)
+        raise SystemExit('Host has too little physical RAM for a safe auto worker. '
+                         'Auto requires at least 2 GiB for the worker plus host reserve.')
+    # Auto Maximum can use all physical CPU cores; Linux still schedules other
+    # services fairly. Shared deliberately caps CPU at 65% of host capacity.
+    cpu_limit = max(0.5, math.floor(cpus * 0.65 * 2) / 2) if share else float(cpus)
     threads = max(1, min(cpus, math.ceil(cpu_limit)))
     # Leave at least 4 GiB on the Docker volume filesystem; disk budget is
     # application-enforced and not an OS-level quota.
@@ -142,8 +149,17 @@ if profile != 'manual':
             f'WORKER_CPU_LIMIT={cpu_limit}\n'
             f'WORKER_THREADS={threads}\n'
             f'WORKER_DISK_BUDGET_GB={disk_gb}\n')
-    print(f'Auto limits: RAM {memory_gb} GiB, CPU {cpu_limit}, '
-          f'threads {threads}, disk budget {disk_gb} GiB', file=sys.stderr)
+    print(f'Auto {"Shared" if share else "Maximum"}: physical RAM {total / gib:.2f} GiB; '
+          f'Docker RAM ceiling {memory_gb:.2f} GiB; '
+          f'host reserve {total / gib - memory_gb:.2f} GiB; '
+          f'CPU {cpu_limit:g}; threads {threads}; '
+          f'model disk budget {disk_gb} GiB', file=sys.stderr)
+    if available < (memory_gb + 1) * gib:
+        print(f'NOTE: Current available host RAM is only {available / gib:.2f} GiB. '
+              'Auto RAM ceilings do not shrink because another process is busy. '
+              'The worker will check live available RAM before loading models; '
+              'do not run competing heavy workloads without reducing their budgets.',
+              file=sys.stderr)
 
 target.mkdir(mode=0o700)
 for filename, content in [('docker-compose.yml', compose), ('.env', env)]:
@@ -207,3 +223,136 @@ info "Identity preserved in its own Docker volume; one-time setup code removed."
 info "Check Compute Nodes in the proxy; public requests are allowed by default,"
 info "but PRIVATE access remains disabled until explicitly approved."
 info "Inspect logs: cd '$INSTALL_DIR' && docker compose logs --tail=80 compute-worker"
+
+# Host-side updater: no Docker socket is mounted into the worker container.
+# A user systemd timer survives SSH logouts via one-time linger approval.
+# Skip auto updates for the isolated local-test image.
+if grep -Fq 'simpleai-home-test/worker:local' docker-compose.yml; then
+  info "Local-test image: automatic production-image updates are disabled."
+else
+  info "Configuring unattended updates (this may request one-time sudo for systemd linger)..."
+  if curl -fsSL --connect-timeout 10 --max-time 30 "$PROXY_ORIGIN/compute/auto-update.sh" |
+       bash -s -- --install "$(basename "$INSTALL_DIR")" "$PROXY_ORIGIN"; then
+    info "Automatic updates active: checks four times per day with rollback on failure."
+  else
+    info "WARNING: automatic updates are NOT active. Worker still runs normally."
+    info "Review systemd setup above; automated updates must be enabled once."
+  fi
+fi
+
+
+# Install an unprivileged, one-word launcher. It reads worker folders from the
+# existing per-user registry; no credentials or Docker socket are embedded.
+install_tui_shortcut() {
+  local bin_dir="$HOME/.local/bin"
+  local launcher="$bin_dir/simpleai-tui"
+  local tmp
+  mkdir -p -- "$bin_dir"
+  if [[ -e "$launcher" || -L "$launcher" ]]; then
+    if ! [[ -f "$launcher" ]] || ! grep -Fq '# SimpleAI Compute Worker managed TUI shortcut' "$launcher"; then
+      info "Shortcut $launcher already exists and is not managed by SimpleAI; leaving it unchanged."
+      return 1
+    fi
+  fi
+  tmp="$(mktemp "$bin_dir/.simpleai-tui.XXXXXXXX")" || return 1
+  cat > "$tmp" <<'SIMPLEAI_TUI_LAUNCHER'
+#!/usr/bin/env bash
+# SimpleAI Compute Worker managed TUI shortcut
+set -euo pipefail
+
+root="$HOME/.local/share/simpleai-compute"
+usage() {
+  printf 'Usage: simpleai-tui [worker-name] [--once]\n' >&2
+}
+name=''
+once=0
+for arg in "$@"; do
+  case "$arg" in
+    --once) once=1 ;;
+    --help|-h) usage; exit 0 ;;
+    -*)
+      usage
+      exit 2
+      ;;
+    *)
+      if [[ -n "$name" ]]; then usage; exit 2; fi
+      name="$arg"
+      ;;
+  esac
+done
+
+if [[ -n "$name" ]]; then
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+    printf 'Invalid worker name.\n' >&2
+    exit 2
+  fi
+  dir="$root/$name"
+  if [[ ! -f "$dir/docker-compose.yml" ]]; then
+    printf 'Worker "%s" not installed at %s\n' "$name" "$dir" >&2
+    exit 1
+  fi
+else
+  shopt -s nullglob
+  configs=( "$root"/*/docker-compose.yml )
+  if (( ${#configs[@]} == 0 )); then
+    printf 'No installed SimpleAI Compute Workers found.\n' >&2
+    exit 1
+  fi
+  if (( ${#configs[@]} > 1 )); then
+    printf 'More than one worker is installed. Choose one:\n' >&2
+    for config in "${configs[@]}"; do
+      printf '  simpleai-tui %s\n' "$(basename "$(dirname "$config")")" >&2
+    done
+    exit 2
+  fi
+  dir="$(dirname "${configs[0]}")"
+fi
+
+cd "$dir"
+if (( once )); then
+  exec docker compose exec -T compute-worker python tui.py --once
+fi
+if [[ ! -t 0 || ! -t 1 ]]; then
+  printf 'Interactive dashboard requires a terminal; use --once for a snapshot.\n' >&2
+  exit 2
+fi
+exec docker compose exec compute-worker python tui.py
+SIMPLEAI_TUI_LAUNCHER
+  chmod 700 "$tmp"
+  mv -f -- "$tmp" "$launcher"
+
+  # A new Ubuntu account may not have ~/.local/bin on PATH until the next
+  # login. Add a guarded PATH stanza for *future* Bash/Zsh sessions only.
+  if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+    local rc
+    case "${SHELL:-}" in
+      */zsh) rc="$HOME/.zshrc" ;;
+      *) rc="$HOME/.bashrc" ;;
+    esac
+    if [[ -f "$rc" ]] && ! grep -Fq '# SimpleAI Compute Worker TUI PATH' "$rc"; then
+      printf '\n# SimpleAI Compute Worker TUI PATH\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
+    elif [[ ! -e "$rc" ]]; then
+      printf '# SimpleAI Compute Worker TUI PATH\nexport PATH="$HOME/.local/bin:$PATH"\n' > "$rc"
+    fi
+    info "Open a NEW shell for the 'simpleai-tui' command; this shell's PATH cannot be changed by an installer."
+  fi
+  return 0
+}
+
+if install_tui_shortcut; then
+  info "TUI shortcut installed: simpleai-tui"
+  info "Later, from any directory, run 'simpleai-tui' (or 'simpleai-tui <worker-name>')."
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    info "Opening interactive TUI automatically. Press q to return to the shell."
+    # The installer was piped to Bash. Reopen the real terminal: Compose and
+    # the TUI both require stdin/stdout to be TTYs, not the curl input pipe.
+    if ! "$HOME/.local/bin/simpleai-tui" "$(basename "$INSTALL_DIR")" </dev/tty >/dev/tty 2>&1; then
+      info "Could not open interactive TUI; try '$HOME/.local/bin/simpleai-tui' manually."
+    fi
+  else
+    info "No interactive terminal available; open the TUI later with 'simpleai-tui'."
+  fi
+else
+  info "Warning: worker registered, but shortcut installation was skipped."
+  info "TUI remains available: cd '$INSTALL_DIR' && docker compose exec compute-worker python tui.py"
+fi

@@ -21,7 +21,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 import main_impl as core
-from compute_catalog import CATALOG
+from compute_catalog import (CATALOG, BUILTIN_CATALOG, MAX_CATALOG_MODELS,
+                             apply_custom_catalog, validate_model_entry)
+from compute_hf_catalog import lookup_gguf_models
 from compute_placement import models_for_node
 from compute_scheduler import auto_candidates as select_auto_candidates
 from compute_setup import compose_text, env_text, validate_setup
@@ -139,6 +141,11 @@ def _setup() -> None:
             id INTEGER PRIMARY KEY CHECK(id=1),
             placement_mode TEXT NOT NULL DEFAULT 'manual'
         );
+        CREATE TABLE IF NOT EXISTS ComputeCustomModels (
+            id TEXT PRIMARY KEY,
+            definition_json TEXT NOT NULL,
+            added_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS ComputeEvents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             node_id TEXT NOT NULL,
@@ -153,6 +160,11 @@ def _setup() -> None:
         """)
         db.execute("INSERT OR IGNORE INTO ComputePolicy(id,revision,models_json,updated_at) VALUES(1,1,'[]',?)", (int(time.time()),))
         db.execute("INSERT OR IGNORE INTO ComputeSettings(id,placement_mode) VALUES(1,'manual')")
+        # Keep the module's imported shared dict alive. Restarting the proxy
+        # rebuilds the same catalog from durable DB records, not Python source.
+        rows = db.execute("SELECT id, definition_json FROM ComputeCustomModels").fetchall()
+        custom = {row["id"]: json.loads(row["definition_json"]) for row in rows}
+        apply_custom_catalog(custom)
 
 
 
@@ -164,7 +176,7 @@ _EVENT_TYPES = frozenset({
     "enrolled", "connected", "disconnected", "policy_sent", "model_test",
     "model_loaded", "model_unloaded", "operation_started", "operation_succeeded",
     "operation_failed", "private_access_enabled", "private_access_disabled",
-    "revoked",
+    "revoked", "removed",
 })
 _MODEL_STATES = frozenset({"untested", "testing", "supported", "unsupported", "error"})
 
@@ -230,7 +242,10 @@ def _model_policy() -> dict[str, Any]:
     if not isinstance(selected, list):
         selected = []
     return {"type": "policy", "revision": int(row["revision"]) if row else 1,
-            "models": [mid for mid in selected if isinstance(mid, str) and mid in CATALOG]}
+            "models": [mid for mid in selected if isinstance(mid, str) and mid in CATALOG],
+            # The full catalog is safe metadata, NOT a command to run an
+            # arbitrary remote binary or download URL. Worker revalidates it.
+            "catalog": {mid: dict(info) for mid, info in CATALOG.items()}}
 
 
 def _placement_mode() -> str:
@@ -259,7 +274,8 @@ def _node_policy(node_id: str, global_policy: dict[str, Any] | None = None) -> d
 
 async def _send_node_policy(conn: "NodeConnection") -> None:
     policy = _node_policy(conn.node_id)
-    signature = (policy["revision"], tuple(policy["models"]))
+    signature = (policy["revision"], tuple(policy["models"]),
+                 hashlib.sha256(json.dumps(policy["catalog"], sort_keys=True).encode()).hexdigest())
     if signature == conn.last_policy_signature:
         return
     if policy["revision"] <= 1 and not policy["models"]:
@@ -923,7 +939,8 @@ async def revoke_node(node_id: str):
 
 @router.get("/admin/api/compute/catalog", dependencies=[Depends(core.verify_admin)])
 async def catalog() -> dict[str, Any]:
-    return {"models": CATALOG}
+    _setup()
+    return {"models": CATALOG, "built_in": list(BUILTIN_CATALOG)}
 
 
 @router.get("/admin/api/compute/model-policy", dependencies=[Depends(core.verify_admin)])
@@ -935,6 +952,7 @@ async def read_model_policy() -> dict[str, Any]:
 async def change_model_policy(request: Request) -> dict[str, Any]:
     data = await request.json()
     selected = data.get("models") if isinstance(data, dict) else None
+    _setup()
     if (not isinstance(selected, list) or len(selected) > len(CATALOG)
             or any(not isinstance(mid, str) or mid not in CATALOG for mid in selected)
             or len(set(selected)) != len(selected)):
@@ -983,7 +1001,8 @@ async def start_operation(node_id: str, request: Request):
     data = await request.json()
     action = str(data.get("action") or "")
     model = str(data.get("model") or "")
-    if action not in ("install", "load", "unload", "delete") or model not in CATALOG:
+    _setup()
+    if action not in ("install", "load", "unload", "delete", "test") or model not in CATALOG:
         raise HTTPException(400, "Invalid model or operation")
     if node_id not in _connections:
         raise HTTPException(409, "Node is offline")

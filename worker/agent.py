@@ -263,10 +263,10 @@ class Worker:
 
     def _apply_remote_catalog(self, payload):
         if payload is None:
-            return
+            return False
         fresh = self._validated_catalog(payload)
         if fresh == CATALOG:
-            return
+            return False
         changed = {mid for mid in set(CATALOG) | set(fresh)
                    if CATALOG.get(mid) != fresh.get(mid)}
         CATALOG.clear()
@@ -280,6 +280,7 @@ class Worker:
         self._save_catalog()
         self._save_state()
         self._publish_snapshot()
+        return True
 
     def _publish_snapshot(self):
         """Local TUI observability only: never serialize credentials or prompts."""
@@ -490,7 +491,7 @@ class Worker:
             return
         try:
             async with self.lock:
-                self._apply_remote_catalog(message.get("catalog"))
+                catalog_changed = self._apply_remote_catalog(message.get("catalog"))
         except (ValueError, OSError, TypeError):
             # Never allow an unpinned or malformed remote download target.
             return
@@ -505,7 +506,11 @@ class Worker:
         if previous != selected:
             # A node may get a new model assignment at the same global revision.
             self.policy_generation += 1
-        self.force_retest = previous == selected and old_version not in (0, version)
+        # Re-saving an unchanged policy deliberately re-tests; merely
+        # inspecting/adding a disabled catalog entry must not re-run expensive
+        # benchmarks for every already verified model.
+        self.force_retest = (not catalog_changed and previous == selected
+                             and old_version not in (0, version))
         if self.reconcile_task is None or self.reconcile_task.done():
             self.reconcile_task = asyncio.create_task(self.reconcile(ws))
 

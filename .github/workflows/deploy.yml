@@ -112,7 +112,7 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           port: ${{ secrets.DEPLOY_PORT }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          source: "server_deployment/docker-compose.yml,server_deployment/update.sh"
+          source: "server_deployment/docker-compose.yml,server_deployment/update.sh,server_deployment/backup_release.py,server_deployment/check_release.py"
           target: ${{ secrets.DEPLOY_PATH }}
           strip_components: 1
           overwrite: true

@@ -696,6 +696,15 @@ async def linux_auto_update_script():
     })
 
 
+@router.get("/compute/enable-auto-updates.sh", response_class=PlainTextResponse)
+async def legacy_worker_auto_update_setup_script():
+    """Public, token-free helper for adopting existing production workers."""
+    data = (Path(__file__).parent / "worker" / "enable-auto-updates.sh").read_text()
+    return PlainTextResponse(data, headers={
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    })
+
+
 @router.post("/compute/bootstrap")
 async def claim_install_plan(request: Request):
     # The short-lived random token authorizes access to pre-approved setup,

@@ -494,3 +494,66 @@ with open(os.environ["MOCK_ACTIONS"], "a") as f:
     assert "Persistent=true" in timer
     assert "OnCalendar=" in timer
     assert "enable --now simpleai-compute-update@demo.timer" in actions.read_text()
+
+
+def test_installer_bootstraps_docker_without_breaking_existing_working_docker(tmp_path):
+    """Execute real installer host preflight with a mocked working Docker CLI."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    original = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    assert "SimpleAI Compute Worker — isolated Linux installation" in original
+    prefix = original.split('info "SimpleAI Compute Worker — isolated Linux installation"', 1)[0]
+    script = tmp_path / "preflight.sh"
+    script.write_text(prefix + '\nprintf "BOOTSTRAP_PASSED\\n"\n')
+    mock = tmp_path / "bin"
+    mock.mkdir()
+    log = tmp_path / "root-changes.log"
+    docker = mock / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        "case \"$1 $2\" in\n"
+        "  'compose version'|'info ' ) exit 0 ;;\n"
+        "  * ) exit 99 ;;\n"
+        "esac\n"
+    )
+    docker.chmod(0o755)
+    for tool in ("sudo", "systemctl", "pacman", "apt-get", "dnf", "usermod", "sg"):
+        stub = mock / tool
+        stub.write_text("#!/bin/sh\nprintf '%s\\n' '" + tool +
+                        "' >> \"$SIMPLEAI_TEST_CHANGES\"\nexit 99\n")
+        stub.chmod(0o755)
+    env = {**os.environ, "HOME": str(tmp_path),
+           "PATH": str(mock) + os.pathsep + os.environ.get("PATH", ""),
+           "SIMPLEAI_TEST_CHANGES": str(log)}
+    finished = subprocess.run(["bash", str(script), "https://proxy.example.com"],
+                              env=env, capture_output=True, text=True, timeout=15)
+    assert finished.returncode == 0, finished.stderr
+    assert "BOOTSTRAP_PASSED" in finished.stdout
+    assert not log.exists(), "Existing working Docker must never trigger sudo/pacman/systemctl"
+
+
+def test_installer_host_bootstrap_has_explicit_security_boundaries():
+    """Check fail-closed defaults for privileged operations and distro support."""
+    from pathlib import Path
+    installer = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+
+    assert 'install_host_packages\nstart_host_docker\nensure_docker_user_access' in installer
+    assert installer.index("install_host_packages\nstart_host_docker") < installer.index(
+        "ENROLLMENT_CODE=\"$2\""), "Never claim a short-lived code before host prerequisites"
+    assert "pacman -S --needed --noconfirm" in installer
+    assert "No -Sy: never risk a partial upgrade" in installer
+    assert "apt-get update" in installer and "apt-get install -y" in installer
+    assert "dnf install -y" in installer
+    assert "systemctl enable --now docker.service" in installer
+    assert "root-equivalent privileges" in installer
+    assert "Type YES" in installer
+    assert "usermod -aG docker" in installer
+    assert 'exec sg docker -c "$cmd"' in installer
+    assert 'SIMPLEAI_DOCKER_GROUP_REENTRY' in installer
+    assert "sudo -v </dev/tty" in installer
+    assert "DOCKER_HOST is set" in installer
+    assert "$base.sha256" in installer
+    assert '[[ "$expected" =~ ^[a-fA-F0-9]{64}$ && "$expected" == "$actual" ]]' in installer
+    assert 'Docker daemon is unavailable. Start Docker or configure access' not in installer

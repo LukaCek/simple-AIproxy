@@ -216,3 +216,79 @@ def test_wizard_explains_physical_host_ram_budget_and_heavy_loads():
     assert "85% of total physical RAM" in wizard
     assert "Running other memory-heavy services" in wizard
     assert "Auto Shared" in wizard
+
+
+def test_one_word_tui_shortcut_works_from_any_directory(tmp_path, monkeypatch):
+    """Check generated launcher using a stub Docker command, not host Docker."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    launcher = script.split("cat > \"$tmp\" <<'SIMPLEAI_TUI_LAUNCHER'\n", 1)[1].split(
+        "\nSIMPLEAI_TUI_LAUNCHER\n", 1)[0]
+    assert "WORKER_ENROLLMENT_TOKEN" not in launcher
+    assert "node_secret" not in launcher
+
+    home = tmp_path / "home"
+    worker_root = home / ".local/share/simpleai-compute"
+    worker_root.mkdir(parents=True)
+    first = worker_root / "first-node"
+    first.mkdir()
+    (first / "docker-compose.yml").write_text("services:\n  compute-worker: {}\n")
+    launcher_file = tmp_path / "simpleai-tui"
+    launcher_file.write_text(launcher)
+    launcher_file.chmod(0o700)
+
+    mock_dir = tmp_path / "mock-bin"
+    mock_dir.mkdir()
+    mock_docker = mock_dir / "docker"
+    mock_docker.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$*\" > \"$SIMPLEAI_TUI_TEST_LOG\"\n"
+    )
+    mock_docker.chmod(0o700)
+    log = tmp_path / "docker.log"
+    env = {**os.environ, "HOME": str(home),
+           "PATH": str(mock_dir) + os.pathsep + os.environ.get("PATH", ""),
+           "SIMPLEAI_TUI_TEST_LOG": str(log)}
+    assert subprocess.run(["bash", "-n", str(launcher_file)], check=False).returncode == 0
+
+    # One installed worker: no name or cd needed.
+    single = subprocess.run([str(launcher_file), "--once"], cwd=tmp_path,
+                            env=env, capture_output=True, text=True)
+    assert single.returncode == 0, single.stderr
+    assert log.read_text().splitlines() == [
+        str(first), "compose exec -T compute-worker python tui.py --once"
+    ]
+
+    # Multiple installed workers: require the explicit name, never guess.
+    second = worker_root / "second-node"
+    second.mkdir()
+    (second / "docker-compose.yml").write_text("services:\n  compute-worker: {}\n")
+    ambiguous = subprocess.run([str(launcher_file), "--once"], cwd=tmp_path,
+                               env=env, capture_output=True, text=True)
+    assert ambiguous.returncode == 2
+    assert "simpleai-tui first-node" in ambiguous.stderr
+    assert "simpleai-tui second-node" in ambiguous.stderr
+
+    specific = subprocess.run([str(launcher_file), "second-node", "--once"],
+                              cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert specific.returncode == 0, specific.stderr
+    assert log.read_text().splitlines()[0] == str(second)
+
+    path_traversal = subprocess.run([str(launcher_file), "../other", "--once"],
+                                    cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert path_traversal.returncode != 0
+    assert "Invalid worker name" in path_traversal.stderr
+
+
+def test_installer_auto_opens_live_tui_and_installs_private_shortcut():
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "worker" / "install.sh").read_text()
+    assert 'local launcher="$bin_dir/simpleai-tui"' in script
+    assert 'chmod 700 "$tmp"' in script
+    assert 'mv -f -- "$tmp" "$launcher"' in script
+    assert '"$HOME/.local/bin/simpleai-tui" "$(basename "$INSTALL_DIR")" </dev/tty >/dev/tty 2>&1' in script
+    assert 'docker compose exec compute-worker python tui.py' in script
+    assert 'docker compose exec -T compute-worker python tui.py --once' in script

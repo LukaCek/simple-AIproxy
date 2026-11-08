@@ -584,6 +584,12 @@ def test_installer_bootstraps_fresh_arch_packages_then_starts_daemon(tmp_path):
     os_release.write_text("ID=arch\nID_LIKE=arch\n")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    # Keep the runner's real Docker CLI out of PATH: emulate a fresh host.
+    import shutil
+    for command in ("uname", "curl", "python3", "cp", "chmod", "touch"):
+        target = shutil.which(command)
+        assert target
+        (bin_dir / command).symlink_to(target)
     docker_template = tmp_path / "docker-template"
     docker_template.write_text(
         "#!/bin/sh\n"
@@ -610,13 +616,13 @@ def test_installer_bootstraps_fresh_arch_packages_then_starts_daemon(tmp_path):
     ready = tmp_path / "docker.started"
     events = tmp_path / "events.log"
     env = {**os.environ, "HOME": str(tmp_path),
-           "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+           "PATH": str(bin_dir),
            "SIMPLEAI_TEST_OS_RELEASE": str(os_release),
            "SIMPLEAI_TEST_BIN": str(bin_dir),
            "SIMPLEAI_TEST_READY": str(ready),
            "SIMPLEAI_TEST_DOCKER_TEMPLATE": str(docker_template),
            "SIMPLEAI_TEST_EVENTS": str(events)}
-    result = subprocess.run(["bash", str(script), "https://proxy.example.com"],
+    result = subprocess.run(["/bin/bash", str(script), "https://proxy.example.com"],
                             env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert "BOOTSTRAP_PASSED" in result.stdout

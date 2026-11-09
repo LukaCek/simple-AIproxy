@@ -190,3 +190,83 @@ def test_ui_mcp_page_requires_admin(client):
     r=client.get("/admin/mcp",auth=ADMIN)
     assert r.status_code==200
     assert "/mcp" in r.text
+
+
+def test_real_gguf_policy_and_group_actions_reuse_existing_safe_handlers(client,monkeypatch):
+    from compute_catalog import CATALOG
+    from compute_plane import _model_policy
+    monkeypatch.setattr(core,"config_data",{
+        "providers":[{"name":"local-provider","models":["test-model"],"api_key":"PRIVATE-KEY"}],
+        "groups":{},"model_profiles":{}})
+    key=token(client,"operate")["token"]
+    group=call(client,key,"save_group",
+               name="test-routing",description="One existing model",
+               strategy="fallback",
+               members=[{"provider":"local-provider","model":"test-model"}],
+               confirm=True)
+    assert group["result"]["isError"] is False,group
+    assert "PRIVATE-KEY" not in json.dumps(group)
+    invalid=call(client,key,"save_group",
+                 name="bad",strategy="fallback",
+                 members=[{"provider":"missing","model":"model"}],confirm=True)
+    assert invalid["result"]["isError"] is True
+    chosen=next(iter(CATALOG))
+    policy=call(client,key,"set_model_policy",models=[chosen],confirm=True)
+    assert policy["result"]["isError"] is False,policy
+    assert chosen in _model_policy()["models"]
+    placement=call(client,key,"set_placement",mode="auto",confirm=True)
+    assert placement["result"]["isError"] is False,placement
+    assert placement["result"]["structuredContent"]["mode"]=="auto"
+
+
+def test_playground_test_never_leaves_temporary_api_key_in_storage(client):
+    key=token(client,"operate")["token"]
+    before=client.get("/admin/keys",auth=ADMIN)
+    with core.get_db_connection() as db:
+        count_before=db.execute("SELECT count(*) FROM API_Keys").fetchone()[0]
+    # Invalid model returns an ordinary error; it must not leak the temporary
+    # bearer key or turn an MCP call into a permanent API credential.
+    result=call(client,key,"run_playground",
+                model="model-that-does-not-exist",
+                prompt="Harmless integration smoke test", max_tokens=16,confirm=True)
+    assert result["result"]["isError"] is False,result
+    record=result["result"]["structuredContent"]
+    assert record["status_code"] != 200
+    assert "api_key" not in json.dumps(record)
+    with core.get_db_connection() as db:
+        count_after=db.execute("SELECT count(*) FROM API_Keys").fetchone()[0]
+        assert count_before==count_after
+        assert db.execute("SELECT count(*) FROM API_Keys WHERE name='MCP one-time Playground test'").fetchone()[0]==0
+
+
+def test_manage_worker_model_is_permissioned_and_cannot_delete_without_extra_confirmation(client):
+    key=token(client,"operate")["token"]
+    # Even before the lookup sees an offline node, destructive operations
+    # require explicit second confirmation.
+    response=call(client,key,"worker_model_action",
+                  node_id="a"*32,model="qwen35-0.8b-q4",
+                  action="delete",confirm=True)
+    assert response["result"]["isError"] is True
+    read=token(client,"read")["token"]
+    rejected=call(client,read,"worker_model_action",
+                  node_id="a"*32,model="qwen35-0.8b-q4",
+                  action="test",confirm=True)
+    assert "error" in rejected
+    assert rejected["error"]["message"]=="This MCP key is read-only"
+
+
+def test_worker_provided_metadata_does_not_leak_through_mcp(client):
+    import compute_plane
+    compute_plane._setup()
+    with core.get_db_connection() as db:
+        db.execute("INSERT INTO ComputeNodes(id,name,secret_hash,created_at,hardware_json,models_json) "
+                   "VALUES(?,?,?,?,?,?)",
+                   ("a"*32,"Vid-PC","deadbeef",int(time.time()),
+                    json.dumps({"arch":"token=VERY_SECRET_VALUE","backend":"safe","cpus":4}),
+                    json.dumps({"active":"api_key=VERY_SECRET_VALUE","installed":[],
+                                "policy_revision":{"private":"PRIVATE_STUFF"}})))
+    key=token(client)["token"]
+    result=call(client,key,"list_workers")
+    output=json.dumps(result)
+    assert "VERY_SECRET_VALUE" not in output
+    assert "PRIVATE_STUFF" not in output

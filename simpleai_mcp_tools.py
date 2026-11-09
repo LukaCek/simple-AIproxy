@@ -126,6 +126,11 @@ def _code(value: object) -> str:
     return error_code(value)
 
 
+def compute_catalog_ids() -> set[str]:
+    import compute_plane
+    return set(compute_plane.CATALOG)
+
+
 def _public_worker(node: dict) -> dict:
     from compute_plane import _public_node
     d = _public_node(node)
@@ -137,14 +142,26 @@ def _public_worker(node: dict) -> dict:
         "online": bool(d.get("online")), "revoked": bool(d.get("revoked")),
         "allow_private": bool(d.get("allow_private")),
         "last_seen": d.get("last_seen"),
-        "hardware": {key: hardware.get(key) for key in
-                     ("arch","os","cpus","memory_limit_bytes","memory_available_bytes",
-                      "disk_free_bytes","backend","catalog_protocol","build_revision")},
-        "models": {"active": models.get("active"), "ready": bool(models.get("ready")),
+        "hardware": {
+            "arch": _read_safe(hardware.get("arch"), 40),
+            "os": _read_safe(hardware.get("os"), 40),
+            "cpus": hardware.get("cpus"),
+            "memory_limit_bytes": hardware.get("memory_limit_bytes"),
+            "memory_available_bytes": hardware.get("memory_available_bytes"),
+            "disk_free_bytes": hardware.get("disk_free_bytes"),
+            "backend": _read_safe(hardware.get("backend"), 50),
+            "catalog_protocol": hardware.get("catalog_protocol")
+                if type(hardware.get("catalog_protocol")) is int else None,
+            "build_revision": _read_safe(hardware.get("build_revision"), 64),
+        },
+        "models": {"active": models.get("active")
+                       if models.get("active") in compute_catalog_ids() else None,
+                   "ready": bool(models.get("ready")),
                    "installed": models.get("installed", []),
                    "busy": bool(models.get("busy")), "disk_limit_bytes": models.get("disk_limit_bytes"),
                    "disk_used_bytes": models.get("disk_used_bytes"),
-                   "policy_revision": models.get("policy_revision"),
+                   "policy_revision": models.get("policy_revision")
+                       if type(models.get("policy_revision")) is int else None,
                    "capabilities": {mid: {
                        "status": state.get("status"), "reason_code": _code(state.get("reason")),
                        "test_seconds": state.get("test_seconds"),
@@ -164,7 +181,7 @@ def _groups(core) -> list[dict]:
     with core.config_lock:
         entries = core.config_data.get("groups", {})
         return [{"name": _read_safe(name), "description": _read_safe(group.get("description"), 240),
-                 "strategy": group.get("strategy"),
+                 "strategy": _read_safe(group.get("strategy"), 40),
                  "members": [{k: _read_safe(v) for k,v in member.items()
                               if k in ("group", "provider", "model")}
                              for member in group.get("members", []) if isinstance(member, dict)]}
@@ -174,7 +191,7 @@ def _groups(core) -> list[dict]:
 def _providers(core) -> list[dict]:
     with core.config_lock:
         entries = core.config_data.get("providers", [])
-        return [{"name": _read_safe(p.get("name")), "api_mode": p.get("api_mode", "openai_chat_completions"),
+        return [{"name": _read_safe(p.get("name")), "api_mode": _read_safe(p.get("api_mode", "openai_chat_completions")),
                  "description": _read_safe(p.get("description"), 200),
                  "models": [_read_safe(x, 128) for x in p.get("models", [])][:100],
                  "oauth": bool(p.get("oauth")),

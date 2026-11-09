@@ -43,8 +43,8 @@ def rpc(client, key, method, params=None, rpc_id=1, **extra):
         "Authorization":"Bearer "+key, "Accept":ACCEPT, **extra},json=body)
 
 
-def call(client, key, name, **arguments):
-    return rpc(client,key,"tools/call",{"name":name,"arguments":arguments}).json()
+def call(client, key, tool_name, **arguments):
+    return rpc(client,key,"tools/call",{"name":tool_name,"arguments":arguments}).json()
 
 
 def test_default_deny_and_mcp_version_negotiation(client):

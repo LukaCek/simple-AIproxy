@@ -273,3 +273,32 @@ def test_worker_provided_metadata_does_not_leak_through_mcp(client):
     output=json.dumps(result)
     assert "VERY_SECRET_VALUE" not in output
     assert "PRIVATE_STUFF" not in output
+
+
+def test_provider_model_update_preserves_existing_oauth_and_api_keys(client, monkeypatch):
+    original = {
+        "providers":[{
+            "name":"codex","api_mode":"codex_responses","models":["old-model"],
+            "url":"https://backend.internal/v1","api_key":"DO_NOT_EXPOSE_API_KEY",
+            "access_token":"DO_NOT_EXPOSE_OAUTH_ACCESS",
+            "refresh_token":"DO_NOT_EXPOSE_OAUTH_REFRESH"}],
+        "groups":{},"model_profiles":{}}
+    monkeypatch.setattr(core,"config_data",original)
+    monkeypatch.setattr(core,"save_config",lambda data: setattr(core,"config_data",data))
+    key=token(client,"operate")["token"]
+    resp=call(client,key,"set_provider_models",
+              provider="codex", models=["new-model"],confirm=True)
+    assert resp["result"]["isError"] is False,resp
+    provider=core.config_data["providers"][0]
+    assert provider["models"]==["new-model"]
+    assert provider["api_key"]=="DO_NOT_EXPOSE_API_KEY"
+    assert provider["access_token"]=="DO_NOT_EXPOSE_OAUTH_ACCESS"
+    assert provider["refresh_token"]=="DO_NOT_EXPOSE_OAUTH_REFRESH"
+    assert provider["url"]=="https://backend.internal/v1"
+    payload=json.dumps(resp)
+    assert "DO_NOT_EXPOSE" not in payload
+    # A read-only connection cannot reconfigure providers.
+    reader=token(client,"read")["token"]
+    refused=call(client,reader,"set_provider_models",
+                 provider="codex",models=["bad-model"],confirm=True)
+    assert refused["error"]["message"]=="This MCP key is read-only"

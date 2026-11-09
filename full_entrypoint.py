@@ -31,4 +31,9 @@ _free_registry.install(_impl)
 import compute_plane as _compute_plane
 _compute_plane.install(_impl.app)
 
+# Optional remote MCP lives on the existing HTTPS proxy host, no extra port.
+# Access is deny-by-default until a separate MCP token is generated.
+import simpleai_mcp as _simpleai_mcp
+_simpleai_mcp.install(_impl)
+
 app = _live.app

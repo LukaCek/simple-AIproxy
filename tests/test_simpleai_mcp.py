@@ -198,6 +198,9 @@ def test_real_gguf_policy_and_group_actions_reuse_existing_safe_handlers(client,
     monkeypatch.setattr(core,"config_data",{
         "providers":[{"name":"local-provider","models":["test-model"],"api_key":"PRIVATE-KEY"}],
         "groups":{},"model_profiles":{}})
+    # Avoid touching the real config.yml in the repository during CI.
+    monkeypatch.setattr(core,"save_config",
+                        lambda data: setattr(core,"config_data",data))
     key=token(client,"operate")["token"]
     group=call(client,key,"save_group",
                name="test-routing",description="One existing model",

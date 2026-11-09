@@ -202,8 +202,10 @@ def _providers(core) -> list[dict]:
 
 def _catalog(compute) -> dict:
     compute._setup()
-    return {mid: {k: definition.get(k) for k in
-                  ("name", "repo", "file", "revision", "size", "ctx", "sha256")}
+    return {mid: {k: (_read_safe(definition.get(k), 160)
+                    if k in ("name", "repo", "file", "revision", "sha256")
+                    else definition.get(k))
+                  for k in ("name", "repo", "file", "revision", "size", "ctx", "sha256")}
             for mid, definition in list(compute.CATALOG.items())[:150]}
 
 

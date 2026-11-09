@@ -171,7 +171,8 @@ def _public_worker(node: dict) -> dict:
             "build_revision": _read_safe(hardware.get("build_revision"), 64),
         },
         "models": {"active": models.get("active")
-                       if models.get("active") in compute_catalog_ids() else None,
+                       if isinstance(models.get("active"), str) and
+                       models.get("active") in compute_catalog_ids() else None,
                    "ready": bool(models.get("ready")),
                    "installed": models.get("installed", []),
                    "busy": bool(models.get("busy")), "disk_limit_bytes": models.get("disk_limit_bytes"),
@@ -209,7 +210,8 @@ def _providers(core) -> list[dict]:
         entries = core.config_data.get("providers", [])
         return [{"name": _read_safe(p.get("name")), "api_mode": _read_safe(p.get("api_mode", "openai_chat_completions")),
                  "description": _read_safe(p.get("description"), 200),
-                 "models": [_read_safe(x, 128) for x in p.get("models", [])][:100],
+                 "models": [_read_safe(x, 128) for x in p.get("models", [])][:100]
+                           if isinstance(p.get("models", []), list) else [],
                  "oauth": bool(p.get("oauth")),
                  "oauth_connected": core.oauth_provider_connected(p) if p.get("oauth") else None,
                  "needs_reauth": bool(p.get("oauth_reauth_required"))}

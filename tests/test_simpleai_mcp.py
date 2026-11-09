@@ -19,12 +19,12 @@ ACCEPT = "application/json, text/event-stream"
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    import full_entrypoint
+    mcp.install(core)
     monkeypatch.setattr(core, "DB_PATH", tmp_path / "mcp.db")
     monkeypatch.setattr(core, "ADMIN_USERNAME", "admin")
     monkeypatch.setattr(core, "ADMIN_PASSWORD", "admin")
     core.init_database()
-    with TestClient(full_entrypoint.app) as c:
+    with TestClient(core.app) as c:
         yield c
 
 

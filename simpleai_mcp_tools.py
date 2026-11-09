@@ -82,6 +82,11 @@ TOOLS = [
           **CONFIRM},("models","confirm"),write=True),
     spec("set_placement", "Choose automatic or manual worker placement.", 
          {"mode":{"type":"string","enum":["manual","auto"]},**CONFIRM},("mode","confirm"),write=True),
+    spec("set_provider_models", "Safely update only the advertised model IDs of an existing provider; preserves API keys, OAuth data and backend URL.",
+         {"provider":string("Exact existing provider name",maxlen=100),
+          "models":{"type":"array","minItems":1,"maxItems":100,
+                    "items":string("Model ID",maxlen=128)},**CONFIRM},
+         ("provider","models","confirm"),write=True),
     spec("worker_model_action", "Install, test, load or unload a model on a connected worker; delete requires extra explicit destructive flag.",
          {"node_id":string("Registered worker ID",maxlen=48),
           "model":string("Approved model ID",maxlen=80),
@@ -122,8 +127,19 @@ def _read_safe(value: object, limit: int = 120) -> str:
 
 def _code(value: object) -> str:
     # Fixed allowlist diagnostics rather than forwarding freeform exceptions.
+    # Explicit Codex/OAuth/provider classifications make metadata useful for
+    # debugging while preventing raw upstream error bodies from being returned.
+    text = str(value or "").lower()[:4096]
+    if any(t in text for t in ("invalid_grant", "token_expired", "refresh token expired")):
+        return "oauth_token_expired"
+    if "429" in text or "rate limit" in text or "too many requests" in text:
+        return "provider_rate_limited"
+    if "401" in text or "unauthorized" in text or "invalid api key" in text:
+        return "provider_unauthorized"
+    if "503" in text or "502" in text or "504" in text:
+        return "provider_unavailable"
     from compute_worker_diagnostics import error_code
-    return error_code(value)
+    return error_code(text)
 
 
 def compute_catalog_ids() -> set[str]:
@@ -457,6 +473,28 @@ async def execute(name: str, args: dict, app) -> dict:
     if name == "set_placement":
         _confirm(args)
         return await compute.update_placement(_Body({"mode":args["mode"]}))
+    if name == "set_provider_models":
+        _confirm(args)
+        provider=args.get("provider")
+        names=args.get("models")
+        if (not isinstance(provider,str) or not 1<=len(provider)<=100
+                or not isinstance(names,list) or not 1<=len(names)<=100
+                or len(set(names))!=len(names)
+                or any(not isinstance(n,str) or not re.fullmatch(r"[A-Za-z0-9._/:-]{1,128}",n)
+                       for n in names)):
+            raise ValueError("Invalid provider/model names")
+        # Restrict mutations to an existing provider's public advertised model
+        # list, preserving all credentials, account settings and endpoints.
+        with core.config_lock:
+            import copy
+            updated=copy.deepcopy(core.config_data)
+            selected=next((p for p in updated.get("providers",[])
+                           if isinstance(p,dict) and p.get("name")==provider),None)
+            if selected is None:
+                raise ValueError("Provider not found")
+            selected["models"]=list(names)
+            core.save_config(updated)
+        return {"updated":True,"provider":_read_safe(provider),"models":list(names)}
     if name == "worker_model_action":
         _confirm(args)
         action=args.get("action")

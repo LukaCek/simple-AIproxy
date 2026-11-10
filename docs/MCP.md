@@ -1,5 +1,62 @@
 # SimpleAI Proxy — secure remote MCP connection
 
+## OAuth 2.1 browser login (recommended for ChatGPT)
+
+The same HTTPS `/mcp` endpoint now supports both the original manually
+issued bearer tokens and OAuth 2.1. ChatGPT clients should select **OAuth**
+when adding the custom MCP server: no API key needs to be pasted.
+
+- Resource metadata (RFC 9728):
+  `https://aiproxy.cekluka.com/.well-known/oauth-protected-resource`
+- Authorization server metadata (RFC 8414):
+  `https://aiproxy.cekluka.com/.well-known/oauth-authorization-server`
+- OAuth endpoints:
+  `/oauth/register` (RFC 7591 dynamic client registration),
+  `/oauth/authorize` (admin login and explicit consent),
+  `/oauth/token` (S256 PKCE code exchange/refresh rotation),
+  `/oauth/revoke` (token revocation)
+
+ChatGPT's supported OAuth registration paths include **DCR**, so this
+server advertises a public-client `registration_endpoint`. Its redirect
+URI is registered with an exact match and the code verifier must prove
+possession of the corresponding PKCE S256 challenge. The consent page uses
+the same SimpleAI administrator login (HTTP Basic authentication over
+HTTPS), a short-lived one-time request and a CSRF nonce. The user may
+approve **read-only** access or **read + operate** if the client requested
+the stronger scope. Approval is never automatic.
+
+Access tokens are scoped to `https://aiproxy.cekluka.com/mcp`, expire in
+one hour, and are stored only as SHA-256 hashes in `app.db`. Clients
+requesting `offline_access` receive a 30-day rotating refresh token.
+Access tokens cannot be used as SimpleAI regular API keys or admin login
+credentials. Errors include a protected-resource `WWW-Authenticate`
+challenge, and tools advertise their OAuth scopes individually.
+
+For a ChatGPT connection:
+
+1. Go to ChatGPT Plugins and add a custom remote MCP server with URL
+   `https://aiproxy.cekluka.com/mcp`; choose **OAuth**.
+2. ChatGPT performs public-client registration and opens SimpleAI's
+   browser login and consent page.
+3. Sign in using your SimpleAI administrator credentials and choose the
+   minimum scope that your workflow requires (read-only by default).
+4. Return to ChatGPT and test the `system_status` MCP tool. If you chose
+   read+operate, model and worker action tools are also available.
+
+To disconnect, open `https://aiproxy.cekluka.com/admin/mcp` and select
+**Disconnect** for the authorized OAuth client. This revokes all access and
+refresh tokens issued to that client. Legacy manually issued MCP keys
+remain managed separately on the same page.
+
+**Notes:** HTTPS must terminate at Nginx Proxy Manager with a valid public
+certificate, and NPM must forward `/.well-known/` and `/oauth/` routes to
+the same SimpleAI proxy. No new ports or additional containers are needed.
+OAuth consent works for one existing SimpleAI admin identity; this is not
+a multi-tenant identity provider. Do not use OAuth client credentials or
+disable authentication to work around a linking issue.
+
+
+
 SimpleAI Proxy includes an **opt-in Streamable HTTP MCP server** at
 `https://aiproxy.cekluka.com/mcp`, on the same FastAPI/Nginx Proxy Manager
 HTTPS hostname and port as the admin. No Docker socket, second container
@@ -40,7 +97,7 @@ worker image upgrades. The request log and ProviderAttempts tools expose
 routing decisions, status codes, timings and **error categories**, not raw
 request prompt/output or unredacted exception messages.
 
-## Generate and revoke credentials
+## Legacy manual bearer credentials
 
 1. Open `https://aiproxy.cekluka.com/admin/mcp` and sign in with the existing
    SimpleAI proxy admin account.

@@ -16,6 +16,22 @@ when adding the custom MCP server: no API key needs to be pasted.
   `/oauth/token` (S256 PKCE code exchange/refresh rotation),
   `/oauth/revoke` (token revocation)
 
+The first unauthenticated MCP request now advertises both
+`simpleai:read` and `simpleai:operate` in its OAuth
+`WWW-Authenticate` scope challenge. MCP clients prioritize this challenge
+over the metadata's `scopes_supported` list. This makes the consent page
+offer both permissions, with **read-only selected by default** and explicit
+admin approval required for operate. An existing read-only OAuth connection
+must be disconnected and reconnected to grant a stronger scope; previously
+issued access tokens are never silently elevated.
+
+**ChatGPT plan limitation:** As of November 2026, full custom MCP write
+capabilities in ChatGPT require a Business or Enterprise/Edu workspace.
+Personal plans may connect for read/fetch only; changing the OAuth scope
+does not override ChatGPT's account or workspace permissions. Full write
+operations still work in other MCP clients that allow them and in eligible
+ChatGPT workspaces.
+
 ChatGPT's supported OAuth registration paths include **DCR**, so this
 server advertises a public-client `registration_endpoint`. Its redirect
 URI is registered with an exact match and the code verifier must prove

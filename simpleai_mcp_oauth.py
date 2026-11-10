@@ -228,6 +228,7 @@ async def authorization_server_metadata():
     base = issuer()
     return _json({
         "issuer": base,
+        "authorization_response_iss_parameter_supported": True,
         "authorization_endpoint": base + "/oauth/authorize",
         "token_endpoint": base + "/oauth/token",
         "registration_endpoint": base + "/oauth/register",
@@ -389,7 +390,7 @@ async def authorize_decision(req: Request):
             return HTMLResponse("Authorization already used", status_code=400)
         if decision == "deny":
             target = row["redirect_uri"]
-            query = {"error": "access_denied", "state": row["state"]}
+            query = {"error": "access_denied", "state": row["state"], "iss": issuer()}
         else:
             code = "simpleai_code_" + secrets.token_urlsafe(32)
             granted = {READ} if permission == "read" else {READ,OPERATE}
@@ -402,7 +403,7 @@ async def authorize_decision(req: Request):
                  " ".join(sorted(granted)),row["resource"],row["challenge"],
                  now + CODE_TTL))
             target = row["redirect_uri"]
-            query = {"code": code, "state": row["state"]}
+            query = {"code": code, "state": row["state"], "iss": issuer()}
     sep = "&" if "?" in target else "?"
     return RedirectResponse(target + sep + urlencode(query), status_code=303,
                             headers={"Cache-Control":"no-store","Referrer-Policy":"no-referrer"})

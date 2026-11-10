@@ -11,6 +11,8 @@ untrusted X-Forwarded-* headers. OAuth does not bypass MCP scope checks.
 """
 from __future__ import annotations
 
+from collections import deque
+from threading import Lock
 import base64
 import hashlib
 import html
@@ -36,8 +38,10 @@ ACCESS_TTL = 3600
 REFRESH_TTL = 30 * 86400
 CODE_TTL = 300
 PENDING_TTL = 600
-CLIENT_LIMIT = 200
+CLIENT_LIMIT = 1000
 AUTH_MAX_BYTES = 4096
+_REGISTER_LOCK = Lock()
+_REGISTER_ATTEMPTS: dict[str, deque[float]] = {}
 DEFAULT_ISSUER = "https://aiproxy.cekluka.com"
 
 
@@ -210,6 +214,11 @@ def _gc(db, now: int) -> None:
     db.execute("DELETE FROM MCPOAuthCodes WHERE expires_at<?", (now,))
     db.execute("DELETE FROM MCPOAuthAccess WHERE expires_at<?", (now - 86400,))
     db.execute("DELETE FROM MCPOAuthRefresh WHERE expires_at<?", (now - 86400,))
+    # Unapproved DCR records older than a week can no longer block new
+    # connections forever; preserve identities with OAuth grant history.
+    db.execute("""DELETE FROM MCPOAuthClients
+        WHERE created_at<? AND id NOT IN
+        (SELECT DISTINCT client_id FROM MCPOAuthAccess)""", (now - 7*86400,))
 
 
 @router.get("/.well-known/oauth-protected-resource")
@@ -242,8 +251,29 @@ async def authorization_server_metadata():
     })
 
 
+def _register_rate_check(req: Request) -> bool:
+    # Do not trust proxy-supplied X-Forwarded-For without an explicit trusted
+    # proxy configuration. Rate-limit the actual TCP peer instead.
+    peer = req.client.host if req.client else "unknown"
+    now = time.monotonic()
+    with _REGISTER_LOCK:
+        queue = _REGISTER_ATTEMPTS.setdefault(peer, deque())
+        while queue and queue[0] < now - 3600:
+            queue.popleft()
+        if len(queue) >= 30:
+            return False
+        queue.append(now)
+        if len(_REGISTER_ATTEMPTS) > 200:
+            for key in list(_REGISTER_ATTEMPTS)[:100]:
+                if not _REGISTER_ATTEMPTS[key] or _REGISTER_ATTEMPTS[key][-1] < now - 3600:
+                    _REGISTER_ATTEMPTS.pop(key, None)
+    return True
+
+
 @router.post("/oauth/register")
 async def register_client(req: Request):
+    if not _register_rate_check(req):
+        return _oauth_error("slow_down", 429)
     if req.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
         return _oauth_error("invalid_client_metadata", 415)
     raw = await req.body()

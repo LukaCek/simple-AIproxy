@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import simpleai_mcp_logging as safe_logs
+import simpleai_mcp_oauth as oauth
 import simpleai_mcp_tools as toolset
 
 _router = APIRouter(include_in_schema=False)
@@ -97,21 +98,28 @@ def _rate_check(key: str) -> None:
 
 def _authenticate(req: Request) -> dict:
     auth = req.headers.get("authorization", "")
+    def unauthorized():
+        raise HTTPException(401, "MCP OAuth authorization or an existing MCP token is required",
+                            headers={"WWW-Authenticate": oauth.challenge_header(),
+                                     "Cache-Control": "no-store"})
     if not auth.startswith("Bearer ") or len(auth) > 256:
-        raise HTTPException(401, "A dedicated MCP bearer token is required",
-                            headers={"WWW-Authenticate":"Bearer"})
+        unauthorized()
     value = auth[7:].strip()
+    if value.startswith("simpleai_oauth_"):
+        principal = oauth.validate_access(value)
+        if principal is None:
+            unauthorized()
+        _rate_check(principal["id"])
+        return principal
     if not re.fullmatch(r"simpleai_mcp_[A-Za-z0-9_-]{32,128}", value):
-        raise HTTPException(401, "Invalid MCP bearer token",
-                            headers={"WWW-Authenticate":"Bearer"})
+        unauthorized()
     _setup()
     digest = _hash(value)
     with _db() as db:
         token = db.execute("SELECT id,name,scope,expires_at,revoked "
                            "FROM MCPAccessTokens WHERE token_hash=?", (digest,)).fetchone()
         if not token or token["revoked"] or token["expires_at"] < int(time.time()):
-            raise HTTPException(401, "MCP token expired, revoked or invalid",
-                                headers={"WWW-Authenticate":"Bearer"})
+            unauthorized()
         db.execute("UPDATE MCPAccessTokens SET last_used=? WHERE id=?",
                    (int(time.time()),token["id"]))
     _rate_check(token["id"])
@@ -274,8 +282,16 @@ async def mcp(req: Request):
     if method=="ping":
         return _response(_rpc_response(rpc_id,{}))
     if method=="tools/list":
-        tools=[tool for tool in toolset.TOOLS if
-               principal["scope"]=="operate" or tool["annotations"]["readOnlyHint"]]
+        tools=[]
+        for tool in toolset.TOOLS:
+            if (principal.get("auth_type") != "oauth" and principal["scope"] != "operate"
+                    and not tool["annotations"]["readOnlyHint"]):
+                continue  # Preserve legacy read-only API key behavior.
+            exposed=dict(tool)
+            requested=oauth.READ if tool["annotations"]["readOnlyHint"] else oauth.OPERATE
+            exposed["securitySchemes"]=[{"type":"oauth2","scopes":[requested]}]
+            exposed["_meta"]={"securitySchemes":[{"type":"oauth2","scopes":[requested]}]}
+            tools.append(exposed)
         return _response(_rpc_response(rpc_id,{"tools":tools}))
     if method=="tools/call":
         name=params.get("name")
@@ -284,6 +300,12 @@ async def mcp(req: Request):
             return _response(_rpc_error(rpc_id,-32602,"Unknown tool or invalid arguments"))
         spec=toolset.TOOL_BY_NAME[name]
         if not spec["annotations"]["readOnlyHint"] and principal["scope"]!="operate":
+            if principal.get("auth_type") == "oauth":
+                return _response(_rpc_response(rpc_id,{
+                    "isError":True,
+                    "content":[{"type":"text","text":"Authorize the SimpleAI MCP operate scope to use this tool."}],
+                    "_meta":{"mcp/www_authenticate":[oauth.challenge_header(
+                        error="insufficient_scope", scope=oauth.OPERATE)]}}))
             return _response(_rpc_error(rpc_id,-32602,"This MCP key is read-only"))
         try:
             result=await toolset.execute(name,args,_app)
@@ -318,6 +340,8 @@ def install(core) -> None:
     _core=core
     _app=core.app
     _setup()
+    oauth.install(core)
+    _router.include_router(oauth.router)
     safe_logs.install()
     core.app.include_router(_router)
     _installed=True

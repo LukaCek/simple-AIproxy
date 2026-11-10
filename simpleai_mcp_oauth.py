@@ -148,6 +148,7 @@ def _valid_redirect(uri: object) -> bool:
         if (not u.netloc or not u.hostname or u.username or u.password or
                 u.fragment or "\\" in uri or any(ord(ch) < 33 for ch in uri)):
             return False
+        _ = u.port  # Reject malformed non-numeric and oversized port strings.
         # RFC 8252 loopback exception for native MCP clients.
         if u.scheme == "http":
             return u.hostname in ("127.0.0.1", "::1", "localhost")
@@ -436,7 +437,12 @@ async def token_exchange(req: Request):
     client_id = data.get("client_id")
     requested_resource = data.get("resource")
     grant_type = data.get("grant_type")
-    if not isinstance(client_id,str) or requested_resource != resource():
+    if (not isinstance(client_id,str) or
+            (requested_resource is not None and requested_resource != resource())):
+        return _oauth_error("invalid_request")
+    # Code grants always bind the requested resource. Refresh tokens already
+    # carry their original audience; some clients omit resource when refreshing.
+    if grant_type == "authorization_code" and requested_resource != resource():
         return _oauth_error("invalid_request")
     if any(k in data for k in ("client_secret","client_assertion")):
         return _oauth_error("invalid_client",401)
@@ -500,6 +506,40 @@ async def revoke(req: Request):
         db.execute("UPDATE MCPOAuthRefresh SET revoked=1 WHERE token_hash=? AND client_id=?",
                    (h,client_id))
     return Response(status_code=200,headers={"Cache-Control":"no-store"})
+
+
+@router.get("/admin/api/mcp/oauth/connections")
+async def admin_connections(req: Request):
+    _admin_verified(req)
+    setup()
+    with _db() as db:
+        rows=db.execute("""
+            SELECT c.id,c.name,MAX(t.created_at) AS last_granted,
+                   MAX(t.expires_at) AS access_expires,
+                   SUM(CASE WHEN t.revoked=0 AND t.expires_at>? THEN 1 ELSE 0 END)
+                     AS active_access_tokens
+            FROM MCPOAuthClients c JOIN MCPOAuthAccess t ON c.id=t.client_id
+            GROUP BY c.id ORDER BY last_granted DESC LIMIT 100
+        """,(int(time.time()),)).fetchall()
+    return _json({"connections":[dict(row) for row in rows]})
+
+
+@router.post("/admin/api/mcp/oauth/connections/{client_id}/revoke")
+async def admin_revoke_connection(req: Request, client_id: str):
+    _admin_verified(req)
+    import simpleai_mcp
+    simpleai_mcp._require_admin_action(req)
+    if not re.fullmatch(r"simpleai_client_[A-Za-z0-9_-]{20,100}",client_id):
+        raise HTTPException(400,"Invalid connection ID")
+    with _db() as db:
+        row=db.execute("SELECT id FROM MCPOAuthClients WHERE id=?",(client_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"OAuth connection not found")
+        db.execute("UPDATE MCPOAuthAccess SET revoked=1 WHERE client_id=?",(client_id,))
+        db.execute("UPDATE MCPOAuthRefresh SET revoked=1 WHERE client_id=?",(client_id,))
+        db.execute("DELETE FROM MCPOAuthPending WHERE client_id=?",(client_id,))
+        db.execute("DELETE FROM MCPOAuthCodes WHERE client_id=?",(client_id,))
+    return _json({"revoked":True,"client_id":client_id})
 
 
 def validate_access(token: str) -> dict | None:

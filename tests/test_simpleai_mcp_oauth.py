@@ -62,6 +62,7 @@ def authorize(client, client_id, scope="simpleai:read offline_access",
     assert callback.startswith(redirect+"?")
     parsed=parse_qs(urlsplit(callback).query)
     assert parsed["state"]==[state]
+    assert parsed["iss"]==[ISSUER]
     return parsed["code"][0],data
 
 
@@ -83,6 +84,7 @@ def test_discovery_and_oauth_challenge(client):
     assert metadata.status_code==200
     d=metadata.json()
     assert d["issuer"]==ISSUER
+    assert d["authorization_response_iss_parameter_supported"] is True
     assert d["token_endpoint"]==ISSUER+"/oauth/token"
     assert d["registration_endpoint"]==ISSUER+"/oauth/register"
     assert d["code_challenge_methods_supported"]==["S256"]
@@ -244,3 +246,39 @@ def test_oauth_does_not_authenticate_regular_api_or_admin(client):
         "Authorization":"Bearer "+access}).status_code==401
     assert client.get("/v1/models",headers={
         "Authorization":"Bearer "+access}).status_code==401
+
+
+def test_admin_can_list_and_revoke_all_oauth_connection_tokens(client):
+    cid=register(client)
+    code,_=authorize(client,cid)
+    issued=exchange(client,cid,code).json()
+    listing=client.get("/admin/api/mcp/oauth/connections",auth=ADMIN)
+    assert listing.status_code==200
+    assert cid in listing.text
+    assert issued["access_token"] not in listing.text
+    assert issued["refresh_token"] not in listing.text
+    assert client.get("/admin/api/mcp/oauth/connections").status_code==401
+    bad=client.post("/admin/api/mcp/oauth/connections/"+cid+"/revoke",auth=ADMIN)
+    assert bad.status_code==403
+    good=client.post("/admin/api/mcp/oauth/connections/"+cid+"/revoke",auth=ADMIN,
+                     headers={"Origin":ISSUER,"X-SimpleAI-Admin-Action":"1"})
+    assert good.status_code==200,good.text
+    assert rpc(client,issued["access_token"],"ping").status_code==401
+    refresh=client.post("/oauth/token",data={
+        "grant_type":"refresh_token","client_id":cid,
+        "refresh_token":issued["refresh_token"]})
+    assert refresh.status_code==400
+
+
+def test_refresh_can_omit_optional_resource_but_not_substitute_another(client):
+    cid=register(client)
+    code,_=authorize(client,cid)
+    issued=exchange(client,cid,code).json()
+    invalid=client.post("/oauth/token",data={
+        "grant_type":"refresh_token","client_id":cid,
+        "resource":"https://evil.example/mcp","refresh_token":issued["refresh_token"]})
+    assert invalid.status_code==400
+    ok=client.post("/oauth/token",data={
+        "grant_type":"refresh_token","client_id":cid,
+        "refresh_token":issued["refresh_token"]})
+    assert ok.status_code==200,ok.text

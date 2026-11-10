@@ -126,8 +126,14 @@ def setup() -> None:
         """)
 
 
-def challenge_header(error: str = "invalid_token", scope: str = READ) -> str:
-    # All values fixed constants; no reflected client-provided strings.
+def challenge_header(error: str = "invalid_token", scope: str = READ + " " + OPERATE) -> str:
+    # Advertise both available privileges in the initial OAuth challenge.
+    # MCP clients prioritize the 401 challenge's scope over scopes_supported.
+    # A READ-only initial challenge made ChatGPT request only simpleai:read,
+    # which meant the consent page could never offer operate. The user must
+    # still explicitly select/approve operate; the consent default is READ.
+    # Tool-level step-up challenges continue requesting only OPERATE.
+    # All values below are fixed constants; never reflect a client's scope.
     return ('Bearer resource_metadata="' + issuer() +
             '/.well-known/oauth-protected-resource", error="' + error +
             '", error_description="Connect your SimpleAI Proxy account to continue", '

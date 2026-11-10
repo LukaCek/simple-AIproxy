@@ -14,7 +14,27 @@
     </div>
   </div>
   <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-    <h2 class="text-lg font-semibold text-slate-900">New MCP connection</h2>
+    <h2 class="text-lg font-semibold text-slate-900">Connect using OAuth</h2>
+    <p class="mt-2 text-sm text-slate-600">Recommended for ChatGPT and other compatible MCP clients.
+      No manual token copying. Add the MCP URL in your client, choose OAuth,
+      sign in with your existing SimpleAI administrator account and approve
+      read-only diagnostics or read + operate permissions.</p>
+    <div class="mt-3 flex flex-wrap gap-2 text-sm">
+      <a href="https://chatgpt.com/plugins" target="_blank" rel="noopener noreferrer"
+        class="rounded-lg bg-slate-900 px-4 py-2 text-white">ChatGPT plugins</a>
+      <a href="/.well-known/oauth-authorization-server" target="_blank" rel="noopener noreferrer"
+        class="rounded-lg border px-4 py-2">OAuth discovery metadata</a>
+    </div>
+    <p class="mt-3 text-xs text-slate-600">OAuth uses the same HTTPS /mcp URL,
+      explicit authorization with PKCE, one-time codes, limited-lifetime
+      access tokens and rotating refresh tokens.</p>
+    <h3 class="mt-5 font-semibold text-slate-900">Authorized OAuth connections</h3>
+    <div id="oauth-connections" class="mt-3 text-sm text-slate-600">Loading…</div>
+    <button type="button" id="oauth-refresh" class="mt-3 rounded-lg border px-3 py-2 text-sm">
+      Refresh connections</button>
+  </div>
+  <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+    <h2 class="text-lg font-semibold text-slate-900">Legacy token connection (optional)</h2>
     <p class="mt-1 text-sm text-slate-600">The token is displayed only once.
       Keep it private. Read-only access is recommended for diagnostics.
       Operate access can run model tests, change routing and spend provider credits.</p>
@@ -113,6 +133,43 @@
       target.textContent = "MCP token list unavailable.";
     }
   }
+  async function refreshOAuth() {
+    const target = document.getElementById("oauth-connections");
+    try {
+      const response = await fetch("/admin/api/mcp/oauth/connections", {cache:"no-store"});
+      if(!response.ok) throw new Error("Unable to list OAuth connections");
+      const rows = (await response.json()).connections || [];
+      target.replaceChildren();
+      if(!rows.length) {target.textContent = "No OAuth client has been authorized yet."; return;}
+      for(const connection of rows) {
+        const row = document.createElement("div");
+        row.className = "flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-100 px-3 py-2";
+        const label = document.createElement("span");
+        label.textContent = connection.name + " · active tokens: " +
+          connection.active_access_tokens + " · last linked: " +
+          new Date(connection.last_granted * 1000).toLocaleString();
+        row.append(label);
+        const button = document.createElement("button");
+        button.className = "rounded-lg border border-red-300 px-3 py-1 text-xs text-red-700";
+        button.textContent = "Disconnect";
+        button.onclick = async () => {
+          if(!confirm("Revoke all OAuth access and refresh tokens for this client?")) return;
+          const result = await fetch("/admin/api/mcp/oauth/connections/" +
+            encodeURIComponent(connection.id) + "/revoke", {
+            method:"POST",headers:{"X-SimpleAI-Admin-Action":"1"}
+          });
+          if(result.ok) await refreshOAuth();
+          else target.textContent = "Unable to disconnect OAuth client.";
+        };
+        row.append(button);
+        target.append(row);
+      }
+    } catch(error) {
+      target.textContent = "Could not load OAuth connections.";
+    }
+  }
+  document.getElementById("oauth-refresh").onclick = refreshOAuth;
+  refreshOAuth();
   document.getElementById("mcp-refresh").onclick = refresh;
   document.getElementById("mcp-create-form").onsubmit = async (event) => {
     event.preventDefault();

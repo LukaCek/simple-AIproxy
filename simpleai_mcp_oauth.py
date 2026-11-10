@@ -197,11 +197,31 @@ async def _body_form(req: Request, limit: int = AUTH_MAX_BYTES) -> dict:
 
 
 def _same_origin_post(req: Request) -> bool:
-    origin = req.headers.get("origin", "").rstrip("/")
-    if origin:
+    """Reject *explicitly foreign* origins; never depend on optional headers.
+
+    Privacy browsers (including Brave) can suppress Origin and Referer on
+    form POST, especially with the consent page's no-referrer policy.
+    Requiring one of those optional headers incorrectly blocks legitimate
+    users. The authorization decision still requires an authenticated admin,
+    an unguessable one-time form ID and a SHA256-checked CSRF secret bound to
+    that pending request, with a short expiry and atomic consumption.
+    """
+    origin = req.headers.get("origin", "").strip()
+    if origin and origin != "null":
         return origin == issuer()
-    referer = req.headers.get("referer", "")
-    return referer.startswith(issuer() + "/oauth/authorize")
+    # A literal Origin: null can be emitted by privacy-aware clients. It is
+    # not proof of trust; only the one-time CSRF-bound consent is.
+    referer = req.headers.get("referer", "").strip()
+    if referer:
+        try:
+            parsed = urlsplit(referer)
+        except ValueError:
+            return False
+        expected = urlsplit(issuer())
+        if (parsed.scheme != expected.scheme or parsed.netloc != expected.netloc
+                or parsed.path != "/oauth/authorize"):
+            return False
+    return True
 
 
 def _admin_verified(req: Request) -> None:

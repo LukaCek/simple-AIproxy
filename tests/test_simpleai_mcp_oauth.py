@@ -282,3 +282,78 @@ def test_refresh_can_omit_optional_resource_but_not_substitute_another(client):
         "grant_type":"refresh_token","client_id":cid,
         "refresh_token":issued["refresh_token"]})
     assert ok.status_code==200,ok.text
+
+
+def _consent_form(client, client_id):
+    """Open a real OAuth consent page and extract its one-time form tokens."""
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": client_id,
+        "redirect_uri": CALLBACK, "scope": "simpleai:read",
+        "state": "mobile-login-state-1234", "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": RESOURCE,
+    }, auth=ADMIN)
+    assert page.status_code == 200
+    attempt = re.search(r'name="authorization_request_id" value="([^"]+)"', page.text)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+    assert attempt and csrf
+    return {"authorization_request_id": attempt.group(1),
+            "csrf": csrf.group(1), "permission": "read", "decision": "approve"}
+
+
+@pytest.mark.parametrize("headers", [
+    {},
+    {"Origin": "null"},
+    {"Referer": ISSUER + "/oauth/authorize?client_id=safe"},
+    {"Origin": ISSUER},
+])
+def test_mobile_privacy_browser_can_authorize_with_valid_csrf(client, headers):
+    """Brave may suppress Referer and Origin; PKCE consent remains valid."""
+    cid = register(client)
+    data = _consent_form(client, cid)
+    response = client.post("/oauth/authorize", data=data, auth=ADMIN,
+                           headers=headers, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    query = parse_qs(urlsplit(response.headers["location"]).query)
+    assert query["state"] == ["mobile-login-state-1234"]
+    assert query["iss"] == [ISSUER]
+    code = query["code"][0]
+    exchanged = exchange(client, cid, code)
+    assert exchanged.status_code == 200, exchanged.text
+
+
+@pytest.mark.parametrize("headers", [
+    {},
+    {"Origin": "null"},
+    {"Origin": ISSUER},
+])
+def test_mobile_consent_missing_or_wrong_csrf_still_blocked(client, headers):
+    cid = register(client)
+    valid = _consent_form(client, cid)
+    for altered in ({**valid, "csrf": "x" * 43},
+                    {k: v for k, v in valid.items() if k != "csrf"}):
+        denied = client.post("/oauth/authorize", data=altered, auth=ADMIN,
+                             headers=headers, follow_redirects=False)
+        assert denied.status_code == 400, denied.text
+        assert "location" not in denied.headers
+    allowed = client.post("/oauth/authorize", data=valid, auth=ADMIN,
+                          headers=headers, follow_redirects=False)
+    assert allowed.status_code == 303, allowed.text
+
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "https://evil.example"},
+    {"Referer": "https://evil.example/oauth/authorize"},
+    {"Referer": "https://aiproxy.cekluka.com.evil.example/oauth/authorize"},
+    {"Origin": "null", "Referer": "https://evil.example/oauth/authorize"},
+])
+def test_mobile_consent_explicitly_foreign_origin_is_rejected(client, headers):
+    cid = register(client)
+    data = _consent_form(client, cid)
+    denied = client.post("/oauth/authorize", data=data, auth=ADMIN,
+                         headers=headers, follow_redirects=False)
+    assert denied.status_code == 403, denied.text
+    assert "location" not in denied.headers
+    # Rejection must not consume a valid pending authorization.
+    allowed = client.post("/oauth/authorize", data=data, auth=ADMIN,
+                          follow_redirects=False)
+    assert allowed.status_code == 303

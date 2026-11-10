@@ -146,6 +146,43 @@ def test_oauth_code_pkce_and_one_time_use(client):
     assert ping.json()["result"]=={}
 
 
+def test_initial_oauth_challenge_offers_operate_with_explicit_user_consent(client):
+    """MCP clients use challenge scope before resource metadata; avoid read-only trap."""
+    required = client.post("/mcp", headers={"Accept": ACCEPT}, json={
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    })
+    assert required.status_code == 401
+    challenge = required.headers["www-authenticate"]
+    assert 'scope="simpleai:read simpleai:operate"' in challenge
+
+    # Reproduce how a real MCP client requests the scopes from that header.
+    cid = register(client)
+    code, _ = authorize(client, cid, scope="simpleai:read simpleai:operate",
+                        permission="operate")
+    granted = exchange(client, cid, code)
+    assert granted.status_code == 200
+    access = granted.json()
+    assert set(access["scope"].split()) == {"simpleai:read", "simpleai:operate"}
+    tools = rpc(client, access["access_token"], "tools/list").json()["result"]["tools"]
+    assert "set_model_policy" in {entry["name"] for entry in tools}
+    # It must NOT silently change policy without the per-action confirmation.
+    denied = rpc(client, access["access_token"], "tools/call", {
+        "name": "set_model_policy", "arguments": {"models": []},
+    }).json()
+    assert denied["result"]["isError"] is True
+
+    # Read-only remains selectable even after both scopes were requested.
+    read_code, _ = authorize(client, cid, scope="simpleai:read simpleai:operate",
+                             permission="read")
+    limited = exchange(client, cid, read_code).json()
+    assert "simpleai:operate" not in limited["scope"].split()
+    refused = rpc(client, limited["access_token"], "tools/call", {
+        "name": "set_model_policy", "arguments": {"models": [], "confirm": True},
+    }).json()
+    assert refused["result"]["isError"] is True
+    assert "mcp/www_authenticate" in refused["result"]["_meta"]
+
+
 def test_scope_consent_and_upgrade_challenge(client):
     cid=register(client)
     code,_=authorize(client,cid,scope="simpleai:read simpleai:operate offline_access",

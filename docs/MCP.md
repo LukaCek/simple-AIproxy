@@ -1,5 +1,45 @@
 # SimpleAI Proxy — secure remote MCP connection
 
+## Troubleshooting OAuth login from ChatGPT
+
+If ChatGPT shows **"already used or expired"** after the browser consent:
+
+1. Start a fresh connection from the ChatGPT Plugins page; do **not** reuse
+   the old authorization callback or click Back and resubmit consent.
+2. Open `https://aiproxy.cekluka.com/admin/mcp` and select **Refresh
+   diagnostics**. Only bounded diagnostic categories are shown, without
+   credentials or OAuth codes.
+3. Interpret the newest `mcp_oauth` event:
+   - `consent_request_replayed`: the browser submitted the same consent twice;
+     restart from ChatGPT rather than replaying a one-use form.
+   - `authorization_code_reused`: code redemption was attempted twice; never
+     disable PKCE or reuse codes.
+   - `authorization_code_pkce_mismatch`: the OAuth client supplied a different
+     PKCE verifier; fix the client flow or reconnect it.
+   - `authorization_code_redirect_mismatch`: the token request callback URI
+     differs from its registered and approved callback.
+   - `code_exchange_resource_omitted`: informational interoperability event;
+     the authorization code still enforces the exact MCP audience.
+   - `authorization_code_exchange_succeeded`: the server granted a token.
+     If ChatGPT still reports failure, investigate its plugin connection state.
+4. If the connection was linked before the latest fix, disconnect and start
+   a fresh OAuth authorization. Previously issued read-only tokens do not
+   silently gain write privileges.
+
+A client may omit `resource` in its **token exchange**; the authorization
+request and stored code must still be bound to our canonical /mcp audience.
+Wrong explicit resources and PKCE mismatches remain rejected. One-use codes
+are never reusable. The initial OAuth challenge advertises
+`offline_access` so capable clients can request rotating refresh tokens;
+the consent UI shows this permission explicitly.
+
+**ChatGPT plan limitation:** a successful OAuth login does not override
+ChatGPT's own write-tool availability. On personal plans, ChatGPT may be
+limited to read/fetch tools; full custom MCP write actions are supported in
+eligible Business and Enterprise/Edu workspaces. Use a compatible MCP client
+or GitHub workflows for actual mutations when ChatGPT itself exposes only
+read permissions.
+
 ## OAuth 2.1 browser login (recommended for ChatGPT)
 
 The same HTTPS `/mcp` endpoint now supports both the original manually

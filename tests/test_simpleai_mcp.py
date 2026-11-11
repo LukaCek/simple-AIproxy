@@ -19,6 +19,10 @@ ACCEPT = "application/json, text/event-stream"
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    import simpleai_mcp_oauth as oauth
+    # Isolate per-client OAuth DCR rate limits between tests, without changing
+    # the production limit for an actual source IP.
+    monkeypatch.setattr(oauth, "_REGISTER_ATTEMPTS", {})
     mcp.install(core)
     monkeypatch.setattr(core, "DB_PATH", tmp_path / "mcp.db")
     monkeypatch.setattr(core, "ADMIN_USERNAME", "admin")

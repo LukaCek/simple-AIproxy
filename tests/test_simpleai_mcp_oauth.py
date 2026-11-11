@@ -487,3 +487,30 @@ def test_mobile_consent_explicitly_foreign_origin_is_rejected(client, headers):
     allowed = client.post("/oauth/authorize", data=data, auth=ADMIN,
                           follow_redirects=False)
     assert allowed.status_code == 303
+
+
+def test_admin_oauth_diagnostics_are_auth_protected_and_never_show_codes(client, monkeypatch):
+    import simpleai_mcp_logging as logs
+    recorded = []
+    original = logs.record
+
+    def capture(component, level, code, *, exception_type=""):
+        recorded.append((component, level, code, exception_type))
+        return original(component, level, code, exception_type=exception_type)
+
+    monkeypatch.setattr(logs, "record", capture)
+    cid = register(client)
+    code, _ = authorize(client, cid)
+    failure = exchange(client, cid, code, verifier="b" * 64)
+    assert failure.status_code == 400
+    assert ("mcp_oauth", "warning", "authorization_code_pkce_mismatch", "") in recorded
+
+    denied = client.get("/admin/api/mcp/oauth/diagnostics")
+    assert denied.status_code == 401
+    result = client.get("/admin/api/mcp/oauth/diagnostics", auth=ADMIN)
+    assert result.status_code == 200
+    body = result.json()
+    assert "authorization_code_pkce_mismatch" in json.dumps(body)
+    assert code not in json.dumps(body)
+    assert VERIFIER not in json.dumps(body)
+    assert body["note"].startswith("Privacy-safe")

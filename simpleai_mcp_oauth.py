@@ -126,8 +126,10 @@ def setup() -> None:
         """)
 
 
-def challenge_header(error: str = "invalid_token", scope: str = READ + " " + OPERATE) -> str:
-    # Advertise both available privileges in the initial OAuth challenge.
+def challenge_header(error: str = "invalid_token", scope: str = READ + " " + OPERATE + " " + OFFLINE) -> str:
+    # Advertise both available privileges plus offline_access for long-lived
+    # ChatGPT connections using rotating refresh tokens. Every permission
+    # remains subject to explicit OAuth consent; read is the safe default.
     # MCP clients prioritize the 401 challenge's scope over scopes_supported.
     # A READ-only initial challenge made ChatGPT request only simpleai:read,
     # which meant the consent page could never offer operate. The user must
@@ -553,7 +555,8 @@ async def token_exchange(req: Request):
                 _audit_failure("authorization_code_concurrent_reuse")
                 return _oauth_error("invalid_grant")
             result = _json(_new_tokens(db,client_id,row["scope"],uuid.uuid4().hex,now))
-            _audit_failure("authorization_code_exchange_succeeded")
+            import simpleai_mcp_logging as diagnostics
+            diagnostics.record("mcp_oauth", "info", "authorization_code_exchange_succeeded")
             return result
     if grant_type == "refresh_token":
         refresh = data.get("refresh_token","")

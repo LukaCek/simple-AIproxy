@@ -153,7 +153,7 @@ def test_initial_oauth_challenge_offers_operate_with_explicit_user_consent(clien
     })
     assert required.status_code == 401
     challenge = required.headers["www-authenticate"]
-    assert 'scope="simpleai:read simpleai:operate"' in challenge
+    assert 'scope="simpleai:read simpleai:operate offline_access"' in challenge
 
     # Reproduce how a real MCP client requests the scopes from that header.
     cid = register(client)
@@ -181,6 +181,24 @@ def test_initial_oauth_challenge_offers_operate_with_explicit_user_consent(clien
     }).json()
     assert refused["result"]["isError"] is True
     assert "mcp/www_authenticate" in refused["result"]["_meta"]
+
+
+def test_initial_challenge_supports_refreshable_authorization_without_auto_operate(client):
+    cid = register(client)
+    code, _ = authorize(client, cid,
+                        scope="simpleai:read simpleai:operate offline_access",
+                        permission="read")
+    result = exchange(client, cid, code)
+    assert result.status_code == 200
+    granted = result.json()
+    assert "simpleai:operate" not in granted["scope"]
+    assert granted["refresh_token"].startswith("simpleai_refresh_")
+    refreshed = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": cid,
+        "refresh_token": granted["refresh_token"],
+    })
+    assert refreshed.status_code == 200
+    assert "simpleai:operate" not in refreshed.json()["scope"]
 
 
 def test_scope_consent_and_upgrade_challenge(client):

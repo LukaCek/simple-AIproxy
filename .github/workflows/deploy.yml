@@ -35,6 +35,9 @@ jobs:
           ruff check --ignore BLE001,RUF100 main.py free_model_registry.py tests/test_proxy.py tests/test_free_model_registry.py
           pytest -q
 
+      - name: Real Docker production rollback fault injection
+        run: bash tests/release_docker_fault_injection.sh
+
       - name: Start services with docker compose
         run: docker compose up -d
 
@@ -57,45 +60,107 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  # Native architectures compile in parallel and preserve their own caches.
+  # DO NOT update the live :latest tag from either individual architecture.
   build-and-push:
     needs: test
-    runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU for ARM64 builds
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push multi-platform Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and push native ${{ matrix.arch }} by immutable digest
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/lukacek/simple-aiproxy:latest
-            ghcr.io/lukacek/simple-aiproxy:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/lukacek/simple-aiproxy,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=simpleai-proxy-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=simpleai-proxy-${{ matrix.arch }}
+      - name: Export platform digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxy-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-image:
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: proxy-digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify native manifests before moving latest
+        env:
+          IMAGE: ghcr.io/lukacek/simple-aiproxy
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/digests"
+          shopt -s nullglob
+          digests=( * )
+          [[ "${#digests[@]}" -eq 2 ]] || {
+            echo "Both AMD64 and ARM64 digests are required."
+            exit 1
+          }
+          sources=()
+          for digest in "${digests[@]}"; do
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || exit 1
+            sources+=( "$IMAGE@sha256:$digest" )
+          done
+          docker buildx imagetools create -t "$IMAGE:$GITHUB_SHA" "${sources[@]}"
+          docker buildx imagetools inspect --raw "$IMAGE:$GITHUB_SHA" | python3 -c '
+          import json,sys
+          obj=json.load(sys.stdin)
+          arches={(m["platform"]["os"],m["platform"]["architecture"])
+                  for m in obj["manifests"] if m.get("platform")}
+          required={("linux","amd64"),("linux","arm64")}
+          assert required <= arches, (required,arches)
+          '
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$GITHUB_SHA"
+          docker buildx imagetools inspect "$IMAGE:latest"
 
   deploy:
-    needs: build-and-push
+    needs: publish-image
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
@@ -112,7 +177,7 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           port: ${{ secrets.DEPLOY_PORT }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          source: "server_deployment/docker-compose.yml,server_deployment/update.sh"
+          source: "server_deployment/docker-compose.yml,server_deployment/update.sh,server_deployment/backup_release.py,server_deployment/check_release.py"
           target: ${{ secrets.DEPLOY_PATH }}
           strip_components: 1
           overwrite: true
@@ -130,7 +195,7 @@ jobs:
             ./update.sh
 
   report:
-    needs: [test, build-and-push, deploy]
+    needs: [test, build-and-push, publish-image, deploy]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -148,6 +213,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TEST_RESULT: ${{ needs.test.result }}
           BUILD_RESULT: ${{ needs.build-and-push.result }}
+          PUBLISH_RESULT: ${{ needs.publish-image.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
         run: |
           git config user.name "SimpleAIProxy Deploy Bot"
@@ -176,6 +242,7 @@ jobs:
             "jobs": {
               "test": "${TEST_RESULT}",
               "build_and_push": "${BUILD_RESULT}",
+              "publish_image": "${PUBLISH_RESULT}",
               "deploy": "${DEPLOY_RESULT}"
             },
             "checks": {

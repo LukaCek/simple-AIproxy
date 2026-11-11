@@ -153,7 +153,7 @@ def test_initial_oauth_challenge_offers_operate_with_explicit_user_consent(clien
     })
     assert required.status_code == 401
     challenge = required.headers["www-authenticate"]
-    assert 'scope="simpleai:read simpleai:operate"' in challenge
+    assert 'scope="simpleai:read simpleai:operate offline_access"' in challenge
 
     # Reproduce how a real MCP client requests the scopes from that header.
     cid = register(client)
@@ -181,6 +181,24 @@ def test_initial_oauth_challenge_offers_operate_with_explicit_user_consent(clien
     }).json()
     assert refused["result"]["isError"] is True
     assert "mcp/www_authenticate" in refused["result"]["_meta"]
+
+
+def test_initial_challenge_supports_refreshable_authorization_without_auto_operate(client):
+    cid = register(client)
+    code, _ = authorize(client, cid,
+                        scope="simpleai:read simpleai:operate offline_access",
+                        permission="read")
+    result = exchange(client, cid, code)
+    assert result.status_code == 200
+    granted = result.json()
+    assert "simpleai:operate" not in granted["scope"]
+    assert granted["refresh_token"].startswith("simpleai_refresh_")
+    refreshed = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": cid,
+        "refresh_token": granted["refresh_token"],
+    })
+    assert refreshed.status_code == 200
+    assert "simpleai:operate" not in refreshed.json()["scope"]
 
 
 def test_scope_consent_and_upgrade_challenge(client):
@@ -221,6 +239,81 @@ def test_refresh_rotates_and_replay_fails(client):
     assert repeat.status_code==400
     assert repeat.json()["error"]=="invalid_grant"
     assert rpc(client,rotated["access_token"],"ping").status_code==200
+
+
+
+def test_chatgpt_token_exchange_can_omit_optional_resource_and_remains_bound_to_mcp(client):
+    """Some OAuth clients omit resource on POST /oauth/token after the redirect."""
+    cid = register(client)
+    code, _ = authorize(client, cid, permission="read", scope="simpleai:read")
+    exchanged = client.post("/oauth/token", data={
+        "grant_type": "authorization_code", "client_id": cid, "code": code,
+        "code_verifier": VERIFIER, "redirect_uri": CALLBACK,
+        # No resource here; the already-approved code is MCP-audience bound.
+    })
+    assert exchanged.status_code == 200, exchanged.text
+    token = exchanged.json()["access_token"]
+    assert rpc(client, token, "ping").status_code == 200
+    with core.get_db_connection() as db:
+        audience = db.execute(
+            "SELECT audience FROM MCPOAuthAccess WHERE client_id=? ORDER BY created_at DESC LIMIT 1",
+            (cid,)).fetchone()[0]
+    assert audience == RESOURCE
+    again = exchange(client, cid, code)
+    assert again.status_code == 400
+    assert again.json()["error"] == "invalid_grant"
+
+
+def test_wrong_resource_still_rejected_before_code_is_consumed(client):
+    cid = register(client)
+    code, _ = authorize(client, cid)
+    bad = exchange(client, cid, code, resource="https://attacker.example/mcp")
+    assert bad.status_code == 400
+    assert bad.json()["error"] == "invalid_request"
+    good = exchange(client, cid, code)
+    assert good.status_code == 200
+
+
+def test_oauth_audit_uses_only_fixed_reason_codes_and_never_codes(client, monkeypatch):
+    import simpleai_mcp_oauth as oauth
+    events = []
+    monkeypatch.setattr(oauth, "_audit_failure", lambda category: events.append(category))
+    cid = register(client)
+    code, _ = authorize(client, cid)
+    incorrect = exchange(client, cid, code, verifier="b" * 64)
+    assert incorrect.status_code == 400
+    assert "authorization_code_pkce_mismatch" in events
+    assert code not in json.dumps(events)
+    assert VERIFIER not in json.dumps(events)
+    good = exchange(client, cid, code)
+    assert good.status_code == 200
+    replay = exchange(client, cid, code)
+    assert replay.status_code == 400
+    assert "authorization_code_reused" in events
+    assert code not in json.dumps(events)
+
+
+def test_repeated_browser_consent_shows_actionable_error_without_new_code(client):
+    cid = register(client)
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid, "redirect_uri": CALLBACK,
+        "scope": "simpleai:read", "state": "oauth-consent-state-reuse",
+        "code_challenge": CHALLENGE, "code_challenge_method": "S256",
+        "resource": RESOURCE}, auth=ADMIN)
+    assert page.status_code == 200
+    attempt = re.search(r'name="authorization_request_id" value="([^"]+)"', page.text)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+    assert attempt and csrf
+    fields = {"authorization_request_id": attempt.group(1),
+              "csrf": csrf.group(1), "permission": "read", "decision": "approve"}
+    first = client.post("/oauth/authorize", data=fields, auth=ADMIN,
+                        headers={"Origin": ISSUER}, follow_redirects=False)
+    assert first.status_code == 303
+    second = client.post("/oauth/authorize", data=fields, auth=ADMIN,
+                         headers={"Origin": ISSUER}, follow_redirects=False)
+    assert second.status_code == 400
+    assert "already submitted" in second.text.lower()
+    assert "code=" not in second.text
 
 
 def test_no_offline_access_means_no_refresh_token(client):
@@ -394,3 +487,30 @@ def test_mobile_consent_explicitly_foreign_origin_is_rejected(client, headers):
     allowed = client.post("/oauth/authorize", data=data, auth=ADMIN,
                           follow_redirects=False)
     assert allowed.status_code == 303
+
+
+def test_admin_oauth_diagnostics_are_auth_protected_and_never_show_codes(client, monkeypatch):
+    import simpleai_mcp_logging as logs
+    recorded = []
+    original = logs.record
+
+    def capture(component, level, code, *, exception_type=""):
+        recorded.append((component, level, code, exception_type))
+        return original(component, level, code, exception_type=exception_type)
+
+    monkeypatch.setattr(logs, "record", capture)
+    cid = register(client)
+    code, _ = authorize(client, cid)
+    failure = exchange(client, cid, code, verifier="b" * 64)
+    assert failure.status_code == 400
+    assert ("mcp_oauth", "warning", "authorization_code_pkce_mismatch", "") in recorded
+
+    denied = client.get("/admin/api/mcp/oauth/diagnostics")
+    assert denied.status_code == 401
+    result = client.get("/admin/api/mcp/oauth/diagnostics", auth=ADMIN)
+    assert result.status_code == 200
+    body = result.json()
+    assert "authorization_code_pkce_mismatch" in json.dumps(body)
+    assert code not in json.dumps(body)
+    assert VERIFIER not in json.dumps(body)
+    assert body["note"].startswith("Privacy-safe")

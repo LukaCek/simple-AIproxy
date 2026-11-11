@@ -425,6 +425,7 @@ async def authorize(req: Request):
 async def authorize_decision(req: Request):
     _admin_verified(req)
     if not _same_origin_post(req):
+        _audit_failure("consent_origin_rejected")
         raise HTTPException(403, "Invalid consent origin")
     try:
         data = await _body_form(req)
@@ -510,8 +511,11 @@ async def token_exchange(req: Request):
     client_id = data.get("client_id")
     requested_resource = data.get("resource")
     grant_type = data.get("grant_type")
-    if (not isinstance(client_id,str) or
-            (requested_resource is not None and requested_resource != resource())):
+    if not isinstance(client_id, str):
+        _audit_failure("token_client_id_missing")
+        return _oauth_error("invalid_request")
+    if requested_resource is not None and requested_resource != resource():
+        _audit_failure("token_resource_mismatch")
         return _oauth_error("invalid_request")
     # Clients SHOULD echo RFC 8707 resource at the token endpoint, but some
     # public OAuth clients omit this optional form field in the code exchange.
@@ -561,16 +565,26 @@ async def token_exchange(req: Request):
     if grant_type == "refresh_token":
         refresh = data.get("refresh_token","")
         if not isinstance(refresh,str) or not refresh.startswith("simpleai_refresh_"):
+            _audit_failure("refresh_token_invalid_format")
             return _oauth_error("invalid_grant")
         with _db() as db:
             row = db.execute("SELECT * FROM MCPOAuthRefresh WHERE token_hash=?",
                              (_hash(refresh),)).fetchone()
-            if (not row or row["revoked"] or row["expires_at"] <= now or
-                    row["client_id"]!=client_id or row["audience"]!=resource()):
+            failure = (
+                "refresh_token_not_found" if not row else
+                "refresh_token_reused_or_revoked" if row["revoked"] else
+                "refresh_token_expired" if row["expires_at"] <= now else
+                "refresh_token_client_mismatch" if row["client_id"] != client_id else
+                "refresh_token_audience_mismatch" if row["audience"] != resource() else
+                None
+            )
+            if failure:
+                _audit_failure(failure)
                 return _oauth_error("invalid_grant")
             updated = db.execute("UPDATE MCPOAuthRefresh SET revoked=1 "
                                  "WHERE token_hash=? AND revoked=0",(_hash(refresh),))
             if updated.rowcount != 1:
+                _audit_failure("refresh_token_concurrent_reuse")
                 return _oauth_error("invalid_grant")
             return _json(_new_tokens(db,client_id,row["scope"],row["family"],now))
     return _oauth_error("unsupported_grant_type")

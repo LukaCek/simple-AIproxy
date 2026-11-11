@@ -150,6 +150,12 @@ def _oauth_error(code: str, status: int = 400) -> JSONResponse:
     return _json({"error": code}, status)
 
 
+def _audit_failure(code: str) -> None:
+    """Persist only a fixed diagnostic reason, never OAuth secrets or tokens."""
+    import simpleai_mcp_logging as diagnostics
+    diagnostics.record("mcp_oauth", "warning", code)
+
+
 def _valid_redirect(uri: object) -> bool:
     if not isinstance(uri, str) or not 10 <= len(uri) <= 512:
         return False
@@ -435,9 +441,18 @@ async def authorize_decision(req: Request):
     with _db() as db:
         # The UPDATE is atomic even under two concurrent browser submissions.
         row = db.execute("SELECT * FROM MCPOAuthPending WHERE id=?", (attempt_id,)).fetchone()
-        if (not row or row["consumed"] or row["expires_at"] <= now or
-                not secrets.compare_digest(row["csrf_hash"], _hash(csrf))):
-            return HTMLResponse("Authorization expired or already used", status_code=400)
+        if not row:
+            _audit_failure("consent_request_unknown")
+            return HTMLResponse("Authorization request not found. Restart connection in ChatGPT.", status_code=400)
+        if row["consumed"]:
+            _audit_failure("consent_request_replayed")
+            return HTMLResponse("Authorization already submitted. Return to ChatGPT; if linking failed, start a fresh connection.", status_code=400)
+        if row["expires_at"] <= now:
+            _audit_failure("consent_request_expired")
+            return HTMLResponse("Authorization request expired. Restart connection in ChatGPT.", status_code=400)
+        if not secrets.compare_digest(row["csrf_hash"], _hash(csrf)):
+            _audit_failure("consent_csrf_invalid")
+            return HTMLResponse("Invalid authorization form. Restart connection in ChatGPT.", status_code=400)
         original = set(row["scope"].split())
         if permission == "operate" and OPERATE not in original:
             return HTMLResponse("Operation scope not requested", status_code=400)
@@ -496,10 +511,13 @@ async def token_exchange(req: Request):
     if (not isinstance(client_id,str) or
             (requested_resource is not None and requested_resource != resource())):
         return _oauth_error("invalid_request")
-    # Code grants always bind the requested resource. Refresh tokens already
-    # carry their original audience; some clients omit resource when refreshing.
-    if grant_type == "authorization_code" and requested_resource != resource():
-        return _oauth_error("invalid_request")
+    # Clients SHOULD echo RFC 8707 resource at the token endpoint, but some
+    # public OAuth clients omit this optional form field in the code exchange.
+    # The authorization request REQUIRED our exact MCP resource, and each
+    # one-time code stores that audience. We verify it below before issuing a
+    # token; accepting omitted resource cannot broaden the token audience.
+    if grant_type == "authorization_code" and requested_resource is None:
+        _audit_failure("code_exchange_resource_omitted")
     if any(k in data for k in ("client_secret","client_assertion")):
         return _oauth_error("invalid_client",401)
     now = int(time.time())
@@ -511,20 +529,32 @@ async def token_exchange(req: Request):
         if (not code.startswith("simpleai_code_") or
                 not re.fullmatch(r"[A-Za-z0-9._~-]{43,128}", verifier) or
                 not _valid_redirect(redirect)):
+            _audit_failure("authorization_code_parameters_invalid")
             return _oauth_error("invalid_grant")
         actual = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
         with _db() as db:
             row = db.execute("SELECT * FROM MCPOAuthCodes WHERE code_hash=?",(_hash(code),)).fetchone()
-            if (not row or row["consumed"] or row["expires_at"] <= now or
-                    row["client_id"]!=client_id or row["redirect_uri"]!=redirect or
-                    row["resource"]!=resource() or
-                    not secrets.compare_digest(row["challenge"],actual)):
+            failure = (
+                "authorization_code_not_found" if not row else
+                "authorization_code_reused" if row["consumed"] else
+                "authorization_code_expired" if row["expires_at"] <= now else
+                "authorization_code_client_mismatch" if row["client_id"] != client_id else
+                "authorization_code_redirect_mismatch" if row["redirect_uri"] != redirect else
+                "authorization_code_audience_mismatch" if row["resource"] != resource() else
+                "authorization_code_pkce_mismatch" if not secrets.compare_digest(row["challenge"], actual) else
+                None
+            )
+            if failure:
+                _audit_failure(failure)
                 return _oauth_error("invalid_grant")
             updated = db.execute("UPDATE MCPOAuthCodes SET consumed=1 "
                                  "WHERE code_hash=? AND consumed=0",(_hash(code),))
             if updated.rowcount != 1:
+                _audit_failure("authorization_code_concurrent_reuse")
                 return _oauth_error("invalid_grant")
-            return _json(_new_tokens(db,client_id,row["scope"],uuid.uuid4().hex,now))
+            result = _json(_new_tokens(db,client_id,row["scope"],uuid.uuid4().hex,now))
+            _audit_failure("authorization_code_exchange_succeeded")
+            return result
     if grant_type == "refresh_token":
         refresh = data.get("refresh_token","")
         if not isinstance(refresh,str) or not refresh.startswith("simpleai_refresh_"):

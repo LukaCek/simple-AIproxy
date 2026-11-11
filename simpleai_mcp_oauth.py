@@ -597,6 +597,19 @@ async def revoke(req: Request):
     return Response(status_code=200,headers={"Cache-Control":"no-store"})
 
 
+@router.get("/admin/api/mcp/oauth/diagnostics")
+async def admin_oauth_diagnostics(req: Request):
+    """Admin-only failure categories to troubleshoot browser MCP linking."""
+    _admin_verified(req)
+    import simpleai_mcp_logging as logs
+    entries = [event for event in logs.events(limit=200)["events"]
+               if event.get("component") == "mcp_oauth"]
+    # Every record already has fixed safe fields. Never disclose authorization
+    # codes, CSRF secrets, access/refresh tokens, or callback URLs.
+    return _json({"events": entries[:60],
+                  "note": "Privacy-safe OAuth codes only; no credentials are recorded"})
+
+
 @router.get("/admin/api/mcp/oauth/connections")
 async def admin_connections(req: Request):
     _admin_verified(req)

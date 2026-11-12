@@ -614,7 +614,7 @@ def test_mobile_consent_is_native_relative_form_without_hanging_javascript(clien
     assert 'name="csrf"' in page.text
     assert 'Connecting' not in page.text
     assert '<script' not in page.text
-    assert "form-action 'self'" in page.headers["content-security-policy"]
+    assert "form-action 'self' https://example.test;" in page.headers["content-security-policy"]
     assert "script-src" not in page.headers["content-security-policy"]
 
     # A native form POST must navigate to ChatGPT with the one-time code,
@@ -659,3 +659,43 @@ def test_consent_on_alternate_public_hostname_redirects_to_canonical_issuer(clie
                            headers={"Host": "aiproxy.cekluka.com"})
     assert canonical.status_code == 200
     assert 'action="/oauth/authorize"' in canonical.text
+
+
+def test_chromium_csp_form_action_allows_registered_chatgpt_oauth_return(client):
+    """Brave/Chromium validates form-action on redirects after POST/303 too."""
+    callback = "https://chatgpt.com/connector_platform_oauth_redirect"
+    cid = register(client, redirect=callback)
+    params = {
+        "response_type": "code", "client_id": cid,
+        "redirect_uri": callback,
+        "scope": "simpleai:read", "state": "chatgpt-mobile-oauth-state",
+        "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": RESOURCE,
+    }
+    page = client.get("/oauth/authorize", params=params, auth=ADMIN)
+    assert page.status_code == 200, page.text
+    csp = page.headers["content-security-policy"]
+    assert "form-action 'self' https://chatgpt.com;" in csp
+    assert "'none'" in csp
+    assert "https://evil.example" not in csp
+    assert 'action="/oauth/authorize"' in page.text
+
+    attempt = re.search(r'name="authorization_request_id" value="([^"]+)"', page.text)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+    approved = client.post("/oauth/authorize", data={
+        "authorization_request_id": attempt.group(1),
+        "csrf": csrf.group(1), "permission": "read", "decision": "approve",
+    }, auth=ADMIN, follow_redirects=False)
+    assert approved.status_code == 303
+    target = urlsplit(approved.headers["location"])
+    assert target.scheme == "https"
+    assert target.netloc == "chatgpt.com"
+    assert target.path == "/connector_platform_oauth_redirect"
+    assert "code" in parse_qs(target.query)
+
+    # A forged callback cannot influence a valid client's form CSP.
+    rejected = client.get("/oauth/authorize", params={
+        **params, "redirect_uri": "https://evil.example/connector_platform_oauth_redirect",
+    }, auth=ADMIN, follow_redirects=False)
+    assert rejected.status_code == 400
+    assert "location" not in rejected.headers

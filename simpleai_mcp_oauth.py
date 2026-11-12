@@ -417,14 +417,14 @@ async def authorize(req: Request):
     # ChatGPT/MCP callback is blocked by "form-action 'self'" unless that
     # verified callback origin is explicitly present in the policy.
     callback = urlsplit(redirect_uri)
-    if not re.fullmatch(r"(?:[A-Za-z0-9.-]+|\\[[0-9A-Fa-f:.]+\\])(?::[0-9]{1,5})?",
+    if not re.fullmatch(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?",
                         callback.netloc):
         return HTMLResponse("Invalid OAuth callback host", status_code=400)
     callback_origin = callback.scheme + "://" + callback.netloc
 
     now = int(time.time())
     nonce = secrets.token_urlsafe(32)
-    csrf = secrets.token_urlsafe(32
+    csrf = secrets.token_urlsafe(32)
     with _db() as db:
         _gc(db, now)
         db.execute("""INSERT INTO MCPOAuthPending

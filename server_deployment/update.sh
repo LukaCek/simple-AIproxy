@@ -94,6 +94,8 @@ allowed = {
     "consent_replay_after_completion", "consent_request_unknown",
     "consent_request_expired", "consent_csrf_invalid",
     "consent_origin_rejected", "refresh_token_reused_or_revoked",
+    "consent_post_received", "consent_approved_redirected",
+    "consent_denied_redirected",
 }
 counts = Counter()
 cutoff = datetime.now(timezone.utc) - timedelta(hours=24)

@@ -78,6 +78,17 @@ if data.get("issuer") != "https://aiproxy.cekluka.com" or data.get("simpleai_con
     sys.exit("ERROR: NPM routes OAuth to an outdated or incorrect server")
 print("Verified NPM OAuth route revision: idempotent-v2")'
 
+echo "[$(date +'%Y-%m-%d %H:%M:%S')] Checking canonical OAuth authorization host (no redirect loop)..."
+auth_status="$(curl --silent --show-error --max-time 12 \
+  --resolve aiproxy.cekluka.com:443:127.0.0.1 \
+  --output /dev/null --write-out '%{http_code}' \
+  "https://aiproxy.cekluka.com/oauth/authorize")"
+if [ "$auth_status" != "401" ]; then
+  echo "ERROR: Canonical OAuth route must challenge unauthenticated GET with HTTP 401, got $auth_status" >&2
+  exit 1
+fi
+echo "Verified canonical /oauth/authorize returns 401 without credentials."
+
 echo "[$(date +'%Y-%m-%d %H:%M:%S')] OAuth diagnostics (privacy-safe aggregate code counts)..."
 docker compose exec -T llm-proxy python - <<'PY'
 from collections import Counter

@@ -311,9 +311,19 @@ def test_repeated_browser_consent_shows_actionable_error_without_new_code(client
     assert first.status_code == 303
     second = client.post("/oauth/authorize", data=fields, auth=ADMIN,
                          headers={"Origin": ISSUER}, follow_redirects=False)
-    assert second.status_code == 400
-    assert "already submitted" in second.text.lower()
-    assert "code=" not in second.text
+    assert second.status_code == 303
+    assert second.headers["location"] == first.headers["location"]
+    # The same browser form does not mint a second grant, alter scopes, or
+    # bypass the one-use authorization code's PKCE verifier.
+    issued_code = parse_qs(urlsplit(first.headers["location"]).query)["code"][0]
+    good = exchange(client, cid, issued_code)
+    assert good.status_code == 200
+    assert exchange(client, cid, issued_code).status_code == 400
+    third = client.post("/oauth/authorize", data=fields, auth=ADMIN,
+                        headers={"Origin": ISSUER}, follow_redirects=False)
+    assert third.status_code == 200
+    assert "already been completed" in third.text
+    assert "location" not in third.headers
 
 
 def test_no_offline_access_means_no_refresh_token(client):
@@ -341,7 +351,11 @@ def test_oauth_csrf_and_consumed_consent(client):
     _,payload=authorize(client,cid)
     reused=client.post("/oauth/authorize",data=payload,auth=ADMIN,
                        headers={"Origin":ISSUER},follow_redirects=False)
-    assert reused.status_code==400
+    # A consumed consent whose code was already redeemed is acknowledged,
+    # not redirected with an expired/used authorization code.
+    assert reused.status_code==200
+    assert "already been completed" in reused.text
+    assert "location" not in reused.headers
     code,second=authorize(client,cid)
     malformed={**second,"csrf":"c"*43}
     invalid=client.post("/oauth/authorize",data=malformed,auth=ADMIN,
@@ -514,3 +528,83 @@ def test_admin_oauth_diagnostics_are_auth_protected_and_never_show_codes(client,
     assert code not in json.dumps(body)
     assert VERIFIER not in json.dumps(body)
     assert body["note"].startswith("Privacy-safe")
+
+
+def test_consent_duplicate_cannot_escalate_read_scope_to_operate(client):
+    cid = register(client)
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid,
+        "redirect_uri": CALLBACK,
+        "scope": "simpleai:read simpleai:operate",
+        "state": "same-form-two-submits", "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": RESOURCE,
+    }, auth=ADMIN)
+    assert page.status_code == 200
+    attempt = re.search(r'name="authorization_request_id" value="([^"]+)"', page.text)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+    assert attempt and csrf
+    fields = {
+        "authorization_request_id": attempt.group(1), "csrf": csrf.group(1),
+        "permission": "read", "decision": "approve",
+    }
+    first = client.post("/oauth/authorize", data=fields, auth=ADMIN,
+                        follow_redirects=False)
+    assert first.status_code == 303
+    # A duplicate POST tries to ask for operate. It must not issue another
+    # grant, nor change the original read-only authorization scope.
+    escalated = client.post("/oauth/authorize",
+                            data={**fields, "permission": "operate"}, auth=ADMIN,
+                            follow_redirects=False)
+    assert escalated.status_code == 303
+    assert escalated.headers["location"] == first.headers["location"]
+    code = parse_qs(urlsplit(first.headers["location"]).query)["code"][0]
+    issued = exchange(client, cid, code)
+    assert issued.status_code == 200
+    assert "simpleai:operate" not in issued.json()["scope"].split()
+
+
+def test_duplicate_consent_with_wrong_csrf_never_replays_authorization_code(client):
+    cid = register(client)
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid,
+        "redirect_uri": CALLBACK,
+        "scope": "simpleai:read",
+        "state": "same-form-csrf-replay", "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": RESOURCE,
+    }, auth=ADMIN)
+    assert page.status_code == 200
+    attempt = re.search(r'name="authorization_request_id" value="([^"]+)"', page.text)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+    fields = {
+        "authorization_request_id": attempt.group(1), "csrf": csrf.group(1),
+        "permission": "read", "decision": "approve",
+    }
+    first = client.post("/oauth/authorize", data=fields, auth=ADMIN,
+                        follow_redirects=False)
+    assert first.status_code == 303
+    invalid = client.post("/oauth/authorize",
+                          data={**fields, "csrf": "x" * 43}, auth=ADMIN,
+                          follow_redirects=False)
+    assert invalid.status_code == 400
+    assert "location" not in invalid.headers
+    retried = client.post("/oauth/authorize", data=fields, auth=ADMIN,
+                          follow_redirects=False)
+    assert retried.status_code == 303
+    assert retried.headers["location"] == first.headers["location"]
+
+
+def test_consent_client_side_submits_only_once_and_retains_csrf(client):
+    cid = register(client)
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid,
+        "redirect_uri": CALLBACK, "scope": "simpleai:read",
+        "state": "safe-browser-form-123", "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": RESOURCE,
+    }, auth=ADMIN)
+    assert page.status_code == 200
+    assert 'id="mcp-consent-form"' in page.text
+    assert 'let submitted = false;' in page.text
+    assert 'event.preventDefault();' in page.text
+    assert 'name="csrf"' in page.text
+    assert "script-src 'nonce-" in page.headers["content-security-policy"]
+    assert "form-action 'self'" in page.headers["content-security-policy"]

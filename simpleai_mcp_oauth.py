@@ -273,6 +273,9 @@ async def authorization_server_metadata():
     base = issuer()
     return _json({
         "issuer": base,
+        # Public, non-secret release marker: allows deployment checks to verify
+        # that the external Nginx Proxy Manager route serves current MCP code.
+        "simpleai_consent_revision": "idempotent-v2",
         "authorization_response_iss_parameter_supported": True,
         "authorization_endpoint": base + "/oauth/authorize",
         "token_endpoint": base + "/oauth/token",

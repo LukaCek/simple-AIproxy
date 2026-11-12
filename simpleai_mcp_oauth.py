@@ -412,9 +412,19 @@ async def authorize(req: Request):
     except ValueError as exc:
         # Never redirect to an unverified callback.
         return HTMLResponse("Invalid OAuth authorization request", status_code=400)
+    # Brave/Chromium applies CSP form-action to POST 303 redirects as well as
+    # to the initial HTML form action. Redirecting to the user's approved
+    # ChatGPT/MCP callback is blocked by "form-action 'self'" unless that
+    # verified callback origin is explicitly present in the policy.
+    callback = urlsplit(redirect_uri)
+    if not re.fullmatch(r"(?:[A-Za-z0-9.-]+|\\[[0-9A-Fa-f:.]+\\])(?::[0-9]{1,5})?",
+                        callback.netloc):
+        return HTMLResponse("Invalid OAuth callback host", status_code=400)
+    callback_origin = callback.scheme + "://" + callback.netloc
+
     now = int(time.time())
     nonce = secrets.token_urlsafe(32)
-    csrf = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(32
     with _db() as db:
         _gc(db, now)
         db.execute("""INSERT INTO MCPOAuthPending
@@ -458,7 +468,7 @@ async def authorize(req: Request):
     </body></html>"""
     return HTMLResponse(page, headers={
         "Cache-Control": "no-store", "Content-Security-Policy":
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        f"default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {callback_origin}; frame-ancestors 'none'; base-uri 'none'",
         "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"})
 
 

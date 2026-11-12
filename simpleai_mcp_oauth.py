@@ -417,6 +417,14 @@ async def authorize(req: Request):
     except ValueError as exc:
         # Never redirect to an unverified callback.
         return HTMLResponse("Invalid OAuth authorization request", status_code=400)
+    # Chromium/Brave enforces CSP form-action on redirects too. OAuth's
+    # POST /oauth/authorize returns HTTP 303 to the client's *registered*
+    # callback, often https://chatgpt.com. A policy with only 'self' blocks
+    # that redirect even after the server successfully issued the code.
+    # Allow exactly the origin from the already validated redirect_uri.
+    callback = urlsplit(redirect_uri)
+    callback_origin = callback.scheme + "://" + callback.netloc
+
     now = int(time.time())
     nonce = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(32)
@@ -462,7 +470,7 @@ async def authorize(req: Request):
       </form></section></body></html>"""
     return HTMLResponse(page, headers={
         "Cache-Control": "no-store", "Content-Security-Policy":
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        f"default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {callback_origin}; frame-ancestors 'none'; base-uri 'none'",
         "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"})
 
 

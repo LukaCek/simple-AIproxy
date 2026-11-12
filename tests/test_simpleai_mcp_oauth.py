@@ -600,18 +600,62 @@ def test_duplicate_consent_with_wrong_csrf_never_replays_authorization_code(clie
     assert retried.headers["location"] == first.headers["location"]
 
 
-def test_consent_client_side_submits_only_once_and_retains_csrf(client):
+def test_mobile_consent_is_native_relative_form_without_hanging_javascript(client):
     cid = register(client)
-    page = client.get("/oauth/authorize", params={
+    params = {
         "response_type": "code", "client_id": cid,
         "redirect_uri": CALLBACK, "scope": "simpleai:read",
         "state": "safe-browser-form-123", "code_challenge": CHALLENGE,
         "code_challenge_method": "S256", "resource": RESOURCE,
-    }, auth=ADMIN)
+    }
+    page = client.get("/oauth/authorize", params=params, auth=ADMIN)
     assert page.status_code == 200
-    assert 'id="mcp-consent-form"' in page.text
-    assert 'let submitted = false;' in page.text
-    assert 'event.preventDefault();' in page.text
+    assert 'id="mcp-consent-form" action="/oauth/authorize" method="post"' in page.text
     assert 'name="csrf"' in page.text
-    assert "script-src 'nonce-" in page.headers["content-security-policy"]
+    assert 'Connecting' not in page.text
+    assert '<script' not in page.text
     assert "form-action 'self'" in page.headers["content-security-policy"]
+    assert "script-src" not in page.headers["content-security-policy"]
+
+    # A native form POST must navigate to ChatGPT with the one-time code,
+    # never depend on a browser script changing a button label.
+    attempt = re.search(r'name="authorization_request_id" value="([^"]+)"', page.text)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+    assert attempt and csrf
+    posted = client.post("/oauth/authorize", data={
+        "authorization_request_id": attempt.group(1), "csrf": csrf.group(1),
+        "permission": "read", "decision": "approve",
+    }, auth=ADMIN, follow_redirects=False)
+    assert posted.status_code == 303, posted.text
+    assert posted.headers["location"].startswith(CALLBACK + "?")
+    query = parse_qs(urlsplit(posted.headers["location"]).query)
+    assert query["state"] == ["safe-browser-form-123"]
+    assert exchange(client, cid, query["code"][0]).status_code == 200
+
+
+def test_consent_on_alternate_public_hostname_redirects_to_canonical_issuer(client):
+    # Some in-app browsers or NPM aliases expose proxy.cekluka.com rather
+    # than aiproxy.cekluka.com. Canonicalize *before* creating pending auth,
+    # rather than serving a cross-origin form that CSP might silently block.
+    cid = register(client)
+    params = {
+        "response_type": "code", "client_id": cid,
+        "redirect_uri": CALLBACK, "scope": "simpleai:read",
+        "state": "redirect-host-state-12345", "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": RESOURCE,
+    }
+    redirected = client.get("/oauth/authorize", params=params, auth=ADMIN,
+                            headers={"Host": "proxy.cekluka.com"},
+                            follow_redirects=False)
+    assert redirected.status_code == 302, redirected.text
+    location = redirected.headers["location"]
+    assert location.startswith(ISSUER + "/oauth/authorize?")
+    assert "client_id=" in location
+    assert urlsplit(location).hostname == "aiproxy.cekluka.com"
+    assert redirected.headers["cache-control"] == "no-store"
+
+    # The consent is created and approved only on the canonical domain.
+    canonical = client.get("/oauth/authorize", params=params, auth=ADMIN,
+                           headers={"Host": "aiproxy.cekluka.com"})
+    assert canonical.status_code == 200
+    assert 'action="/oauth/authorize"' in canonical.text

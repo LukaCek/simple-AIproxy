@@ -465,6 +465,8 @@ async def authorize(req: Request):
 @router.post("/oauth/authorize")
 async def authorize_decision(req: Request):
     _admin_verified(req)
+    import simpleai_mcp_logging as diagnostics
+    diagnostics.record("mcp_oauth", "info", "consent_post_received")
     if not _same_origin_post(req):
         _audit_failure("consent_origin_rejected")
         raise HTTPException(403, "Invalid consent origin")
@@ -540,6 +542,9 @@ async def authorize_decision(req: Request):
                  now + CODE_TTL))
             target = row["redirect_uri"]
             query = {"code": code, "state": row["state"], "iss": issuer()}
+    diagnostics.record("mcp_oauth", "info",
+                       "consent_approved_redirected" if decision == "approve"
+                       else "consent_denied_redirected")
     return _callback_redirect(target, query)
 
 

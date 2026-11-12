@@ -380,6 +380,25 @@ def _callback_redirect(uri: str, query: dict) -> RedirectResponse:
 
 @router.get("/oauth/authorize", response_class=HTMLResponse)
 async def authorize(req: Request):
+    # OAuth's issuer is fixed. If a ChatGPT in-app browser arrives via
+    # proxy.cekluka.com (without the "ai" prefix), our old absolute form
+    # action targeted a *different* origin while CSP restricted form-action
+    # to 'self'. The browser silently blocked POST after our JS had already
+    # changed the button to "Connecting...". Canonicalize the GET before
+    # showing a password/consent form; never reflect the untrusted Host into
+    # a redirect target. Local TestClient addresses remain valid for tests.
+    from urllib.parse import urlsplit as _split
+    canonical_host = _split(issuer()).hostname
+    current_host = req.url.hostname
+    if current_host != canonical_host and current_host not in (
+            "testserver", "localhost", "127.0.0.1", "::1"):
+        query = req.scope.get("query_string", b"").decode("ascii", "replace")
+        target = issuer() + "/oauth/authorize" + ("?" + query if query else "")
+        import simpleai_mcp_logging as diagnostics
+        diagnostics.record("mcp_oauth", "info", "consent_canonical_host_redirect")
+        return RedirectResponse(target, status_code=302, headers={
+            "Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
     _admin_verified(req)
     values = dict(req.query_params)
     client_id = values.get("client_id", "")
@@ -401,7 +420,6 @@ async def authorize(req: Request):
     now = int(time.time())
     nonce = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(32)
-    script_nonce = secrets.token_urlsafe(18)
     with _db() as db:
         _gc(db, now)
         db.execute("""INSERT INTO MCPOAuthPending
@@ -434,34 +452,17 @@ async def authorize(req: Request):
       <p>After approval, this client can query your worker diagnostics and
       routing state. Operate access can change models and use provider credits.</p>
       <small>Callback: {esc(redirect_uri)}</small>
-      <form id="mcp-consent-form" action="{esc(issuer())}/oauth/authorize" method="post">
+      <form id="mcp-consent-form" action="/oauth/authorize" method="post">
         <input type="hidden" name="authorization_request_id" value="{esc(nonce)}">
         <input type="hidden" name="csrf" value="{esc(csrf)}">
         <label>Permissions<select name="permission">{choices}</select></label>
         <p><small>{'Offline access requested: refreshing the connection for up to 30 days.' if wants_offline else 'No offline access requested.'}</small></p>
         <button class="approve" type="submit" name="decision" value="approve">Authorize</button>
         <button type="submit" name="decision" value="deny">Deny</button>
-      </form></section>
-    <script nonce="{esc(script_nonce)}">
-    (() => {{
-      const form = document.getElementById("mcp-consent-form");
-      let submitted = false;
-      form.addEventListener("submit", event => {{
-        if (submitted) {{
-          event.preventDefault();
-          return;
-        }}
-        submitted = true;
-        // Keep the submit button enabled; the browser must serialize its
-        // name/value to distinguish approve and deny.
-        const button = event.submitter;
-        if (button) button.textContent = "Connecting…";
-      }});
-    }})();
-    </script></body></html>"""
+      </form></section></body></html>"""
     return HTMLResponse(page, headers={
         "Cache-Control": "no-store", "Content-Security-Policy":
-        f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{script_nonce}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"})
 
 
@@ -471,6 +472,8 @@ async def authorize_decision(req: Request):
     if not _same_origin_post(req):
         _audit_failure("consent_origin_rejected")
         raise HTTPException(403, "Invalid consent origin")
+    import simpleai_mcp_logging as diagnostics
+    diagnostics.record("mcp_oauth", "info", "consent_post_received")
     try:
         data = await _body_form(req)
     except (ValueError, UnicodeError):
@@ -543,6 +546,7 @@ async def authorize_decision(req: Request):
                  now + CODE_TTL))
             target = row["redirect_uri"]
             query = {"code": code, "state": row["state"], "iss": issuer()}
+    diagnostics.record("mcp_oauth", "info", "consent_redirect_issued")
     return _callback_redirect(target, query)
 
 

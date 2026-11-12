@@ -600,7 +600,7 @@ def test_duplicate_consent_with_wrong_csrf_never_replays_authorization_code(clie
     assert retried.headers["location"] == first.headers["location"]
 
 
-def test_consent_client_side_submits_only_once_and_retains_csrf(client):
+def test_consent_form_stays_same_origin_without_javascript(client):
     cid = register(client)
     page = client.get("/oauth/authorize", params={
         "response_type": "code", "client_id": cid,
@@ -610,8 +610,77 @@ def test_consent_client_side_submits_only_once_and_retains_csrf(client):
     }, auth=ADMIN)
     assert page.status_code == 200
     assert 'id="mcp-consent-form"' in page.text
-    assert 'let submitted = false;' in page.text
-    assert 'event.preventDefault();' in page.text
+    # No absolute action to another hostname. CSP 'form-action self' must be
+    # compatible even if a mobile in-app browser opened an alias URL.
+    assert 'action="/oauth/authorize"' in page.text
     assert 'name="csrf"' in page.text
-    assert "script-src 'nonce-" in page.headers["content-security-policy"]
+    assert '<script' not in page.text
+    assert 'Connecting…' not in page.text
     assert "form-action 'self'" in page.headers["content-security-policy"]
+
+
+def test_noncanonical_mobile_consent_host_redirects_to_known_issuer(client):
+    """The user screenshot shows proxy.cekluka.com (missing the 'ai' prefix).
+
+    Consent must redirect to the canonical OAuth issuer *before* Basic login,
+    and must preserve the original OAuth parameters without leaking them to a
+    client-supplied Host. After redirect, the POST action remains same-origin.
+    """
+    cid = register(client)
+    params = {
+        "response_type": "code", "client_id": cid,
+        "redirect_uri": CALLBACK,
+        "scope": "simpleai:read", "state": "mobile-origin-state-1234",
+        "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": RESOURCE,
+    }
+    wrong_host = client.get("/oauth/authorize", params=params,
+                            headers={"Host": "proxy.cekluka.com"},
+                            follow_redirects=False)
+    assert wrong_host.status_code == 302, wrong_host.text
+    location = wrong_host.headers["location"]
+    assert location.startswith(ISSUER + "/oauth/authorize?")
+    assert "proxy.cekluka.com/oauth/authorize" not in location
+    assert parse_qs(urlsplit(location).query)["state"] == [
+        "mobile-origin-state-1234"]
+    assert wrong_host.headers["cache-control"] == "no-store"
+
+    # A browser following the new issuer can authenticate and use the
+    # ordinary relative POST without being blocked by form-action 'self'.
+    page = client.get("/oauth/authorize", params=params, auth=ADMIN,
+                      headers={"Host": "aiproxy.cekluka.com"})
+    assert page.status_code == 200, page.text
+    assert 'action="/oauth/authorize"' in page.text
+    assert 'name="csrf"' in page.text
+
+
+def test_consent_form_arrival_and_redirect_emits_only_safe_event_codes(client, monkeypatch):
+    import simpleai_mcp_logging as logs
+    events = []
+    original = logs.record
+
+    def capture(component, level, code, *, exception_type=""):
+        events.append((component, level, code, exception_type))
+        return original(component, level, code, exception_type=exception_type)
+
+    monkeypatch.setattr(logs, "record", capture)
+    cid = register(client)
+    page = client.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": cid, "redirect_uri": CALLBACK,
+        "scope": "simpleai:read", "state": "test-consent-post-observability",
+        "code_challenge": CHALLENGE, "code_challenge_method": "S256",
+        "resource": RESOURCE,
+    }, auth=ADMIN)
+    assert page.status_code == 200
+    attempt = re.search(r'name="authorization_request_id" value="([^"]+)"', page.text)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+    assert attempt and csrf
+    response = client.post("/oauth/authorize", data={
+        "authorization_request_id": attempt.group(1), "csrf": csrf.group(1),
+        "permission": "read", "decision": "approve",
+    }, auth=ADMIN, follow_redirects=False)
+    assert response.status_code == 303
+    assert ("mcp_oauth", "info", "consent_post_received", "") in events
+    assert ("mcp_oauth", "info", "consent_redirect_issued", "") in events
+    assert not any(attempt.group(1) in str(event) or csrf.group(1) in str(event)
+                   for event in events)

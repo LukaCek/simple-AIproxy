@@ -348,14 +348,20 @@ def test_oauth_revocation_and_expiration(client):
 
 def test_oauth_csrf_and_consumed_consent(client):
     cid=register(client)
-    _,payload=authorize(client,cid)
+    original_code,payload=authorize(client,cid)
     reused=client.post("/oauth/authorize",data=payload,auth=ADMIN,
                        headers={"Origin":ISSUER},follow_redirects=False)
-    # A consumed consent whose code was already redeemed is acknowledged,
-    # not redirected with an expired/used authorization code.
-    assert reused.status_code==200
-    assert "already been completed" in reused.text
-    assert "location" not in reused.headers
+    # A repeat before the code is redeemed must return the original callback.
+    assert reused.status_code==303
+    returned=parse_qs(urlsplit(reused.headers["location"]).query)["code"][0]
+    assert returned == original_code
+    assert exchange(client,cid,original_code).status_code==200
+    # Once redeemed, the same form no longer redirects to a spent code.
+    repeated=client.post("/oauth/authorize",data=payload,auth=ADMIN,
+                         headers={"Origin":ISSUER},follow_redirects=False)
+    assert repeated.status_code==200
+    assert "already been completed" in repeated.text
+    assert "location" not in repeated.headers
     code,second=authorize(client,cid)
     malformed={**second,"csrf":"c"*43}
     invalid=client.post("/oauth/authorize",data=malformed,auth=ADMIN,

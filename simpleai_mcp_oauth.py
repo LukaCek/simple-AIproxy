@@ -488,15 +488,35 @@ async def authorize_decision(req: Request):
         if not row:
             _audit_failure("consent_request_unknown")
             return HTMLResponse("Authorization request not found. Restart connection in ChatGPT.", status_code=400)
-        if row["consumed"]:
-            _audit_failure("consent_request_replayed")
-            return HTMLResponse("Authorization already submitted. Return to ChatGPT; if linking failed, start a fresh connection.", status_code=400)
         if row["expires_at"] <= now:
             _audit_failure("consent_request_expired")
             return HTMLResponse("Authorization request expired. Restart connection in ChatGPT.", status_code=400)
+        # Never disclose the prior approval state before verifying the same
+        # authenticated admin and the original unpredictable CSRF secret.
         if not secrets.compare_digest(row["csrf_hash"], _hash(csrf)):
             _audit_failure("consent_csrf_invalid")
             return HTMLResponse("Invalid authorization form. Restart connection in ChatGPT.", status_code=400)
+        if row["consumed"]:
+            code = _consent_code(attempt_id, csrf)
+            issued = db.execute(
+                "SELECT consumed,expires_at FROM MCPOAuthCodes WHERE code_hash=?",
+                (_hash(code),)).fetchone()
+            if issued and not issued["consumed"] and issued["expires_at"] > now:
+                # A duplicate consent POST before redemption must not create
+                # a second code: repeat the same redirect to the same client.
+                import simpleai_mcp_logging as diagnostics
+                diagnostics.record("mcp_oauth", "info", "consent_replay_redirected")
+                return _callback_redirect(row["redirect_uri"], {
+                    "code": code, "state": row["state"], "iss": issuer()})
+            # When the original code is already redeemed or expired, do not
+            # send the user to ChatGPT with a spent code.
+            import simpleai_mcp_logging as diagnostics
+            diagnostics.record("mcp_oauth", "info", "consent_replay_after_completion")
+            return HTMLResponse(
+                "This authorization has already been completed. Return to "
+                "ChatGPT to finish connecting. If it still fails, start a "
+                "new connection from ChatGPT.", status_code=200,
+                headers={"Cache-Control": "no-store"})
         original = set(row["scope"].split())
         if permission == "operate" and OPERATE not in original:
             return HTMLResponse("Operation scope not requested", status_code=400)
@@ -508,7 +528,7 @@ async def authorize_decision(req: Request):
             target = row["redirect_uri"]
             query = {"error": "access_denied", "state": row["state"], "iss": issuer()}
         else:
-            code = "simpleai_code_" + secrets.token_urlsafe(32)
+            code = _consent_code(attempt_id, csrf)
             granted = {READ} if permission == "read" else {READ,OPERATE}
             if OFFLINE in original:
                 granted.add(OFFLINE)
@@ -520,9 +540,7 @@ async def authorize_decision(req: Request):
                  now + CODE_TTL))
             target = row["redirect_uri"]
             query = {"code": code, "state": row["state"], "iss": issuer()}
-    sep = "&" if "?" in target else "?"
-    return RedirectResponse(target + sep + urlencode(query), status_code=303,
-                            headers={"Cache-Control":"no-store","Referrer-Policy":"no-referrer"})
+    return _callback_redirect(target, query)
 
 
 def _new_tokens(db, client_id: str, scope: str, family: str, now: int) -> dict:

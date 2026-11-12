@@ -640,7 +640,7 @@ def test_noncanonical_mobile_consent_host_redirects_to_known_issuer(client):
     assert wrong_host.status_code == 302, wrong_host.text
     location = wrong_host.headers["location"]
     assert location.startswith(ISSUER + "/oauth/authorize?")
-    assert "proxy.cekluka.com/oauth/authorize" not in location
+    assert urlsplit(location).hostname == "aiproxy.cekluka.com"
     assert parse_qs(urlsplit(location).query)["state"] == [
         "mobile-origin-state-1234"]
     assert wrong_host.headers["cache-control"] == "no-store"

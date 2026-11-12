@@ -84,6 +84,7 @@ def test_discovery_and_oauth_challenge(client):
     assert metadata.status_code==200
     d=metadata.json()
     assert d["issuer"]==ISSUER
+    assert d["simpleai_consent_revision"]=="idempotent-v2"
     assert d["authorization_response_iss_parameter_supported"] is True
     assert d["token_endpoint"]==ISSUER+"/oauth/token"
     assert d["registration_endpoint"]==ISSUER+"/oauth/register"

@@ -28,6 +28,9 @@ jobs:
           EOF
           touch app.db
 
+      - name: Validate production deployment shell script
+        run: bash -n server_deployment/update.sh
+
       - name: Run Python tests
         run: |
           python -m pip install --upgrade pip
@@ -127,7 +130,7 @@ jobs:
           script: |
             cd ${{ secrets.DEPLOY_PATH }}
             chmod +x update.sh
-            ./update.sh
+            EXPECTED_COMMIT_SHA='${{ github.sha }}' ./update.sh
 
   report:
     needs: [test, build-and-push, deploy]

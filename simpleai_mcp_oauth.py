@@ -16,6 +16,7 @@ from threading import Lock
 import base64
 import hashlib
 import html
+import hmac
 import json
 import os
 import re
@@ -352,6 +353,28 @@ async def register_client(req: Request):
     }, 201)
 
 
+def _consent_code(attempt_id: str, csrf: str) -> str:
+    """Recreate the same cryptographically random one-use code on POST retry.
+
+    The database contains only SHA256(code) and SHA256(CSRF). The high-entropy
+    *plaintext* CSRF is held by the original browser form, not by SQLite.
+    Therefore replay does not issue another grant and a database reader cannot
+    derive the original code.
+    """
+    digest = hmac.new(csrf.encode("ascii"),
+                      ("simpleai-mcp-consent-v1:" + attempt_id).encode("ascii"),
+                      hashlib.sha256).digest()
+    return "simpleai_code_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _callback_redirect(uri: str, query: dict) -> RedirectResponse:
+    separator = "&" if "?" in uri else "?"
+    return RedirectResponse(uri + separator + urlencode(query),
+                            status_code=303, headers={
+                                "Cache-Control": "no-store",
+                                "Referrer-Policy": "no-referrer"})
+
+
 @router.get("/oauth/authorize", response_class=HTMLResponse)
 async def authorize(req: Request):
     _admin_verified(req)
@@ -375,6 +398,7 @@ async def authorize(req: Request):
     now = int(time.time())
     nonce = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(32)
+    script_nonce = secrets.token_urlsafe(18)
     with _db() as db:
         _gc(db, now)
         db.execute("""INSERT INTO MCPOAuthPending
@@ -407,17 +431,34 @@ async def authorize(req: Request):
       <p>After approval, this client can query your worker diagnostics and
       routing state. Operate access can change models and use provider credits.</p>
       <small>Callback: {esc(redirect_uri)}</small>
-      <form action="{esc(issuer())}/oauth/authorize" method="post">
+      <form id="mcp-consent-form" action="{esc(issuer())}/oauth/authorize" method="post">
         <input type="hidden" name="authorization_request_id" value="{esc(nonce)}">
         <input type="hidden" name="csrf" value="{esc(csrf)}">
         <label>Permissions<select name="permission">{choices}</select></label>
         <p><small>{'Offline access requested: refreshing the connection for up to 30 days.' if wants_offline else 'No offline access requested.'}</small></p>
         <button class="approve" type="submit" name="decision" value="approve">Authorize</button>
         <button type="submit" name="decision" value="deny">Deny</button>
-      </form></section></body></html>"""
+      </form></section>
+    <script nonce="{esc(script_nonce)}">
+    (() => {{
+      const form = document.getElementById("mcp-consent-form");
+      let submitted = false;
+      form.addEventListener("submit", event => {{
+        if (submitted) {{
+          event.preventDefault();
+          return;
+        }}
+        submitted = true;
+        // Keep the submit button enabled; the browser must serialize its
+        // name/value to distinguish approve and deny.
+        const button = event.submitter;
+        if (button) button.textContent = "Connecting…";
+      }});
+    }})();
+    </script></body></html>"""
     return HTMLResponse(page, headers={
         "Cache-Control": "no-store", "Content-Security-Policy":
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{script_nonce}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"})
 
 

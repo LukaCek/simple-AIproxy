@@ -836,3 +836,11 @@ elif a[:2] == ["compose", "up"]:
     log = actions.read_text()
     assert "pull --quiet ghcr.io/lukacek/simple-aiproxy-worker:latest" in log
     assert "compose up -d --no-build --no-deps --force-recreate --pull never compute-worker" in log
+    import json
+    report = json.loads((node / ".host-updater-status.json").read_text())
+    assert report["last_result"] == "updated"
+    assert report["last_source"] == "proxy"
+    assert report["last_success_at"] > 0
+    assert report["last_check_at"] > 0
+    assert report["last_error"] == "none"
+    assert (node / ".host-updater-status.json").stat().st_mode & 0o777 == 0o600

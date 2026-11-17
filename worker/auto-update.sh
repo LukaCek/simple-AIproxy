@@ -209,7 +209,7 @@ UNIT
     die "Proxy-driven listener not enabled; backup timer remains active."
   systemctl --user is-active --quiet "simpleai-compute-listener@$name.service" ||
     die "Proxy-driven listener is not active; backup timer remains active."
-  log "Proxy release listener and four daily backup checks enabled for $name."
+  log "Automatic updates enabled for $name: proxy release listener and four daily backup checks."
   log "Status: systemctl --user status simpleai-compute-listener@$name.service"
   log "Backup: systemctl --user status simpleai-compute-update@$name.timer"
 }

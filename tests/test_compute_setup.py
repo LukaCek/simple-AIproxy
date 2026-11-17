@@ -831,7 +831,7 @@ elif a[:2] == ["compose", "up"]:
                                env=env, capture_output=True, text=True, timeout=12)
     # The fake 'sleep' stops the otherwise persistent systemd listener.
     assert completed.returncode == 17, completed.stderr
-    assert "Listener started" in completed.stdout
+    assert "Host listener started" in completed.stdout
     assert changed.exists() and acknowledged.read_text() == "ACK"
     log = actions.read_text()
     assert "pull --quiet ghcr.io/lukacek/simple-aiproxy-worker:latest" in log

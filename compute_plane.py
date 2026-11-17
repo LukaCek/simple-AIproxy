@@ -124,7 +124,12 @@ async def _release_watch_loop() -> None:
     try:
         await asyncio.sleep(30)
         while True:
-            await _check_worker_release_once()
+            try:
+                await _check_worker_release_once()
+            except Exception:
+                # An unexpected metadata/DB error must never stop the watcher
+                # permanently or interfere with live inference.
+                pass
             await asyncio.sleep(300)
     except asyncio.CancelledError:
         raise
@@ -460,6 +465,12 @@ def _public_node(row: dict[str, Any]) -> dict[str, Any]:
     models["disk_limit_bytes"] = _nonnegative_int(models.get("disk_limit_bytes"))
     return {
         "id": row["id"], "name": row["name"], "online": row["id"] in _connections,
+        "update_protocol": bool(_connections.get(row["id"]) and
+                                _connections[row["id"]].update_capable),
+        "update_notice_revision": (
+            _connections[row["id"]].last_update_notice
+            if row["id"] in _connections else ""
+        ),
         "allow_private": bool(row["allow_private"]), "revoked": bool(row["revoked"]),
         "hardware": hardware, "models": models, "last_seen": row["last_seen"],
     }

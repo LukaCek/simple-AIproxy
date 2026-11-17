@@ -142,6 +142,10 @@ install_timer() {
      ! grep -Fq '# SimpleAI Managed Worker Updater v1' "$units/simpleai-compute-update@.timer"; then
     die "Existing unmanaged timer unit will not be overwritten."
   fi
+  if [[ -f "$units/simpleai-compute-listener@.service" ]] &&
+     ! grep -Fq '# SimpleAI Managed Worker Updater v1' "$units/simpleai-compute-listener@.service"; then
+    die "Existing unmanaged listener unit will not be overwritten."
+  fi
   cat > "$units/simpleai-compute-update@.service" <<'UNIT'
 # SimpleAI Managed Worker Updater v1
 [Unit]
@@ -163,6 +167,20 @@ RandomizedDelaySec=30min
 Persistent=true
 [Install]
 WantedBy=timers.target
+UNIT
+  cat > "$units/simpleai-compute-listener@.service" <<'UNIT'
+# SimpleAI Managed Worker Updater v1
+[Unit]
+Description=SimpleAI Compute Worker %i: listen for proxy release notices
+[Service]
+Type=simple
+ExecStart=%h/.local/share/simpleai-compute/%i/auto-update.sh --listen %i
+Restart=always
+RestartSec=20
+Nice=10
+IOSchedulingClass=idle
+[Install]
+WantedBy=default.target
 UNIT
 
   # --user timers must continue running after the SSH session closes.
@@ -187,8 +205,13 @@ UNIT
     die "Timer could not be enabled. Check 'systemctl --user status simpleai-compute-update@$name.timer'."
   systemctl --user is-active --quiet "simpleai-compute-update@$name.timer" ||
     die "Timer is not active."
-  log "Automatic updates enabled for $name (four checks daily; no SSH needed)."
-  log "Status: systemctl --user status simpleai-compute-update@$name.timer"
+  systemctl --user enable --now "simpleai-compute-listener@$name.service" ||
+    die "Proxy-driven listener not enabled; backup timer remains active."
+  systemctl --user is-active --quiet "simpleai-compute-listener@$name.service" ||
+    die "Proxy-driven listener is not active; backup timer remains active."
+  log "Automatic updates enabled for $name: proxy release listener and four daily backup checks."
+  log "Status: systemctl --user status simpleai-compute-listener@$name.service"
+  log "Backup: systemctl --user status simpleai-compute-update@$name.timer"
 }
 
 worker_idle() {
@@ -290,6 +313,77 @@ check_update() {
   fi
 }
 
+# The host listener only consumes a fixed SHA marker from the authenticated
+# worker WSS session. It never executes proxy-supplied commands, scripts or
+# download URLs. Docker always pulls from the hard-coded GHCR image.
+read_update_notice() {
+  docker compose exec -T compute-worker python -c '
+import json, re
+from pathlib import Path
+p = Path("/data/host-update-request.json")
+if p.is_file() and p.stat().st_size <= 256:
+    try:
+        value = json.loads(p.read_text(encoding="ascii")).get("revision")
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value):
+            print(value)
+    except (OSError, ValueError, TypeError):
+        pass
+' 2>/dev/null || :
+}
+
+worker_revision() {
+  docker compose exec -T compute-worker python -c '
+import os
+print(os.getenv("WORKER_BUILD_REVISION", ""))
+' 2>/dev/null || :
+}
+
+ack_update_notice() {
+  docker compose exec -T compute-worker python -c '
+import json, pathlib, sys
+p = pathlib.Path("/data/host-update-request.json")
+try:
+    if json.loads(p.read_text(encoding="ascii")).get("revision") == sys.argv[1]:
+        p.unlink()
+except (OSError, ValueError, TypeError):
+    pass
+' "$1" >/dev/null 2>&1 || :
+}
+
+listen_update_requests() {
+  [[ $# -eq 0 ]] || die "Usage: updater --listen WORKER_NAME"
+  check_service_image
+  cd "$dir"
+  local target installed now previous_attempt='' attempted_at=0
+  log "Host listener started. Waiting for authenticated proxy release notices."
+  while true; do
+    target="$(read_update_notice)"
+    if [[ "$target" =~ ^[0-9a-f]{40}$ ]]; then
+      installed="$(worker_revision)"
+      if [[ "$target" == "$installed" ]]; then
+        ack_update_notice "$target"
+        previous_attempt=''
+      else
+        now="$(date +%s)"
+        # A running inference may defer a check; retry in two minutes rather
+        # than spinning, and leave the six-hour timer as a final fallback.
+        if [[ "$target" != "$previous_attempt" ]] || (( now - attempted_at >= 120 )); then
+          previous_attempt="$target"
+          attempted_at="$now"
+          if ! check_update; then
+            log "Update check failed; backup timer and listener will retry."
+          fi
+          if [[ "$(worker_revision)" == "$target" ]]; then
+            ack_update_notice "$target"
+            previous_attempt=''
+          fi
+        fi
+      fi
+    fi
+    sleep 20
+  done
+}
+
 case "$mode" in
   --install)
     [[ $# -eq 3 || $# -eq 4 ]] ||
@@ -304,7 +398,12 @@ case "$mode" in
     ;;
   --status)
     [[ $# -eq 2 ]] || die "Usage: updater --status WORKER_NAME"
+    systemctl --user status "simpleai-compute-listener@$name.service" --no-pager || :
     systemctl --user status "simpleai-compute-update@$name.timer" --no-pager
+    ;;
+  --listen)
+    [[ $# -eq 2 ]] || die "Usage: updater --listen WORKER_NAME"
+    listen_update_requests
     ;;
   *) die "Usage: updater --install WORKER_NAME https://YOUR_PROXY | --check WORKER_NAME | --status WORKER_NAME" ;;
 esac

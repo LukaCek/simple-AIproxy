@@ -8,6 +8,9 @@ import hashlib
 import json
 import math
 import os
+import re
+
+import httpx
 import secrets
 import sqlite3
 import threading
@@ -50,6 +53,100 @@ _reservation_lock = threading.Lock()
 _reservations: dict[str, str] = {}
 _reservation_waiters: dict[str, int] = {}
 _installed = False
+_release_watch_task: asyncio.Task | None = None
+_latest_worker_release = ""
+_release_last_checked = 0
+
+# A main commit is not a valid release until the multi-architecture Docker
+# publish workflow finishes successfully.
+_WORKER_RELEASE_RUNS_URL = (
+    "https://api.github.com/repos/LukaCek/simple-AIproxy/"
+    "actions/workflows/compute-worker.yml/runs"
+)
+
+
+async def _fetch_worker_release() -> str | None:
+    """Get the latest successfully published main worker revision."""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+            response = await client.get(
+                _WORKER_RELEASE_RUNS_URL,
+                params={"branch": "main", "event": "push", "status": "success",
+                        "per_page": 1},
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": "SimpleAIProxy-WorkerReleaseWatcher"},
+            )
+        response.raise_for_status()
+        runs = response.json().get("workflow_runs", [])
+        if not isinstance(runs, list) or not runs:
+            return None
+        run = runs[0]
+        if not isinstance(run, dict) or run.get("head_branch") != "main":
+            return None
+        if run.get("event") != "push" or run.get("conclusion") != "success":
+            return None
+        sha = run.get("head_sha")
+        return sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        return None
+
+
+async def _send_release_notice(conn: "NodeConnection") -> None:
+    """Send only a release advisory, never a shell or Docker command."""
+    sha = _latest_worker_release
+    if not conn.update_capable or not sha or conn.last_update_notice == sha:
+        return
+    await conn.send({"type": "update_available", "revision": sha})
+    conn.last_update_notice = sha
+    _event(conn.node_id, "update_offered")
+
+
+async def _check_worker_release_once() -> str | None:
+    """Broadcast newly published versions, with reconnect replay."""
+    global _latest_worker_release, _release_last_checked
+    release = await _fetch_worker_release()
+    _release_last_checked = int(time.time())
+    if not release:
+        return None
+    changed = release != _latest_worker_release
+    _latest_worker_release = release
+    if changed:
+        for conn in list(_connections.values()):
+            try:
+                await _send_release_notice(conn)
+            except Exception:
+                pass  # Reconnect causes the pending notice to be re-sent.
+    return release
+
+
+async def _release_watch_loop() -> None:
+    """Server polls GitHub publish metadata; host timers remain the fallback."""
+    try:
+        await asyncio.sleep(30)
+        while True:
+            try:
+                await _check_worker_release_once()
+            except Exception:
+                # An unexpected metadata/DB error must never stop the watcher
+                # permanently or interfere with live inference.
+                pass
+            await asyncio.sleep(300)
+    except asyncio.CancelledError:
+        raise
+
+
+async def _start_worker_release_watch() -> None:
+    global _release_watch_task
+    if _release_watch_task is None or _release_watch_task.done():
+        _release_watch_task = asyncio.create_task(_release_watch_loop())
+
+
+async def _stop_worker_release_watch() -> None:
+    global _release_watch_task
+    if _release_watch_task:
+        _release_watch_task.cancel()
+        await asyncio.gather(_release_watch_task, return_exceptions=True)
+    _release_watch_task = None
 
 
 def _wait_timeout() -> float:
@@ -177,7 +274,7 @@ _EVENT_TYPES = frozenset({
     "enrolled", "connected", "disconnected", "policy_sent", "model_test",
     "model_loaded", "model_unloaded", "operation_started", "operation_succeeded",
     "operation_failed", "private_access_enabled", "private_access_disabled",
-    "revoked", "removed", "worker_diagnostic",
+    "revoked", "removed", "worker_diagnostic", "update_offered",
 })
 _MODEL_STATES = frozenset({"untested", "testing", "supported", "unsupported", "error"})
 
@@ -368,6 +465,12 @@ def _public_node(row: dict[str, Any]) -> dict[str, Any]:
     models["disk_limit_bytes"] = _nonnegative_int(models.get("disk_limit_bytes"))
     return {
         "id": row["id"], "name": row["name"], "online": row["id"] in _connections,
+        "update_protocol": bool(_connections.get(row["id"]) and
+                                _connections[row["id"]].update_capable),
+        "update_notice_revision": (
+            _connections[row["id"]].last_update_notice
+            if row["id"] in _connections else ""
+        ),
         "allow_private": bool(row["allow_private"]), "revoked": bool(row["revoked"]),
         "hardware": hardware, "models": models, "last_seen": row["last_seen"],
     }
@@ -380,6 +483,8 @@ class NodeConnection:
     pending: dict[str, asyncio.Queue] = field(default_factory=dict)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     catalog_capable: bool = False
+    update_capable: bool = False
+    last_update_notice: str = ""
     last_policy_signature: tuple | None = None
 
     async def send(self, message: dict[str, Any]) -> None:
@@ -850,7 +955,9 @@ async def compute_ws(ws: WebSocket):
             return
         conn = NodeConnection(ws=ws, node_id=node_id,
                               catalog_capable=(type(data.get("catalog_protocol")) is int
-                                               and data["catalog_protocol"] == 1))
+                                               and data["catalog_protocol"] == 1),
+                              update_capable=(type(data.get("update_protocol")) is int
+                                              and data["update_protocol"] == 1))
         async with _registry_lock:
             old = _connections.get(node_id)
             if old:
@@ -859,6 +966,7 @@ async def compute_ws(ws: WebSocket):
         await conn.send({"type": "auth_ok", "protocol": 1})
         # A node's policy may differ from the globally approved model list.
         await _send_node_policy(conn)
+        await _send_release_notice(conn)
         with _db() as db:
             db.execute("UPDATE ComputeNodes SET last_seen=? WHERE id=?", (int(time.time()), node_id))
         _event(node_id, "connected")
@@ -923,6 +1031,15 @@ async def compute_ws(ws: WebSocket):
             if _connections.get(conn.node_id) is conn:
                 _connections.pop(conn.node_id, None)
                 _event(conn.node_id, "disconnected")
+
+
+@router.get("/admin/api/compute/update-release", dependencies=[Depends(core.verify_admin)])
+async def worker_release_status() -> dict[str, Any]:
+    """Published-release metadata only; no worker secrets or raw payloads."""
+    return {"revision": _latest_worker_release or None,
+            "last_checked_at": _release_last_checked,
+            "poll_seconds": 300,
+            "mechanism": "WSS notice + host listener; systemd timer fallback"}
 
 
 @router.get("/admin/api/compute/nodes", dependencies=[Depends(core.verify_admin)])
@@ -1244,4 +1361,6 @@ def install(app):
     if not _installed:
         _setup()
         app.include_router(router)
+        app.router.on_startup.append(_start_worker_release_watch)
+        app.router.on_shutdown.append(_stop_worker_release_watch)
         _installed = True

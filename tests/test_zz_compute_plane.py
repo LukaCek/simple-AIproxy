@@ -663,3 +663,62 @@ def test_compute_events_reject_unapproved_categories(tmp_path, monkeypatch):
             pass
         else:
             raise AssertionError("Unapproved event names must be rejected")
+
+
+def test_proxy_signals_only_update_capable_authenticated_worker(tmp_path, monkeypatch):
+    import compute_plane
+    monkeypatch.setattr(compute_plane, "_latest_worker_release", "a" * 40)
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, "update_protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            notice = ws.receive_json()
+            assert notice == {"type": "update_available", "revision": "a" * 40}
+            events = client.get("/admin/api/compute/events",
+                                auth=ADMIN, params={"node_id": identity["node_id"]}).json()["events"]
+            assert any(e["event"] == "update_offered" for e in events)
+        with client.websocket_connect("/compute/ws") as legacy:
+            legacy.send_json({"type": "auth", "protocol": 1, **identity})
+            assert legacy.receive_json()["type"] == "auth_ok"
+            # Legacy workers receive only the normal policy path.
+            legacy.send_json({"type": "telemetry", "hardware": {}, "models": {}})
+            # No unrecognized release message is sent to an old worker.
+            events = client.get("/admin/api/compute/events",
+                                auth=ADMIN, params={"node_id": identity["node_id"]}).json()["events"]
+            assert sum(e["event"] == "update_offered" for e in events) == 1
+
+
+def test_proxy_release_poll_requires_successful_published_commit(monkeypatch):
+    import asyncio
+    import compute_plane
+    monkeypatch.setattr(compute_plane, "_latest_worker_release", "")
+    monkeypatch.setattr(compute_plane, "_release_last_checked", 0)
+
+    class FakeConn:
+        update_capable = True
+        last_update_notice = ""
+        node_id = "f" * 32
+        def __init__(self):
+            self.messages = []
+        async def send(self, message):
+            self.messages.append(message)
+
+    conn = FakeConn()
+    monkeypatch.setattr(compute_plane, "_connections", {conn.node_id: conn})
+    events = []
+    monkeypatch.setattr(compute_plane, "_event",
+                        lambda node_id, kind, **kwargs: events.append((node_id, kind)))
+    async def valid_release():
+        return "b" * 40
+    async def unavailable():
+        return None
+    monkeypatch.setattr(compute_plane, "_fetch_worker_release", valid_release)
+    assert asyncio.run(compute_plane._check_worker_release_once()) == "b" * 40
+    assert conn.messages == [{"type": "update_available", "revision": "b" * 40}]
+    assert asyncio.run(compute_plane._check_worker_release_once()) == "b" * 40
+    assert len(conn.messages) == 1
+    assert events == [(conn.node_id, "update_offered")]
+    monkeypatch.setattr(compute_plane, "_fetch_worker_release", unavailable)
+    assert asyncio.run(compute_plane._check_worker_release_once()) is None
+    assert compute_plane._latest_worker_release == "b" * 40

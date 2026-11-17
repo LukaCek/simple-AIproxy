@@ -497,6 +497,11 @@ with open(os.environ["MOCK_ACTIONS"], "a") as f:
     assert "Persistent=true" in timer
     assert "OnCalendar=" in timer
     assert "enable --now simpleai-compute-update@demo.timer" in actions.read_text()
+    listener = (units / "simpleai-compute-listener@.service").read_text()
+    assert "ExecStart=%h/.local/share/simpleai-compute/%i/auto-update.sh --listen %i" in listener
+    assert "Restart=always" in listener
+    assert "enable --now simpleai-compute-listener@demo.service" in actions.read_text()
+    assert "OnCalendar=*-*-* 03,09,15,21:00:00" in timer
 
 
 def test_installer_bootstraps_docker_without_breaking_existing_working_docker(tmp_path):
@@ -767,3 +772,67 @@ def test_installer_does_not_restart_running_docker_for_socket_denial(tmp_path):
         "systemctl is-active --quiet docker.service",
         "sudo docker info",
     ]
+
+
+def test_proxy_host_listener_invokes_safe_updater_for_sha_notice(tmp_path):
+    """Host listener bridges worker signal to the existing GHCR-only updater."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "worker" / "auto-update.sh"
+    home = tmp_path / "home"
+    node = home / ".local/share/simpleai-compute/demo"
+    node.mkdir(parents=True)
+    (node / "docker-compose.yml").write_text(
+        "services:\n  compute-worker:\n    image: ghcr.io/lukacek/simple-aiproxy-worker:latest\n")
+    helpers = tmp_path / "bin"
+    helpers.mkdir()
+    actions = tmp_path / "actions.log"
+    changed = tmp_path / "updated"
+    acknowledged = tmp_path / "acknowledged"
+
+    docker = helpers / "docker"
+    docker.write_text(r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+a = sys.argv[1:]
+log = pathlib.Path(os.environ["MOCK_ACTIONS"])
+with log.open("a") as f:
+    f.write(" ".join(a).replace("\n", " ") + "\n")
+if a[:2] == ["compose", "config"]:
+    print(json.dumps({"services": {"compute-worker": {
+        "image": "ghcr.io/lukacek/simple-aiproxy-worker:latest"}}}))
+elif a[:3] == ["compose", "ps", "-q"]:
+    print("demo-container")
+elif a[:2] == ["inspect", "--format"]:
+    print("running" if "State.Status" in a[2] else "sha256:old")
+elif a[:3] == ["image", "inspect", "--format"]:
+    print("sha256:new")
+elif a[:3] == ["compose", "exec", "-T"]:
+    cmd = " ".join(a)
+    if "p.is_file()" in cmd:
+        print("b" * 40)
+    elif 'os.getenv("WORKER_BUILD_REVISION"' in cmd:
+        print("b" * 40 if pathlib.Path(os.environ["MOCK_UPDATED"]).exists() else "a" * 40)
+    elif "p.unlink()" in cmd:
+        pathlib.Path(os.environ["MOCK_ACK"]).write_text("ACK")
+elif a[:2] == ["compose", "up"]:
+    pathlib.Path(os.environ["MOCK_UPDATED"]).write_text("1")
+''')
+    docker.chmod(0o700)
+    sleeper = helpers / "sleep"
+    sleeper.write_text("#!/bin/sh\nexit 17\n")
+    sleeper.chmod(0o700)
+    env = {**os.environ, "HOME": str(home),
+           "PATH": str(helpers) + os.pathsep + os.environ.get("PATH", ""),
+           "MOCK_ACTIONS": str(actions), "MOCK_UPDATED": str(changed),
+           "MOCK_ACK": str(acknowledged)}
+    completed = subprocess.run(["bash", str(script), "--listen", "demo"],
+                               env=env, capture_output=True, text=True, timeout=12)
+    # The fake 'sleep' stops the otherwise persistent systemd listener.
+    assert completed.returncode == 17, completed.stderr
+    assert "Host listener started" in completed.stdout
+    assert changed.exists() and acknowledged.read_text() == "ACK"
+    log = actions.read_text()
+    assert "pull --quiet ghcr.io/lukacek/simple-aiproxy-worker:latest" in log
+    assert "compose up -d --no-build --no-deps --force-recreate --pull never compute-worker" in log

@@ -498,3 +498,26 @@ def test_transient_model_failure_has_bounded_automatic_retry():
     assert agent.should_test_model({"status": "supported"}, now=now) is False
     assert agent.should_test_model({"status": "unsupported"}, now=now) is False
     assert agent.should_test_model({"status": "unsupported"}, force=True, now=now) is True
+
+
+def test_wss_update_notice_writes_only_validated_host_signal(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "DATA", tmp_path)
+    monkeypatch.setenv("WORKER_BUILD_REVISION", "a" * 40)
+    signal = tmp_path / "host-update-request.json"
+    assert agent.queue_host_update_notice("a" * 40) is False
+    assert not signal.exists()
+    for invalid in ("bash -c rm -rf /", "https://example.org/setup.sh", "1234", None,
+                    "../../evil", "A" * 40):
+        assert agent.queue_host_update_notice(invalid) is False
+    assert agent.queue_host_update_notice("b" * 40) is True
+    assert json.loads(signal.read_text()) == {"revision": "b" * 40}
+    assert signal.stat().st_mode & 0o777 == 0o600
+    assert agent.queue_host_update_notice("b" * 40) is True
+    assert agent.queue_host_update_notice("c" * 40) is True
+    assert json.loads(signal.read_text()) == {"revision": "c" * 40}
+    signal.write_text("not-json")
+    assert agent.queue_host_update_notice("d" * 40) is True
+    assert json.loads(signal.read_text()) == {"revision": "d" * 40}
+    signal.write_text("[]")
+    assert agent.queue_host_update_notice("e" * 40) is True
+    assert json.loads(signal.read_text()) == {"revision": "e" * 40}

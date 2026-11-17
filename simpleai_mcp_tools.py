@@ -178,6 +178,8 @@ def _public_worker(node: dict) -> dict:
         "online": bool(d.get("online")), "revoked": bool(d.get("revoked")),
         "allow_private": bool(d.get("allow_private")),
         "last_seen": d.get("last_seen"),
+        "update_protocol": bool(d.get("update_protocol")),
+        "update_notice_revision": d.get("update_notice_revision") or None,
         "hardware": {
             "arch": _read_safe(hardware.get("arch"), 40),
             "os": _read_safe(hardware.get("os"), 40),
@@ -461,7 +463,9 @@ async def execute(name: str, args: dict, app) -> dict:
                           "/admin/codex-usage","/admin/playground","/admin/logs"],
                 "backing_state":{"workers":nodes,"groups":groups,"providers":providers,
                                  "model_policy":policy,"placement_mode":compute._placement_mode(),
-                                 "catalog_size":len(compute.CATALOG)},
+                                 "catalog_size":len(compute.CATALOG),
+                                 "worker_release":{"revision":compute._latest_worker_release or None,
+                                                   "last_checked_at":compute._release_last_checked}},
                 "consistency_warnings":warnings,
                 "limitation":"Server-side UI data consistency, not browser pixels or client-side JS"}
     if name == "get_operation":

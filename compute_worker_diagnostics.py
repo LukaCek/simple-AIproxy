@@ -58,7 +58,11 @@ def error_code(reason: object) -> str:
         return "timeout"
     if "download" in s or "huggingface" in s or "httpx" in s:
         return "download_failed"
-    if "connection" in s or "websocket" in s or "tls" in s or "dns" in s:
+    if ("connection" in s or "websocket" in s or "tls" in s or "dns" in s
+            or "no close frame received" in s
+            or "keepalive ping timeout" in s
+            or "ping timed out" in s
+            or "received 1006" in s):
         return "transport_error"
     if "busy" in s:
         return "worker_busy"

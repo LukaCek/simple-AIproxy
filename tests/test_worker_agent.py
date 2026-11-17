@@ -515,3 +515,9 @@ def test_wss_update_notice_writes_only_validated_host_signal(tmp_path, monkeypat
     assert agent.queue_host_update_notice("b" * 40) is True
     assert agent.queue_host_update_notice("c" * 40) is True
     assert json.loads(signal.read_text()) == {"revision": "c" * 40}
+    signal.write_text("not-json")
+    assert agent.queue_host_update_notice("d" * 40) is True
+    assert json.loads(signal.read_text()) == {"revision": "d" * 40}
+    signal.write_text("[]")
+    assert agent.queue_host_update_notice("e" * 40) is True
+    assert json.loads(signal.read_text()) == {"revision": "e" * 40}

@@ -433,11 +433,11 @@ def _safe_host_updater(raw: object) -> dict[str, Any] | None:
     """Client-visible allowlist; reject fabricated strings and invalid timestamps."""
     if not isinstance(raw, dict) or raw.get("schema") != 1:
         return None
-    if raw.get("last_result") not in _HOST_UPDATE_RESULTS:
+    if not isinstance(raw.get("last_result"), str) or raw["last_result"] not in _HOST_UPDATE_RESULTS:
         return None
-    if raw.get("last_error") not in _HOST_UPDATE_ERRORS:
+    if not isinstance(raw.get("last_error"), str) or raw["last_error"] not in _HOST_UPDATE_ERRORS:
         return None
-    if raw.get("last_source") not in _HOST_UPDATE_SOURCES:
+    if not isinstance(raw.get("last_source"), str) or raw["last_source"] not in _HOST_UPDATE_SOURCES:
         return None
     if type(raw.get("listener_active")) is not bool or type(raw.get("timer_enabled")) is not bool:
         return None

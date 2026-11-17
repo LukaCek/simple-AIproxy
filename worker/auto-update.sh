@@ -68,6 +68,9 @@ if not isinstance(prior, dict):
 now = int(time.time())
 def past_timestamp(value):
     return value if type(value) is int and 0 <= value <= now + 3600 else 0
+def known_choice(key, allowed, fallback):
+    value = prior.get(key)
+    return value if isinstance(value, str) and value in allowed else fallback
 state = {
     "schema": 1, "reported_at": now,
     "listener_active": sys.argv[5] == "1",
@@ -75,14 +78,14 @@ state = {
     "last_check_at": past_timestamp(prior.get("last_check_at")),
     "last_success_at": past_timestamp(prior.get("last_success_at")),
     "last_failure_at": past_timestamp(prior.get("last_failure_at")),
-    "last_result": prior.get("last_result") if prior.get("last_result") in {
+    "last_result": known_choice("last_result", {
         "unknown", "checking", "up_to_date", "updated", "deferred",
-        "blocked", "rolled_back", "failed"} else "unknown",
-    "last_error": prior.get("last_error") if prior.get("last_error") in {
+        "blocked", "rolled_back", "failed"}, "unknown"),
+    "last_error": known_choice("last_error", {
         "none", "registry_unavailable", "release_invalid",
-        "health_check_failed", "rollback_failed", "config_invalid"} else "none",
-    "last_source": prior.get("last_source") if prior.get("last_source") in {
-        "proxy", "scheduled_or_manual", "host"} else "host",
+        "health_check_failed", "rollback_failed", "config_invalid"}, "none"),
+    "last_source": known_choice("last_source", {
+        "proxy", "scheduled_or_manual", "host"}, "host"),
 }
 if result != "heartbeat":
     state.update(last_check_at=now, last_result=result,

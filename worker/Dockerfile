@@ -10,6 +10,7 @@ RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /src/llama.cpp
     && git checkout FETCH_HEAD \
     && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
        -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DLLAMA_CURL=ON \
+       -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
     && cmake --build build --target llama-server -j 2
 
 FROM python:3.11-slim-bookworm

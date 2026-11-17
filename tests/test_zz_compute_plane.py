@@ -530,9 +530,14 @@ def test_automatic_policy_moves_models_to_node_fit_and_resolves_exact_model(tmp_
                     "local/qwen35-2b-q4",
                     "local/qwen35-4b-q4",
                     "local/auto"}.issubset(model_ids)
-            quality = compute_plane.automatic_endpoints({"aiproxy_compute_tier": "quality"})
+            # The enrolled friend node is untrusted: private auto requests
+            # must not choose it even when its models passed self-tests.
+            assert compute_plane.automatic_endpoints({"aiproxy_compute_tier": "quality"}) == []
+            quality = compute_plane.automatic_endpoints({
+                "aiproxy_compute_tier": "quality", "aiproxy_visibility": "public"})
             assert len(quality) == 1 and quality[0]["model"] == "qwen35-4b-q4"
-            fast = compute_plane.automatic_endpoints({"aiproxy_compute_tier": "fast"})
+            fast = compute_plane.automatic_endpoints({
+                "aiproxy_compute_tier": "fast", "aiproxy_visibility": "public"})
             assert len(fast) == 1 and fast[0]["model"] == "qwen35-2b-q4"
             assert client.get("/admin/api/compute/placement", auth=ADMIN).json()["mode"] == "auto"
 

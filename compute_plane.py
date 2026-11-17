@@ -1350,6 +1350,6 @@ def install(app):
     if not _installed:
         _setup()
         app.include_router(router)
-        app.add_event_handler("startup", _start_worker_release_watch)
-        app.add_event_handler("shutdown", _stop_worker_release_watch)
+        app.router.on_startup.append(_start_worker_release_watch)
+        app.router.on_shutdown.append(_stop_worker_release_watch)
         _installed = True

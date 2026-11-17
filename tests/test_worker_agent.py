@@ -484,3 +484,17 @@ def test_worker_diagnostic_delivery_only_acks_after_proxy_response(tmp_path, mon
         assert not worker._diag_pending
 
     asyncio.run(run())
+
+
+def test_transient_model_failure_has_bounded_automatic_retry():
+    now = 1_900_000_000
+    cooldown = agent.MODEL_ERROR_RETRY_SECONDS
+    failed = {"status": "error", "tested_at": now}
+    assert agent.should_test_model(failed, now=now) is False
+    assert agent.should_test_model(failed, now=now + cooldown - 1) is False
+    assert agent.should_test_model(failed, now=now + cooldown) is True
+    assert agent.should_test_model({"status": "testing"}, now=now) is True
+    assert agent.should_test_model({"status": "error"}, now=now) is True
+    assert agent.should_test_model({"status": "supported"}, now=now) is False
+    assert agent.should_test_model({"status": "unsupported"}, now=now) is False
+    assert agent.should_test_model({"status": "unsupported"}, force=True, now=now) is True

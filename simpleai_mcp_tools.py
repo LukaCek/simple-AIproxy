@@ -142,6 +142,26 @@ def _code(value: object) -> str:
     return error_code(text)
 
 
+def _model_reason_code(status: object, reason: object) -> str:
+    """Report successful self-tests as success, never as an unknown error.
+
+    Preserve a sanitized failure class for failed and unsupported models.
+    """
+    if status == "supported":
+        return "test_supported"
+    if status == "testing":
+        return "test_start"
+    if status == "untested":
+        return "untested"
+    result = _code(reason)
+    if result == "unknown_error":
+        if status == "unsupported":
+            return "test_unsupported"
+        if status == "error":
+            return "test_failed"
+    return result
+
+
 def compute_catalog_ids() -> set[str]:
     import compute_plane
     return set(compute_plane.CATALOG)
@@ -180,7 +200,8 @@ def _public_worker(node: dict) -> dict:
                    "policy_revision": models.get("policy_revision")
                        if type(models.get("policy_revision")) is int else None,
                    "capabilities": {mid: {
-                       "status": state.get("status"), "reason_code": _code(state.get("reason")),
+                       "status": state.get("status"),
+                       "reason_code": _model_reason_code(state.get("status"), state.get("reason")),
                        "test_seconds": state.get("test_seconds"),
                        "tested_at": state.get("tested_at"),
                        "benchmark": state.get("benchmark", {}),
@@ -416,7 +437,8 @@ async def execute(name: str, args: dict, app) -> dict:
         available=[mid for mid in compute.CATALOG if compute.endpoints("local/"+mid)]
         return {"providers":providers,"groups":groups,
                 "compute_catalog":_catalog(compute),
-                "policy":policy,"routable_local_models":["local/"+x for x in available],
+                "policy":policy,"placement_mode":compute._placement_mode(),
+                "routable_local_models":["local/"+x for x in available],
                 "local_auto_available":bool(available)}
     if name == "ui_state":
         groups=_groups(core)
@@ -438,7 +460,8 @@ async def execute(name: str, args: dict, app) -> dict:
         return {"pages":["/admin/compute-nodes","/admin/groups","/admin/providers",
                           "/admin/codex-usage","/admin/playground","/admin/logs"],
                 "backing_state":{"workers":nodes,"groups":groups,"providers":providers,
-                                 "model_policy":policy,"catalog_size":len(compute.CATALOG)},
+                                 "model_policy":policy,"placement_mode":compute._placement_mode(),
+                                 "catalog_size":len(compute.CATALOG)},
                 "consistency_warnings":warnings,
                 "limitation":"Server-side UI data consistency, not browser pixels or client-side JS"}
     if name == "get_operation":

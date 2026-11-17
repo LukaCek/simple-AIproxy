@@ -556,10 +556,20 @@ def endpoints(model: str) -> list[dict[str, Any]]:
 
 
 def automatic_endpoints(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Resolve local/auto to ONE exact catalog model, not a mixed-model fallback."""
+    """Resolve local/auto to one model using only privacy-eligible workers.
+
+    Select the model *after* filtering untrusted nodes. Otherwise an untrusted
+    quality model can hide a smaller trusted model, causing a private request
+    to fail even though it could be served safely.
+    """
+    visibility = payload.get("aiproxy_visibility", "private")
+    if visibility not in ("private", "public"):
+        raise ValueError("aiproxy_visibility must be private or public")
     policy = _model_policy()
     approved = policy["models"] if policy["revision"] > 1 else list(CATALOG)
     candidates = [candidate for mid in approved for candidate in endpoints("local/" + mid)]
+    if visibility == "private":
+        candidates = [candidate for candidate in candidates if candidate.get("allow_private") is True]
     return select_auto_candidates(candidates, payload, CATALOG)
 
 

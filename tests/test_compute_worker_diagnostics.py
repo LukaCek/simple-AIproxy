@@ -120,3 +120,9 @@ def test_worker_diagnostic_events_deleted_with_permanent_registration(tmp_path, 
         events = client.get("/admin/api/compute/events",
                             auth=ADMIN, params={"node_id": node_id}).json()["events"]
         assert events == []
+
+
+def test_websocket_reconnect_errors_are_classified_without_raw_messages():
+    assert error_code("no close frame received or sent") == "transport_error"
+    assert error_code("keepalive ping timeout; no close frame received") == "transport_error"
+    assert error_code("received 1006 (abnormal closure)") == "transport_error"

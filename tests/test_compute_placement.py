@@ -79,3 +79,49 @@ def test_auto_placement_enforces_aggregate_disk_budget_and_ram_caps():
     assert models_for_node(approved, CATALOG, *telemetry(3, 8)) == [
         "qwen35-2b-q4", "qwen35-0.8b-q4"
     ]
+
+
+def test_auto_placement_respects_real_host_disk_space():
+    hw, state = telemetry(24, 64)
+    hw["disk_free_bytes"] = 700 * 1024**2
+    state["disk_used_bytes"] = 0
+    # Plenty of configured quota is not enough if the physical disk is full.
+    assert models_for_node(list(CATALOG), CATALOG, hw, state) == ["qwen35-0.8b-q4"]
+
+
+def test_auto_model_selects_privacy_eligible_workers_before_quality_tier(monkeypatch):
+    import compute_plane
+
+    monkeypatch.setattr(compute_plane, "CATALOG", CATALOG)
+    monkeypatch.setattr(compute_plane, "_model_policy",
+                        lambda: {"revision": 2, "models": list(CATALOG)})
+
+    def fake_endpoints(model):
+        mid = model.split("/")[-1]
+        # The largest model is deliberately on a friend-owned, untrusted PC.
+        return [{"api_mode": "compute_worker", "node_id": mid, "model": mid,
+                 "name": mid, "allow_private": mid != "qwen35-9b-q4"}]
+
+    monkeypatch.setattr(compute_plane, "endpoints", fake_endpoints)
+    payload = {"aiproxy_compute_tier": "quality",
+               "messages": [{"role": "user", "content": "confidential"}]}
+    private = compute_plane.automatic_endpoints(payload)
+    assert [item["model"] for item in private] == ["qwen35-4b-q4"]
+    public = compute_plane.automatic_endpoints({
+        **payload, "aiproxy_visibility": "public"})
+    assert [item["model"] for item in public] == ["qwen35-9b-q4"]
+    with pytest.raises(ValueError, match="aiproxy_visibility"):
+        compute_plane.automatic_endpoints({**payload, "aiproxy_visibility": "maybe"})
+
+
+def test_auto_model_rejects_private_tier_with_only_untrusted_matching_node(monkeypatch):
+    import compute_plane
+
+    monkeypatch.setattr(compute_plane, "CATALOG", CATALOG)
+    monkeypatch.setattr(compute_plane, "_model_policy",
+                        lambda: {"revision": 2, "models": list(CATALOG)})
+    monkeypatch.setattr(compute_plane, "endpoints", lambda model: [{
+        "api_mode": "compute_worker", "node_id": model, "model": model.split("/")[-1],
+        "name": model, "allow_private": model.endswith("0.8b-q4")
+    }])
+    assert compute_plane.automatic_endpoints({"aiproxy_compute_tier": "quality"}) == []

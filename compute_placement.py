@@ -45,6 +45,14 @@ def models_for_node(selected: list[str], catalog: dict[str, dict],
     # models are also included, not silently limited to a fixed count of 2.
     permitted.sort(key=lambda entry: entry[1], reverse=True)
     budget = int(disk_limit * 0.90)
+    # A model-store quota is NOT a physical disk quota. Account for the
+    # actual free space too; cached bytes are already occupying that disk.
+    # Keep a small host reserve for logs and other processes.
+    disk_free = hardware.get("disk_free_bytes")
+    disk_used = state.get("disk_used_bytes")
+    if (type(disk_free) is int and disk_free >= 0 and
+            type(disk_used) is int and disk_used >= 0):
+        budget = min(budget, max(0, disk_used + disk_free - 64 * MIB))
     chosen: list[str] = []
     for mid, _, required_disk in permitted:
         if required_disk <= budget:

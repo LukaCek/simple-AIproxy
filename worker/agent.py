@@ -123,6 +123,29 @@ def memory_safety_margin() -> int:
     return max(128 * 1024**2, min(256 * 1024**2, memory_limit() // 8))
 
 
+MODEL_ERROR_RETRY_SECONDS = 60 * 60
+
+
+def should_test_model(previous, *, force=False, now=None):
+    """Retry transient failures, but never rebenchmark verified models on every heartbeat.
+
+    Failed/interrupted tests are eligible for a bounded hourly retry.
+    Unsupported resource-limit decisions remain stable until policy/catalog
+    change or an administrator explicitly requests a new test.
+    """
+    if force or not isinstance(previous, dict):
+        return True
+    status = previous.get("status")
+    if status in ("supported", "unsupported"):
+        return False
+    if status == "error":
+        current = int(time.time()) if now is None else now
+        last = previous.get("tested_at")
+        return (type(last) is not int or last > current or
+                current - last >= MODEL_ERROR_RETRY_SECONDS)
+    return True
+
+
 def cpu_count():
     cpus = os.cpu_count() or 1
     try:
@@ -513,6 +536,9 @@ class Worker:
         """
         while True:
             await self.send(ws, {"type": "telemetry", "hardware": hardware(), "models": self.status()})
+            if self.policy is not None and (self.reconcile_task is None or self.reconcile_task.done()):
+                if any(should_test_model(self.capabilities.get(mid)) for mid in self.policy):
+                    self.reconcile_task = asyncio.create_task(self.reconcile(ws))
             for _ in range(15):
                 self._publish_snapshot()
                 await asyncio.sleep(1)
@@ -682,7 +708,7 @@ class Worker:
                 if version != self.policy_revision or generation != self.policy_generation:
                     break
                 previous = self.capabilities.get(mid, {})
-                if not retest and previous.get("status") in ("supported", "unsupported", "error"):
+                if not should_test_model(previous, force=retest):
                     continue
                 async with self.lock:
                     await self.test_model(mid)

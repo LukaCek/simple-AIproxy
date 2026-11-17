@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -31,6 +32,39 @@ REASONING_MODE = os.getenv("WORKER_REASONING", "on").strip().lower()
 if REASONING_MODE not in {"on", "off", "auto"}:
     raise ValueError("WORKER_REASONING must be on, off, or auto")
 DISK_LIMIT_BYTES = disk_limit_bytes(os.getenv("WORKER_DISK_LIMIT_GB", "8"))
+
+UPDATE_SIGNAL_FILE = "host-update-request.json"
+
+
+def queue_host_update_notice(revision: object) -> bool:
+    """Persist a release hint for the host listener; NEVER run Docker here.
+
+    The message comes from our authenticated proxy WSS connection. Its only
+    actionable field is a 40-character commit SHA, not a URL or command.
+    """
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        return False
+    if revision == os.getenv("WORKER_BUILD_REVISION"):
+        return False
+    path = DATA / UPDATE_SIGNAL_FILE
+    try:
+        if path.exists():
+            previous = json.loads(path.read_text(encoding="ascii"))
+            if previous.get("revision") == revision:
+                return True
+        tmp = DATA / (".host-update-request." + str(os.getpid()) + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as output:
+                json.dump({"revision": revision}, output)
+                output.write("\n")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
 
 
 def memory_limit():
@@ -948,7 +982,7 @@ class Worker:
             try:
                 async with connect(url, max_size=2 * 1024 * 1024, ping_interval=20) as ws:
                     await self.send(ws, {"type": "auth", **identity, "protocol": 1,
-                                         "catalog_protocol": 1})
+                                         "catalog_protocol": 1, "update_protocol": 1})
                     msg = json.loads(await asyncio.wait_for(ws.recv(), 20))
                     if msg.get("type") != "auth_ok":
                         raise RuntimeError("Authentication rejected")
@@ -966,6 +1000,8 @@ class Worker:
                                 self._ack_diag(cmd.get("seq"))
                             elif kind == "policy":
                                 await self.receive_policy(ws, cmd)
+                            elif kind == "update_available":
+                                queue_host_update_notice(cmd.get("revision"))
                             elif kind == "cancel":
                                 task = self.tasks.get(cid)
                                 if task:

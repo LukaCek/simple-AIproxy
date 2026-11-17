@@ -706,6 +706,9 @@ def test_proxy_release_poll_requires_successful_published_commit(monkeypatch):
 
     conn = FakeConn()
     monkeypatch.setattr(compute_plane, "_connections", {conn.node_id: conn})
+    events = []
+    monkeypatch.setattr(compute_plane, "_event",
+                        lambda node_id, kind, **kwargs: events.append((node_id, kind)))
     async def valid_release():
         return "b" * 40
     async def unavailable():
@@ -715,6 +718,7 @@ def test_proxy_release_poll_requires_successful_published_commit(monkeypatch):
     assert conn.messages == [{"type": "update_available", "revision": "b" * 40}]
     assert asyncio.run(compute_plane._check_worker_release_once()) == "b" * 40
     assert len(conn.messages) == 1
+    assert events == [(conn.node_id, "update_offered")]
     monkeypatch.setattr(compute_plane, "_fetch_worker_release", unavailable)
     assert asyncio.run(compute_plane._check_worker_release_once()) is None
     assert compute_plane._latest_worker_release == "b" * 40

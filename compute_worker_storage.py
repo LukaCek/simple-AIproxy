@@ -189,6 +189,10 @@ def install_model(models: Path, mid: str, limit: int, last_used: dict,
                         output.write(piece)
         verify_model(part, model["sha256"])
         part.replace(target)
+        # The exact bytes were verified immediately before the atomic rename.
+        # Re-key the process-local memo so the first model load does not
+        # unnecessarily scan the just-downloaded multi-GB file again.
+        _VERIFIED_FILES[(str(target.absolute()), model["sha256"])] = _file_fingerprint(target)
     finally:
         if part.exists() or part.is_symlink():
             part.unlink()

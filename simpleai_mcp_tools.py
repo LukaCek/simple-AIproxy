@@ -201,7 +201,7 @@ def _public_worker(node: dict) -> dict:
                        if type(models.get("policy_revision")) is int else None,
                    "capabilities": {mid: {
                        "status": state.get("status"),
-                        "reason_code": _model_reason_code(state.get("status"), state.get("reason")),
+                       "reason_code": _model_reason_code(state.get("status"), state.get("reason")),
                        "test_seconds": state.get("test_seconds"),
                        "tested_at": state.get("tested_at"),
                        "benchmark": state.get("benchmark", {}),

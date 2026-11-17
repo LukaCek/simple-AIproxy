@@ -306,3 +306,11 @@ def test_provider_model_update_preserves_existing_oauth_and_api_keys(client, mon
     refused=call(client,reader,"set_provider_models",
                  provider="codex",models=["bad-model"],confirm=True)
     assert refused["error"]["message"]=="This MCP key is read-only"
+
+
+def test_worker_model_reasons_use_safe_status_codes():
+    assert tools._model_reason_code("supported", "Actual inference passed") == "test_supported"
+    assert tools._model_reason_code("unsupported", "not measured") == "test_unsupported"
+    assert tools._model_reason_code("error", "unexpected failure") == "test_failed"
+    assert tools._model_reason_code("testing", "") == "test_start"
+    assert tools._model_reason_code("error", "llama-server crashed") == "llama_crashed"

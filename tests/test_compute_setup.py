@@ -791,6 +791,9 @@ def test_proxy_host_listener_invokes_safe_updater_for_sha_notice(tmp_path):
     actions = tmp_path / "actions.log"
     changed = tmp_path / "updated"
     acknowledged = tmp_path / "acknowledged"
+    # Prior state may be malformed; host reporting must recover atomically.
+    (node / ".host-updater-status.json").write_text(
+        '{"last_result":[],"last_error":{},"last_check_at":"corrupt"}')
 
     docker = helpers / "docker"
     docker.write_text(r'''#!/usr/bin/env python3

@@ -49,15 +49,21 @@ def queue_host_update_notice(revision: object) -> bool:
     path = DATA / UPDATE_SIGNAL_FILE
     try:
         if path.exists():
-            previous = json.loads(path.read_text(encoding="ascii"))
-            if previous.get("revision") == revision:
-                return True
-        tmp = DATA / (".host-update-request." + str(os.getpid()) + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                previous = json.loads(path.read_text(encoding="ascii"))
+                if isinstance(previous, dict) and previous.get("revision") == revision:
+                    return True
+            except (OSError, ValueError, TypeError):
+                # A corrupt/partial prior signal must never prevent a new one.
+                pass
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii",
+                                         prefix=".host-update-request.",
+                                         suffix=".tmp", dir=DATA, delete=False) as output:
+            tmp = Path(output.name)
+            json.dump({"revision": revision}, output)
+            output.write("\n")
         try:
-            with os.fdopen(fd, "w", encoding="ascii") as output:
-                json.dump({"revision": revision}, output)
-                output.write("\n")
             os.replace(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)

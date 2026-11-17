@@ -18,6 +18,98 @@ dir="$root/$name"
 [[ -d "$dir" && ! -L "$dir" && -f "$dir/docker-compose.yml" ]] ||
   die "No installed worker at $dir"
 
+# Keep host update status on the host even when the container is offline.
+# The listener mirrors this bounded, secret-free snapshot into the existing
+# /data volume. Neither side gets a Docker socket or arbitrary host commands.
+sync_host_update_status() {
+  [[ -s "$dir/.host-updater-status.json" ]] || return 0
+  (cd "$dir" && docker compose exec -T compute-worker python -c '
+import json, os, pathlib, sys
+raw = sys.stdin.read(1025)
+if not 0 < len(raw) <= 1024:
+    raise SystemExit(2)
+item = json.loads(raw)
+if not isinstance(item, dict) or item.get("schema") != 1:
+    raise SystemExit(2)
+target = pathlib.Path("/data/host-updater-status.json")
+temporary = target.with_suffix(".tmp")
+fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="ascii") as out:
+    json.dump(item, out, separators=(",", ":"))
+os.replace(temporary, target)
+' < "$dir/.host-updater-status.json" >/dev/null 2>&1) || :
+}
+
+report_host_update_status() {
+  local result="${1:-heartbeat}" error="${2:-none}" source="${3:-host}"
+  local listener=0 timer=0
+  systemctl --user is-active --quiet "simpleai-compute-listener@$name.service" >/dev/null 2>&1 && listener=1 || :
+  systemctl --user is-enabled --quiet "simpleai-compute-update@$name.timer" >/dev/null 2>&1 && timer=1 || :
+  python3 - "$dir/.host-updater-status.json" "$result" "$error" "$source" "$listener" "$timer" <<'PY' || :
+import json, os, pathlib, sys, time
+path = pathlib.Path(sys.argv[1])
+result, error, source = sys.argv[2:5]
+if result not in {"heartbeat", "checking", "up_to_date", "updated", "deferred",
+                  "blocked", "rolled_back", "failed"}:
+    raise SystemExit(2)
+if error not in {"none", "registry_unavailable", "release_invalid",
+                 "health_check_failed", "rollback_failed", "config_invalid"}:
+    raise SystemExit(2)
+if source not in {"proxy", "scheduled_or_manual", "host"}:
+    raise SystemExit(2)
+prior = {}
+try:
+    if path.stat().st_size <= 1024:
+        prior = json.loads(path.read_text(encoding="ascii"))
+except (OSError, ValueError, TypeError):
+    pass
+if not isinstance(prior, dict):
+    prior = {}
+now = int(time.time())
+def past_timestamp(value):
+    return value if type(value) is int and 0 <= value <= now + 3600 else 0
+def known_choice(key, allowed, fallback):
+    value = prior.get(key)
+    return value if isinstance(value, str) and value in allowed else fallback
+state = {
+    "schema": 1, "reported_at": now,
+    "listener_active": sys.argv[5] == "1",
+    "timer_enabled": sys.argv[6] == "1",
+    "last_check_at": past_timestamp(prior.get("last_check_at")),
+    "last_success_at": past_timestamp(prior.get("last_success_at")),
+    "last_failure_at": past_timestamp(prior.get("last_failure_at")),
+    "last_result": known_choice("last_result", {
+        "unknown", "checking", "up_to_date", "updated", "deferred",
+        "blocked", "rolled_back", "failed"}, "unknown"),
+    "last_error": known_choice("last_error", {
+        "none", "registry_unavailable", "release_invalid",
+        "health_check_failed", "rollback_failed", "config_invalid"}, "none"),
+    "last_source": known_choice("last_source", {
+        "proxy", "scheduled_or_manual", "host"}, "host"),
+}
+if result != "heartbeat":
+    state.update(last_check_at=now, last_result=result,
+                 last_error=error, last_source=source)
+    if result == "updated":
+        state["last_success_at"] = now
+    if result in ("failed", "rolled_back"):
+        state["last_failure_at"] = now
+temporary = path.with_name(".host-updater-status." + str(os.getpid()) + ".tmp")
+fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    with os.fdopen(fd, "w", encoding="ascii") as stream:
+        json.dump(state, stream, separators=(",", ":"))
+    os.replace(temporary, path)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+  sync_host_update_status
+}
+
+update_source() {
+  if [[ "$mode" == "--listen" ]]; then printf 'proxy'; else printf 'scheduled_or_manual'; fi
+}
+
 check_service_image() {
   cd "$dir"
   docker compose config --format json |
@@ -212,6 +304,7 @@ UNIT
   log "Automatic updates enabled for $name: proxy release listener and four daily backup checks."
   log "Status: systemctl --user status simpleai-compute-listener@$name.service"
   log "Backup: systemctl --user status simpleai-compute-update@$name.timer"
+  report_host_update_status heartbeat none host
 }
 
 worker_idle() {
@@ -252,6 +345,7 @@ check_update() {
   cd "$dir"
   exec 9>"$dir/.update.lock"
   flock -n 9 || { log "Another check is running; skipped."; return 0; }
+  report_host_update_status checking none "$(update_source)"
   local cid old new started rollback_tag status
   cid="$(docker compose ps -q compute-worker 2>/dev/null || :)"
   old=''
@@ -260,6 +354,7 @@ check_update() {
     status="$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || :)"
     if [[ "$status" == "running" ]] && ! worker_idle; then
       log "Worker is active or has unknown status; defer update."
+      report_host_update_status deferred none "$(update_source)"
       return 0
     fi
   fi
@@ -267,17 +362,25 @@ check_update() {
 
   # GHCR is the trusted release channel. No shell commands or scripts from
   # model responses or proxy-side WSS messages can trigger Docker updates.
-  docker pull --quiet "$image" >/dev/null || die "Registry unavailable; keeping current worker."
+  docker pull --quiet "$image" >/dev/null || {
+    report_host_update_status failed registry_unavailable "$(update_source)"
+    die "Registry unavailable; keeping current worker."
+  }
   new="$(docker image inspect --format '{{.Id}}' "$image")"
-  [[ -n "$new" ]] || die "Pulled release has no image ID."
+  [[ -n "$new" ]] || {
+    report_host_update_status failed release_invalid "$(update_source)"
+    die "Pulled release has no image ID."
+  }
   if [[ "$new" == "$old" ]]; then
     log "Already current: $new"
+    report_host_update_status up_to_date none "$(update_source)"
     return 0
   fi
   if [[ -s "$dir/.update-rejected-image" ]] &&
      [[ "$new" == "$(cat "$dir/.update-rejected-image")" ]]; then
     [[ -z "$old" ]] || docker image tag "$old" "$image"
     log "Previously failed image still published; waiting for a newer release."
+    report_host_update_status blocked health_check_failed "$(update_source)"
     return 0
   fi
 
@@ -285,6 +388,7 @@ check_update() {
   if [[ -n "$cid" && "$status" == "running" ]] && ! worker_idle; then
     [[ -z "$old" ]] || docker image tag "$old" "$image"
     log "Worker became busy during pull; defer upgrade."
+    report_host_update_status deferred none "$(update_source)"
     return 0
   fi
   rollback_tag="simpleai-compute-rollback:${name,,}"
@@ -295,6 +399,7 @@ check_update() {
      wait_connected "$started"; then
     rm -f -- "$dir/.update-rejected-image"
     log "Updated successfully; worker reconnected with the same identity."
+    report_host_update_status updated none "$(update_source)"
     return 0
   fi
   printf '%s\n' "$new" > "$dir/.update-rejected-image"
@@ -303,12 +408,18 @@ check_update() {
     log "New release failed health check; rolling back."
     docker image tag "$old" "$image"
     started="$(date +%s)"
-    docker compose up -d --no-build --no-deps --force-recreate --pull never compute-worker ||
+    docker compose up -d --no-build --no-deps --force-recreate --pull never compute-worker || {
+      report_host_update_status failed rollback_failed "$(update_source)"
       die "Rollback container recreation failed. Check Docker logs."
-    wait_connected "$started" ||
+    }
+    wait_connected "$started" || {
+      report_host_update_status failed rollback_failed "$(update_source)"
       die "Old worker restored but not connected. Inspect logs; new image blocked."
+    }
     log "Rollback successful; failed release will not be retried until its digest changes."
+    report_host_update_status rolled_back health_check_failed "$(update_source)"
   else
+    report_host_update_status failed health_check_failed "$(update_source)"
     die "First release failed; no previous image available for rollback."
   fi
 }
@@ -354,9 +465,14 @@ listen_update_requests() {
   [[ $# -eq 0 ]] || die "Usage: updater --listen WORKER_NAME"
   check_service_image
   cd "$dir"
-  local target installed now previous_attempt='' attempted_at=0
+  local target installed now previous_attempt='' attempted_at=0 last_report=0
   log "Host listener started. Waiting for authenticated proxy release notices."
   while true; do
+    now="$(date +%s)"
+    if (( now - last_report >= 60 )); then
+      report_host_update_status heartbeat none host
+      last_report="$now"
+    fi
     target="$(read_update_notice)"
     if [[ "$target" =~ ^[0-9a-f]{40}$ ]]; then
       installed="$(worker_revision)"

@@ -521,3 +521,38 @@ def test_wss_update_notice_writes_only_validated_host_signal(tmp_path, monkeypat
     signal.write_text("[]")
     assert agent.queue_host_update_notice("e" * 40) is True
     assert json.loads(signal.read_text()) == {"revision": "e" * 40}
+
+
+def test_host_updater_status_reader_is_bounded_and_never_exposes_raw_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "DATA", tmp_path)
+    path = tmp_path / "host-updater-status.json"
+    now = int(agent.time.time())
+    sample = {
+        "schema": 1, "reported_at": now,
+        "last_check_at": now - 30, "last_success_at": now - 60,
+        "last_failure_at": 0, "last_result": "updated",
+        "last_error": "none", "last_source": "proxy",
+        "listener_active": True, "timer_enabled": True,
+        "raw_log": "SECRET_DO_NOT_LEAK",
+    }
+    path.write_text(json.dumps(sample))
+    expected = agent.read_host_updater_status()
+    assert expected is not None
+    assert expected["last_result"] == "updated"
+    assert expected["last_success_at"] == now - 60
+    assert "raw_log" not in expected
+    assert "SECRET_DO_NOT_LEAK" not in json.dumps(expected)
+
+    for bad in ({"last_result": ["updated"]},
+                {"last_error": {"untrusted": "raw"}},
+                {"timer_enabled": "enabled"},
+                {"last_check_at": -10},
+                {"reported_at": now + 100_000}):
+        path.write_text(json.dumps({**sample, **bad}))
+        assert agent.read_host_updater_status() is None
+    path.write_text("bad json")
+    assert agent.read_host_updater_status() is None
+    path.write_text("x" * 1500)
+    assert agent.read_host_updater_status() is None
+    path.unlink()
+    assert agent.read_host_updater_status() is None

@@ -201,6 +201,7 @@ def _public_worker(node: dict) -> dict:
                    "disk_used_bytes": models.get("disk_used_bytes"),
                    "policy_revision": models.get("policy_revision")
                        if type(models.get("policy_revision")) is int else None,
+                   "host_updater": models.get("host_updater"),
                    "capabilities": {mid: {
                        "status": state.get("status"),
                        "reason_code": _model_reason_code(state.get("status"), state.get("reason")),

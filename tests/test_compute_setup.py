@@ -791,6 +791,9 @@ def test_proxy_host_listener_invokes_safe_updater_for_sha_notice(tmp_path):
     actions = tmp_path / "actions.log"
     changed = tmp_path / "updated"
     acknowledged = tmp_path / "acknowledged"
+    # Prior state may be malformed; host reporting must recover atomically.
+    (node / ".host-updater-status.json").write_text(
+        '{"last_result":[],"last_error":{},"last_check_at":"corrupt"}')
 
     docker = helpers / "docker"
     docker.write_text(r'''#!/usr/bin/env python3
@@ -836,3 +839,20 @@ elif a[:2] == ["compose", "up"]:
     log = actions.read_text()
     assert "pull --quiet ghcr.io/lukacek/simple-aiproxy-worker:latest" in log
     assert "compose up -d --no-build --no-deps --force-recreate --pull never compute-worker" in log
+    import json
+    report = json.loads((node / ".host-updater-status.json").read_text())
+    assert report["last_result"] == "updated"
+    assert report["last_source"] == "proxy"
+    assert report["last_success_at"] > 0
+    assert report["last_check_at"] > 0
+    assert report["last_error"] == "none"
+    assert (node / ".host-updater-status.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_cpu_worker_image_does_not_download_unused_llama_web_ui():
+    from pathlib import Path
+    dockerfile = (Path(__file__).resolve().parents[1] /
+                  "worker" / "Dockerfile").read_text(encoding="utf-8")
+    assert "-DLLAMA_BUILD_UI=OFF" in dockerfile
+    assert "-DLLAMA_USE_PREBUILT_UI=OFF" in dockerfile
+    assert "cmake --build build --target llama-server" in dockerfile

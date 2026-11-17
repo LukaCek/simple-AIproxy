@@ -418,6 +418,44 @@ def _nonnegative_int(value: Any) -> int:
         return 0
 
 
+_HOST_UPDATE_RESULTS = frozenset({
+    "unknown", "checking", "up_to_date", "updated", "deferred",
+    "blocked", "rolled_back", "failed",
+})
+_HOST_UPDATE_ERRORS = frozenset({
+    "none", "registry_unavailable", "release_invalid",
+    "health_check_failed", "rollback_failed", "config_invalid",
+})
+_HOST_UPDATE_SOURCES = frozenset({"proxy", "scheduled_or_manual", "host"})
+
+
+def _safe_host_updater(raw: object) -> dict[str, Any] | None:
+    """Client-visible allowlist; reject fabricated strings and invalid timestamps."""
+    if not isinstance(raw, dict) or raw.get("schema") != 1:
+        return None
+    if not isinstance(raw.get("last_result"), str) or raw["last_result"] not in _HOST_UPDATE_RESULTS:
+        return None
+    if not isinstance(raw.get("last_error"), str) or raw["last_error"] not in _HOST_UPDATE_ERRORS:
+        return None
+    if not isinstance(raw.get("last_source"), str) or raw["last_source"] not in _HOST_UPDATE_SOURCES:
+        return None
+    if type(raw.get("listener_active")) is not bool or type(raw.get("timer_enabled")) is not bool:
+        return None
+    now = int(time.time()) + 3600
+    stamps = {}
+    for key in ("reported_at", "last_check_at", "last_success_at", "last_failure_at"):
+        value = raw.get(key)
+        if type(value) is not int or not 0 <= value <= now:
+            return None
+        stamps[key] = value
+    return {"schema": 1, **stamps,
+            "last_result": raw["last_result"],
+            "last_error": raw["last_error"],
+            "last_source": raw["last_source"],
+            "listener_active": raw["listener_active"],
+            "timer_enabled": raw["timer_enabled"]}
+
+
 def _public_node(row: dict[str, Any]) -> dict[str, Any]:
     try:
         hardware = json.loads(row["hardware_json"])
@@ -463,6 +501,7 @@ def _public_node(row: dict[str, Any]) -> dict[str, Any]:
     models["running_tasks"] = min(1, _nonnegative_int(models.get("running_tasks")))
     models["disk_used_bytes"] = _nonnegative_int(models.get("disk_used_bytes"))
     models["disk_limit_bytes"] = _nonnegative_int(models.get("disk_limit_bytes"))
+    models["host_updater"] = _safe_host_updater(models.get("host_updater"))
     return {
         "id": row["id"], "name": row["name"], "online": row["id"] in _connections,
         "update_protocol": bool(_connections.get(row["id"]) and

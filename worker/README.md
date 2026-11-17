@@ -261,6 +261,31 @@ journalctl --user -u simpleai-compute-listener@WORKER_NAME.service -n 60
 journalctl --user -u simpleai-compute-update@WORKER_NAME.service -n 60
 ```
 
+### Central host-updater status (Admin + MCP)
+
+The host updater saves a small allowlisted status file in the worker's own
+installation directory, and mirrors it into its existing `/data` Docker
+volume. The running worker reports it with standard 15-second WSS telemetry.
+No Docker logs, commands, environment variables, credentials or host paths
+are transmitted. The Compute Nodes Admin page and MCP worker listing display:
+
+- Proxy listener active / backup systemd timer enabled, and status freshness
+- Time and outcome of last image check (updated, up to date, deferred, failed, rolled back, blocked)
+- Last successful image update, last failure time and safe error classification
+- Whether the status came from the proxy listener or host/timer check
+
+Unknown, missing or stale reports are **not** treated as proof of a healthy
+updater. The report remains visible as stale when the worker is offline.
+
+**One-time migration for existing hosts:** after the image and proxy have
+been deployed, re-run the `enable-auto-updates.sh` command above on each
+existing worker host. This refreshes the host-side updater script without
+re-enrolling the worker, deleting cached models or disabling the four daily
+backup checks. A remote WSS message deliberately cannot update the host
+updater's own script. After adoption, refresh the Admin Compute Nodes page
+and confirm that listener and backup timer are reported, not just that the
+worker is online.
+
 From a host with old timers, **run the one-time adoption command again**
 to install the new listener without losing identity or model volumes.
 The initial update still uses the existing safe `--check` and may defer

@@ -89,6 +89,11 @@
       {% if not node.hardware.get('catalog_protocol') %}
       <p class="mt-1 text-xs text-amber-700">Older worker image: update required before new custom models can be tested here.</p>
       {% endif %}
+      <div data-host-updater class="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700" aria-live="polite">
+        <strong>Host updater</strong>
+        <p data-host-updater-summary class="mt-1">Checking reported listener and backup timer status…</p>
+        <p data-host-updater-history class="mt-1 text-slate-500"></p>
+      </div>
       <p data-node-busy class="mt-1 text-xs text-slate-500">
         Inference: {{ 'Busy' if node.models.get('busy') else 'Idle' }} ·
         {{ node.models.get('running_tasks', 0) }} active slot
@@ -316,6 +321,36 @@ async function manage(id, action) {
     }
   } catch(err) { show(err.message); }
 }
+// The host updater reports only allowlisted codes and timestamps. Older
+// workers do not report status; show unknown rather than assuming success.
+function displayUpdateTime(value) {
+  return Number.isInteger(value) && value > 0 ?
+    new Date(value * 1000).toLocaleString() : "not recorded";
+}
+function refreshHostUpdater(node, card) {
+  const summary = card.querySelector("[data-host-updater-summary]");
+  const history = card.querySelector("[data-host-updater-history]");
+  if(!summary || !history) return;
+  const state = node.models?.host_updater;
+  if(!state) {
+    summary.textContent = "Not reported yet — host listener setup may be required.";
+    history.textContent = node.online ?
+      "Worker is online; awaiting host status." : "Worker is offline.";
+    return;
+  }
+  const stale = !node.online || !state.reported_at ||
+    Date.now() / 1000 - state.reported_at > 180;
+  const listener = state.listener_active ? "active" : "not active";
+  const timer = state.timer_enabled ? "enabled" : "not enabled";
+  summary.textContent = "Listener: " + listener + " · Backup timer: " + timer +
+    (stale ? " · Last report is stale" : " · Reporting");
+  const outcome = String(state.last_result || "unknown").replaceAll("_", " ");
+  history.textContent = "Last check: " + displayUpdateTime(state.last_check_at) +
+    " (" + outcome + ", " + String(state.last_source || "host").replaceAll("_", " ") + ")" +
+    " · Last successful update: " + displayUpdateTime(state.last_success_at) +
+    (state.last_error && state.last_error !== "none" ?
+      " · Last error: " + state.last_error.replaceAll("_", " ") : "");
+}
 // Refresh only the live parts of node cards; never reset the admin form.
 let refreshingNodes = false;
 async function refreshNodeStatuses() {
@@ -330,6 +365,7 @@ async function refreshNodeStatuses() {
         .find(el => el.dataset.nodeId === node.id);
       if(!card) continue;
       const models = node.models || {};
+      refreshHostUpdater(node, card);
       const caps = models.capabilities || {};
       const installed = Array.isArray(models.installed) ? models.installed : [];
       const online = card.querySelector("[data-node-online]");
@@ -414,6 +450,7 @@ async function refreshComputeEvents() {
 document.getElementById("compute-event-node").onchange = refreshComputeEvents;
 document.getElementById("compute-event-level").onchange = refreshComputeEvents;
 refreshComputeEvents();
+refreshNodeStatuses();
 setInterval(refreshComputeEvents, 10000);
 setInterval(refreshNodeStatuses, 5000);
 </script>

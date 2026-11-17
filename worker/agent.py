@@ -96,9 +96,9 @@ def read_host_updater_status():
         result = report.get("last_result")
         error = report.get("last_error")
         source = report.get("last_source")
-        if (result not in _HOST_UPDATE_RESULTS or
-                error not in _HOST_UPDATE_ERRORS or
-                source not in _HOST_UPDATE_SOURCES):
+        if (not isinstance(result, str) or result not in _HOST_UPDATE_RESULTS or
+                not isinstance(error, str) or error not in _HOST_UPDATE_ERRORS or
+                not isinstance(source, str) or source not in _HOST_UPDATE_SOURCES):
             return None
         if type(report.get("listener_active")) is not bool or type(report.get("timer_enabled")) is not bool:
             return None

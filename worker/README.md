@@ -80,19 +80,26 @@ curl -fsSL https://aiproxy.cekluka.com/compute/enable-auto-updates.sh | \
 ```
 
 This finds all standard **production** workers owned by that user, enables
-persistent systemd user timers, performs an immediate safe image-update
-check (deferring during active tasks) and installs `simpleai-tui` without
+a persistent systemd user **proxy release listener** and the existing four
+daily backup timers, performs an immediate safe image-update check
+(deferring during active tasks) and installs `simpleai-tui` without
 overwriting an unmanaged shortcut. It does not delete volume data or change
 worker identity; local test workers and other proxies are untouched.
 A one-time sudo prompt may be necessary to keep the user timer active after
 logout. Fresh one-line installations already opt in automatically.
 
-The updater checks GHCR four times daily when the computer is running,
-Docker is accessible, and the worker can safely restart. Failed updates
-trigger a best-effort rollback. New compatible GGUF models arrive via WSS
-immediately, without waiting for a new Docker build. The initial migration
-still needs a host-side action: the unprivileged worker container must never
-be allowed to control its host Docker daemon remotely.
+The proxy also checks for **successful worker image publish workflows**
+(every five minutes) and sends an authenticated WSS release notice only
+after GHCR publication succeeds. The worker writes a narrowly validated
+commit-SHA marker to its private /data volume. A host-side systemd listener
+reads that marker, asks the existing updater to pull the fixed GHCR image,
+defers if the worker is busy, validates reconnection and rolls back on
+failure. The original timers still check GHCR four times daily as backup.
+No worker container ever gets access to Docker or host shell execution.
+When the proxy or listener is offline, the timer remains independently
+functional. An initial one-time host-side adoption is required for older
+workers because a running container cannot install host systemd units.
+New compatible GGUF models still arrive over WSS independently of images.
 
 ### Removing obsolete worker registrations
 
@@ -204,9 +211,12 @@ total memory budgets across services.
 
 ### Unattended Linux worker updates
 
-New production workers configure a per-user **systemd timer** automatically
-during the one-line installation. It checks the trusted GHCR worker `latest`
-image four times daily, using Docker **on the host only**. Nothing grants the
+New production workers configure both a per-user **systemd listener**
+(proxy-initiated release signal) and a **systemd timer** (four daily
+independent GHCR checks) during one-line installation. The listener receives
+a fixed revision marker from the worker's WSS connection. The timer checks
+the trusted GHCR worker `latest` image independently. Both use Docker
+**on the host only**. Nothing grants the
 worker container access to the host Docker socket. An unattended update runs
 only while the worker is idle, preserving model downloads, identity, data and
 enrollment policy through the existing named volumes. It verifies the worker
@@ -239,14 +249,28 @@ restored if it fails. Use the flag only if the worker was previously created
 with **Auto Maximum**, not Manual or Auto Shared. A new auto installation
 already uses the corrected formula and does not need migration.
 
-Check the schedule:
-`systemctl --user status simpleai-compute-update@WORKER_NAME.timer`.
+Check proxy-triggered listener and backup timer:
+```bash
+systemctl --user status simpleai-compute-listener@WORKER_NAME.service
+systemctl --user status simpleai-compute-update@WORKER_NAME.timer
+```
 
-Review updater activity:
-`journalctl --user -u simpleai-compute-update@WORKER_NAME.service -n 60`.
+Review both update paths:
+```bash
+journalctl --user -u simpleai-compute-listener@WORKER_NAME.service -n 60
+journalctl --user -u simpleai-compute-update@WORKER_NAME.service -n 60
+```
 
-Disable automatic updates without stopping the worker:
-`systemctl --user disable --now simpleai-compute-update@WORKER_NAME.timer`.
+From a host with old timers, **run the one-time adoption command again**
+to install the new listener without losing identity or model volumes.
+The initial update still uses the existing safe `--check` and may defer
+while inference is running.
+
+Disable both update paths without stopping worker inference:
+```bash
+systemctl --user disable --now simpleai-compute-listener@WORKER_NAME.service
+systemctl --user disable --now simpleai-compute-update@WORKER_NAME.timer
+```
 
 The host always retains a Docker memory ceiling. Automatic **image**
 updates intentionally do **not** silently modify previously chosen CPU/RAM

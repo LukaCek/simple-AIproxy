@@ -847,3 +847,12 @@ elif a[:2] == ["compose", "up"]:
     assert report["last_check_at"] > 0
     assert report["last_error"] == "none"
     assert (node / ".host-updater-status.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_cpu_worker_image_does_not_download_unused_llama_web_ui():
+    from pathlib import Path
+    dockerfile = (Path(__file__).resolve().parents[1] /
+                  "worker" / "Dockerfile").read_text(encoding="utf-8")
+    assert "-DLLAMA_BUILD_UI=OFF" in dockerfile
+    assert "-DLLAMA_USE_PREBUILT_UI=OFF" in dockerfile
+    assert "cmake --build build --target llama-server" in dockerfile

@@ -280,3 +280,39 @@ def test_cgroup_v1_reclaimable_cache_is_supported(monkeypatch):
     monkeypatch.setattr(Path, "read_text", fake_read)
     monkeypatch.setattr(agent, "memory_limit", lambda: 2*gib)
     assert agent.memory_available() > int(1.35*gib)
+
+
+def test_gguf_sha256_is_cached_only_for_unchanged_file_in_current_process(tmp_path, monkeypatch):
+    content = b"verified gguf file contents"
+    path = tmp_path / "stable.gguf"
+    path.write_bytes(content)
+    expected = hashlib.sha256(content).hexdigest()
+    original_sha256 = storage.hashlib.sha256
+    calls = []
+
+    def counted_sha256(*args, **kwargs):
+        calls.append(1)
+        return original_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(storage.hashlib, "sha256", counted_sha256)
+    storage.verify_model(path, expected)
+    assert len(calls) == 1
+    storage.verify_model(path, expected)
+    assert len(calls) == 1  # No second full-file scan on model switch.
+
+    path.write_bytes(b"tampered gguf file contents")
+    with pytest.raises(RuntimeError, match="SHA256 mismatch"):
+        storage.verify_model(path, expected)
+    assert len(calls) == 2  # Metadata change invalidates the cache.
+
+    path.write_bytes(content)
+    storage.verify_model(path, expected)
+    assert len(calls) == 3
+    storage.verify_model(path, expected)
+    assert len(calls) == 3
+
+    link = tmp_path / "linked.gguf"
+    link.symlink_to(path)
+    storage.verify_model(link, expected)
+    storage.verify_model(link, expected)
+    assert len(calls) == 5  # Never shortcut symlink verification.

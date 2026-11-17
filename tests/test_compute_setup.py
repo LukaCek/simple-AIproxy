@@ -497,6 +497,11 @@ with open(os.environ["MOCK_ACTIONS"], "a") as f:
     assert "Persistent=true" in timer
     assert "OnCalendar=" in timer
     assert "enable --now simpleai-compute-update@demo.timer" in actions.read_text()
+    listener = (units / "simpleai-compute-listener@.service").read_text()
+    assert "ExecStart=%h/.local/share/simpleai-compute/%i/auto-update.sh --listen %i" in listener
+    assert "Restart=always" in listener
+    assert "enable --now simpleai-compute-listener@demo.service" in actions.read_text()
+    assert "OnCalendar=*-*-* 03,09,15,21:00:00" in timer
 
 
 def test_installer_bootstraps_docker_without_breaking_existing_working_docker(tmp_path):

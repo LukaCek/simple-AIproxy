@@ -66,13 +66,15 @@ except (OSError, ValueError, TypeError):
 if not isinstance(prior, dict):
     prior = {}
 now = int(time.time())
+def past_timestamp(value):
+    return value if type(value) is int and 0 <= value <= now + 3600 else 0
 state = {
     "schema": 1, "reported_at": now,
     "listener_active": sys.argv[5] == "1",
     "timer_enabled": sys.argv[6] == "1",
-    "last_check_at": int(prior.get("last_check_at") or 0),
-    "last_success_at": int(prior.get("last_success_at") or 0),
-    "last_failure_at": int(prior.get("last_failure_at") or 0),
+    "last_check_at": past_timestamp(prior.get("last_check_at")),
+    "last_success_at": past_timestamp(prior.get("last_success_at")),
+    "last_failure_at": past_timestamp(prior.get("last_failure_at")),
     "last_result": prior.get("last_result") if prior.get("last_result") in {
         "unknown", "checking", "up_to_date", "updated", "deferred",
         "blocked", "rolled_back", "failed"} else "unknown",

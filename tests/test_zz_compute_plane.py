@@ -722,3 +722,35 @@ def test_proxy_release_poll_requires_successful_published_commit(monkeypatch):
     monkeypatch.setattr(compute_plane, "_fetch_worker_release", unavailable)
     assert asyncio.run(compute_plane._check_worker_release_once()) is None
     assert compute_plane._latest_worker_release == "b" * 40
+
+
+def test_host_updater_status_is_restricted_in_admin_nodes_and_mcp(tmp_path, monkeypatch):
+    import time
+    import compute_plane
+    from simpleai_mcp_tools import _public_worker
+    now = int(time.time())
+    valid = {
+        "schema": 1, "reported_at": now,
+        "last_check_at": now-30, "last_success_at": now-60,
+        "last_failure_at": 0, "last_result": "updated",
+        "last_error": "none", "last_source": "proxy",
+        "listener_active": True, "timer_enabled": True,
+        "untrusted_secrets": "DO_NOT_SHOW",
+    }
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        with compute_plane._db() as db:
+            db.execute("UPDATE ComputeNodes SET models_json=? WHERE id=?",
+                       (json.dumps({"host_updater": valid}), identity["node_id"]))
+            node = dict(db.execute("SELECT * FROM ComputeNodes WHERE id=?",
+                                   (identity["node_id"],)).fetchone())
+        safe = compute_plane._public_node(node)
+        assert safe["models"]["host_updater"]["last_success_at"] == now-60
+        assert "untrusted_secrets" not in json.dumps(safe)
+        assert _public_worker(node)["models"]["host_updater"]["listener_active"] is True
+        listed = client.get("/admin/api/compute/nodes", auth=ADMIN).json()["nodes"]
+        assert listed[0]["models"]["host_updater"]["last_result"] == "updated"
+        for invalid in ({"last_result": ["evil"]}, {"last_error": {}},
+                        {"timer_enabled": 1}, {"reported_at": -1}):
+            assert compute_plane._safe_host_updater({**valid, **invalid}) is None
+        assert compute_plane._safe_host_updater(None) is None

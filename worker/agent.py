@@ -73,6 +73,49 @@ def queue_host_update_notice(revision: object) -> bool:
 
 
 
+_HOST_UPDATE_RESULTS = frozenset({
+    "unknown", "checking", "up_to_date", "updated", "deferred",
+    "blocked", "rolled_back", "failed",
+})
+_HOST_UPDATE_ERRORS = frozenset({
+    "none", "registry_unavailable", "release_invalid",
+    "health_check_failed", "rollback_failed", "config_invalid",
+})
+_HOST_UPDATE_SOURCES = frozenset({"proxy", "scheduled_or_manual", "host"})
+
+
+def read_host_updater_status():
+    """Read only bounded host-written metadata from /data, never raw logs."""
+    path = DATA / "host-updater-status.json"
+    try:
+        if path.stat().st_size > 1024:
+            return None
+        report = json.loads(path.read_text(encoding="ascii"))
+        if not isinstance(report, dict) or report.get("schema") != 1:
+            return None
+        result = report.get("last_result")
+        error = report.get("last_error")
+        source = report.get("last_source")
+        if (result not in _HOST_UPDATE_RESULTS or
+                error not in _HOST_UPDATE_ERRORS or
+                source not in _HOST_UPDATE_SOURCES):
+            return None
+        if type(report.get("listener_active")) is not bool or type(report.get("timer_enabled")) is not bool:
+            return None
+        now = int(time.time())
+        times = {}
+        for key in ("reported_at", "last_check_at", "last_success_at", "last_failure_at"):
+            value = report.get(key)
+            if type(value) is not int or not 0 <= value <= now + 3600:
+                return None
+            times[key] = value
+        return {"schema": 1, **times, "last_result": result,
+                "last_error": error, "last_source": source,
+                "listener_active": report["listener_active"],
+                "timer_enabled": report["timer_enabled"]}
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return None
+
 def memory_limit():
     values = []
     for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
@@ -539,7 +582,7 @@ class Worker:
 
     def status(self):
         ready = bool(self.process and self.process.returncode is None and self.active)
-        return {"installed": [k for k in CATALOG if model_file(k).exists()],
+        status = {"installed": [k for k in CATALOG if model_file(k).exists()],
                 "active": self.active if ready else None, "ready": ready,
                 "capabilities": self.capabilities,
                 "busy": self.lock.locked() or bool(self.tasks),
@@ -547,6 +590,10 @@ class Worker:
                 "disk_used_bytes": used_bytes(MODELS),
                 "disk_limit_bytes": DISK_LIMIT_BYTES,
                 "policy_revision": self.policy_revision}
+        host_updater = read_host_updater_status()
+        if host_updater is not None:
+            status["host_updater"] = host_updater
+        return status
 
     async def credentials(self):
         if IDENTITY.exists():

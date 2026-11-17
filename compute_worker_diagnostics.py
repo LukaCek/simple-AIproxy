@@ -54,6 +54,9 @@ def error_code(reason: object) -> str:
         return "llama_not_ready"
     if "llama.cpp http" in s:
         return "llama_http_error"
+    # The WebSocket keepalive is a transport failure, not an inference timeout.
+    if "keepalive ping timeout" in s or "ping timed out" in s:
+        return "transport_error"
     if "timed out" in s or "timeout" in s:
         return "timeout"
     if "download" in s or "huggingface" in s or "httpx" in s:

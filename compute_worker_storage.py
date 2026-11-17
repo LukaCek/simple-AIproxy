@@ -21,6 +21,17 @@ MIB = 1024 * 1024
 GIB = 1024 ** 3
 MIN_HOST_FREE = 64 * MIB
 
+# Process-local cache: an unchanged, previously SHA256-verified GGUF need not
+# be re-read (and rehashed) on every model switch. File replacement, edits,
+# inode changes and timestamp changes all invalidate the cached fingerprint.
+# Initial verification and downloads still hash the entire file.
+_VERIFIED_FILES: dict[tuple[str, str], tuple[int, int, int, int, int]] = {}
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int, int, int, int]:
+    st = path.stat()
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
 
 def disk_limit_bytes(raw: str) -> int:
     try:
@@ -185,9 +196,24 @@ def install_model(models: Path, mid: str, limit: int, last_used: dict,
 
 
 def verify_model(path: Path, expected_sha: str) -> None:
+    """Hash on first use, then trust only an unchanged file within this process.
+
+    Never persist the cache across worker restarts. Symlinks are always hashed
+    instead of cached. An altered file must pass full SHA256 verification again.
+    """
+    path = Path(path)
+    key = (str(path.absolute()), expected_sha)
+    before = _file_fingerprint(path)
+    if not path.is_symlink() and _VERIFIED_FILES.get(key) == before:
+        return
+    _VERIFIED_FILES.pop(key, None)
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         while block := stream.read(4 * MIB):
             digest.update(block)
+    if _file_fingerprint(path) != before:
+        raise RuntimeError("Model changed during SHA256 verification")
     if digest.hexdigest() != expected_sha:
         raise RuntimeError("Model SHA256 mismatch")
+    if not path.is_symlink():
+        _VERIFIED_FILES[key] = before

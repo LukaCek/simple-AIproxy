@@ -15,7 +15,8 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from websockets.asyncio.client import connect
 from compute_catalog import CATALOG, BUILTIN_CATALOG, MAX_CATALOG_MODELS, validate_model_entry
-from compute_worker_diagnostics import backend_error_code, error_code, validate as validate_diagnostic
+from compute_worker_diagnostics import (backend_error_code, error_code,
+                                        websocket_close_code, validate as validate_diagnostic)
 from compute_worker_snapshot import STATUS_FILE, write_snapshot
 from compute_worker_storage import (disk_limit_bytes, used_bytes, install_model, remove_model, verify_model, target_path, prune_to_limit)
 
@@ -1084,8 +1085,9 @@ class Worker:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                code = error_code(exc)
-                self._diag("network", code, level="warning")
+                code = websocket_close_code(exc)
+                self._diag("network", code, level=(
+                    "info" if code in ("clean_close", "server_restart") else "warning"))
                 print(f"Disconnected: {code}", flush=True)
             self.connected = False
             self._activity("disconnected")

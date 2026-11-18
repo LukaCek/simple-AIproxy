@@ -31,7 +31,7 @@ request and stored code must still be bound to our canonical /mcp audience.
 Wrong explicit resources and PKCE mismatches remain rejected. One-use codes
 are never reusable. The initial OAuth challenge advertises
 `offline_access` so capable clients can request rotating refresh tokens;
-the consent UI offers **Keep this MCP connection signed in for up to 30 days**
+the consent UI offers **Keep this MCP connection signed in (renewable 30-day refresh token)**
 even when a client omits `offline_access`. This is optional owner consent
 for a narrowly scoped rotating refresh token, not an increase in write
 permissions.
@@ -108,7 +108,9 @@ the stronger scope. Approval is never automatic.
 Access tokens are scoped to `https://aiproxy.cekluka.com/mcp`, expire in
 one hour, and are stored only as SHA-256 hashes in `app.db`. After the owner
 explicitly consents to **Keep this MCP connection signed in**, a rotating
-refresh token expires in 30 days, even if the OAuth client did not include
+refresh token expires after 30 days without being used. Each successful refresh
+rotates the token and extends its expiry; the user may revoke it at any time.
+This works even if the OAuth client did not include
 `offline_access` in its initial scope. No long-lived access token is issued.
 Unchecking that option issues only the normal one-hour access token, whether
 or not the client requested `offline_access`. This remains revocable in

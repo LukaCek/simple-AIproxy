@@ -47,6 +47,7 @@ def require_admin_write(request: Request, _admin=Depends(core.verify_admin)) -> 
 
 _connections: dict[str, "NodeConnection"] = {}
 _registry_lock = asyncio.Lock()
+_retiring_connections: set[asyncio.Task] = set()
 # One proxy event-loop process is the supported coordinator topology for v1.
 # Reserve before dispatch: heartbeat telemetry is too stale to prevent races.
 _reservation_lock = threading.Lock()
@@ -293,6 +294,7 @@ _EVENT_TYPES = frozenset({
     "model_loaded", "model_unloaded", "operation_started", "operation_succeeded",
     "operation_failed", "private_access_enabled", "private_access_disabled",
     "revoked", "removed", "worker_diagnostic", "update_offered",
+    "connection_replaced",
 })
 _MODEL_STATES = frozenset({"untested", "testing", "supported", "unsupported", "error"})
 
@@ -583,10 +585,34 @@ class NodeConnection:
     last_update_notice: str = ""
     last_policy_signature: tuple | None = None
     connected_at: float = field(default_factory=time.monotonic)
+    last_telemetry_at: float = field(default_factory=time.monotonic)
 
     async def send(self, message: dict[str, Any]) -> None:
         async with self.write_lock:
             await self.ws.send_json(message)
+
+
+async def _close_replaced_connection(old: "NodeConnection") -> None:
+    """Close an obsolete WSS session without blocking the registry lock."""
+    try:
+        await asyncio.wait_for(old.ws.close(code=1012), timeout=3)
+    except (asyncio.TimeoutError, RuntimeError, OSError, WebSocketDisconnect):
+        pass  # New connection is already authoritative; stale WSS cannot route.
+
+
+async def _activate_connection(conn: "NodeConnection") -> None:
+    """Make a healthy reconnect authoritative without waiting for stale TCP."""
+    async with _registry_lock:
+        old = _connections.get(conn.node_id)
+        _connections[conn.node_id] = conn
+    if old and old is not conn:
+        elapsed = max(0, min(int(time.monotonic() - old.connected_at), 30 * 86400))
+        gap = max(0, min(int(time.monotonic() - old.last_telemetry_at), 3600))
+        _event(conn.node_id, "connection_replaced",
+               detail=f"old_uptime_s={elapsed} telemetry_gap_s={gap}")
+        task = asyncio.create_task(_close_replaced_connection(old))
+        _retiring_connections.add(task)
+        task.add_done_callback(_retiring_connections.discard)
 
 
 async def _dispatch(node_id: str, message: dict[str, Any], *, timeout: float = 900.0):
@@ -1037,6 +1063,7 @@ async def compute_ws(ws: WebSocket):
     await ws.accept()
     conn = None
     disconnect_reason = "unknown"
+    disconnect_code = 0
     try:
         data = await asyncio.wait_for(ws.receive_json(), timeout=15)
         if not isinstance(data, dict) or data.get("type") != "auth" or data.get("protocol") != 1:
@@ -1061,11 +1088,7 @@ async def compute_ws(ws: WebSocket):
                                               and re.fullmatch(r"[0-9a-f]{40}",
                                                                data["build_revision"])
                                               else ""))
-        async with _registry_lock:
-            old = _connections.get(node_id)
-            if old:
-                await old.ws.close(code=1012)
-            _connections[node_id] = conn
+        await _activate_connection(conn)
         await conn.send({"type": "auth_ok", "protocol": 1})
         # A node's policy may differ from the globally approved model list.
         await _send_node_policy(conn)
@@ -1075,6 +1098,14 @@ async def compute_ws(ws: WebSocket):
         _event(node_id, "connected")
         while True:
             message = await ws.receive_json()
+            if _connections.get(node_id) is not conn:
+                # An obsolete connection must not overwrite fresh telemetry,
+                # dispatch completions or current policy after a reconnect.
+                disconnect_reason = "server_restart"
+                break
+            if not isinstance(message, dict):
+                await ws.close(code=1008)
+                break
             if len(json.dumps(message)) > 256 * 1024:
                 await ws.close(code=1009)
                 break
@@ -1093,6 +1124,7 @@ async def compute_ws(ws: WebSocket):
                         break
                     db.execute("UPDATE ComputeNodes SET last_seen=?,hardware_json=?,models_json=? WHERE id=?",
                                (int(time.time()), json.dumps(hardware), json.dumps(models), node_id))
+                conn.last_telemetry_at = time.monotonic()
                 try:
                     previous = json.loads(old["models_json"]) if old else {}
                 except (TypeError, ValueError):
@@ -1119,6 +1151,7 @@ async def compute_ws(ws: WebSocket):
                 if pending:
                     await pending.put(message)
     except WebSocketDisconnect as exc:
+        disconnect_code = exc.code if type(exc.code) is int and 1000 <= exc.code <= 4999 else 0
         disconnect_reason = (
             "clean_close" if exc.code in (1000, 1001) else
             "server_restart" if exc.code == 1012 else "transport_error"
@@ -1127,6 +1160,7 @@ async def compute_ws(ws: WebSocket):
         disconnect_reason = "timeout"
     except Exception:
         disconnect_reason = "proxy_error"
+        disconnect_code = 1011
         try:
             await ws.close(code=1011)
         except Exception:
@@ -1142,8 +1176,11 @@ async def compute_ws(ws: WebSocket):
                 _connections.pop(conn.node_id, None)
                 duration = max(0, min(int(time.monotonic() - conn.connected_at),
                                       30 * 86400))
+                telemetry_gap = max(0, min(
+                    int(time.monotonic() - conn.last_telemetry_at), 3600))
                 _event(conn.node_id, "disconnected",
-                       detail=f"reason={disconnect_reason} uptime_s={duration}")
+                       detail=(f"reason={disconnect_reason} code={disconnect_code} "
+                               f"uptime_s={duration} telemetry_gap_s={telemetry_gap}"))
 
 
 @router.get("/admin/api/compute/update-release", dependencies=[Depends(core.verify_admin)])

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import secrets
 import shutil
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -305,6 +306,14 @@ class Worker:
         self.reconcile_task = None
         self.last_used = {}
         self.capabilities = {}
+        # Status snapshots are best-effort; quotas are still checked with
+        # fresh filesystem data by storage.py before any new download.
+        self._usage_cache = (0.0, 0)
+        self._wss = None
+        self._connected_since = 0
+        self._last_disconnect_at = 0
+        self._last_disconnect_code = "none"
+        self._reconnect_count = 0
         self.state_path = DATA / "model-test-results.json"
         self.catalog_path = DATA / "approved-model-catalog.json"
         self._diag_path = DATA / "diagnostics.json"
@@ -581,6 +590,28 @@ class Worker:
             stream.write(data)
         os.replace(tmp, self.state_path)
 
+    def _cached_usage(self):
+        now = time.monotonic()
+        sampled_at, usage = self._usage_cache
+        if now - sampled_at >= 10 or not sampled_at:
+            usage = used_bytes(MODELS)
+            self._usage_cache = (now, usage)
+        return usage
+
+    def _network_status(self):
+        latency = getattr(self._wss, "latency", None)
+        ping_ms = None
+        if (self.connected and type(latency) in (float, int)
+                and math.isfinite(latency) and latency > 0):
+            ping_ms = min(300_000, max(1, round(latency * 1000)))
+        return {
+            "connected_since": self._connected_since if self.connected else 0,
+            "ping_rtt_ms": ping_ms,
+            "reconnect_count": min(100_000_000, self._reconnect_count),
+            "last_disconnect_at": self._last_disconnect_at,
+            "last_disconnect_code": self._last_disconnect_code,
+        }
+
     def status(self):
         ready = bool(self.process and self.process.returncode is None and self.active)
         status = {"installed": [k for k in CATALOG if model_file(k).exists()],
@@ -588,9 +619,10 @@ class Worker:
                 "capabilities": self.capabilities,
                 "busy": self.lock.locked() or bool(self.tasks),
                 "running_tasks": 1 if self.lock.locked() else 0,
-                "disk_used_bytes": used_bytes(MODELS),
+                "disk_used_bytes": self._cached_usage(),
                 "disk_limit_bytes": DISK_LIMIT_BYTES,
-                "policy_revision": self.policy_revision}
+                "policy_revision": self.policy_revision,
+                "network": self._network_status()}
         host_updater = read_host_updater_status()
         if host_updater is not None:
             status["host_updater"] = host_updater
@@ -1024,6 +1056,31 @@ class Worker:
                                                  "body": base64.b64encode(piece).decode()})
             await self.send(ws, {"type": "end", "id": cid, "status": 200})
 
+    async def _receive_ws_messages(self, ws):
+        """Handle authenticated commands; no arbitrary proxy-side shell actions."""
+        async for raw in ws:
+            cmd = json.loads(raw)
+            cid, kind = str(cmd.get("id") or ""), cmd.get("type")
+            if kind == "diagnostic_ack":
+                self._ack_diag(cmd.get("seq"))
+            elif kind == "policy":
+                await self.receive_policy(ws, cmd)
+            elif kind == "update_available":
+                queue_host_update_notice(cmd.get("revision"))
+            elif kind == "cancel":
+                task = self.tasks.get(cid)
+                if task:
+                    task.cancel()
+            elif kind in ("command", "run") and cid:
+                if len(self.tasks) >= 1:
+                    await self.send(ws, {"type": "error", "id": cid,
+                                         "error": "Worker busy"})
+                    continue
+                task = asyncio.create_task(
+                    self.command(ws, cmd) if kind == "command"
+                    else self.inference(ws, cmd))
+                self.tasks[cid] = task
+
     async def run(self):
         parts = urlsplit(PROXY)
         if parts.scheme != "https" or not parts.netloc:
@@ -1033,65 +1090,86 @@ class Worker:
         identity = await self.credentials()
         delay = 2
         while True:
+            begun = time.monotonic()
+            connection_error = None
+            self._reconnect_count = min(100_000_000, self._reconnect_count + 1)
             try:
-                async with connect(url, max_size=2 * 1024 * 1024, ping_interval=20) as ws:
+                # Keep 20-second pings (for reverse-proxy idle timeouts), but
+                # tolerate a short CPU/network scheduling stall before dropping
+                # an otherwise healthy long-running inference session.
+                async with connect(url, max_size=2 * 1024 * 1024,
+                                   ping_interval=20, ping_timeout=90) as ws:
                     await self.send(ws, {"type": "auth", **identity, "protocol": 1,
-                                         "catalog_protocol": 1, "update_protocol": 1})
+                                         "catalog_protocol": 1, "update_protocol": 1,
+                                         "build_revision": os.getenv("WORKER_BUILD_REVISION", "")})
                     msg = json.loads(await asyncio.wait_for(ws.recv(), 20))
                     if msg.get("type") != "auth_ok":
                         raise RuntimeError("Authentication rejected")
                     self.connected = True
+                    self._wss = ws
+                    self._connected_since = int(time.time())
                     self._activity("idle")
                     self._diag("network", "connected")
-                    delay = 2
                     heart = asyncio.create_task(self.heartbeat(ws))
                     diagnostics = asyncio.create_task(self._send_diagnostics(ws))
+                    receiver = asyncio.create_task(self._receive_ws_messages(ws))
                     try:
-                        async for raw in ws:
-                            cmd = json.loads(raw)
-                            cid, kind = str(cmd.get("id") or ""), cmd.get("type")
-                            if kind == "diagnostic_ack":
-                                self._ack_diag(cmd.get("seq"))
-                            elif kind == "policy":
-                                await self.receive_policy(ws, cmd)
-                            elif kind == "update_available":
-                                queue_host_update_notice(cmd.get("revision"))
-                            elif kind == "cancel":
-                                task = self.tasks.get(cid)
-                                if task:
-                                    task.cancel()
-                            elif kind in ("command", "run") and cid:
-                                if len(self.tasks) >= 1:
-                                    await self.send(ws, {"type": "error", "id": cid, "error": "Worker busy"})
-                                    continue
-                                task = asyncio.create_task(
-                                    self.command(ws, cmd) if kind == "command" else self.inference(ws, cmd)
-                                )
-                                self.tasks[cid] = task
+                        # A failed heartbeat or diagnostic sender used to die
+                        # silently while the socket remained "connected".
+                        # Monitor all session tasks and reconnect on failure.
+                        done, _ = await asyncio.wait(
+                            (receiver, heart, diagnostics),
+                            return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            task.result()
+                        if receiver not in done:
+                            connection_error = ("heartbeat_failed" if heart in done
+                                                else "diagnostics_failed")
+                        else:
+                            close_code = getattr(ws, "close_code", None)
+                            connection_error = ("clean_close" if close_code in
+                                                (1000, 1001) else "server_restart"
+                                                if close_code == 1012 else "transport_error")
                     finally:
                         heart.cancel()
                         diagnostics.cancel()
+                        receiver.cancel()
                         if self.reconcile_task and not self.reconcile_task.done():
                             self.reconcile_task.cancel()
                             await asyncio.gather(self.reconcile_task, return_exceptions=True)
                         self.reconcile_task = None
                         for task in self.tasks.values():
                             task.cancel()
-                        await asyncio.gather(heart, diagnostics, *list(self.tasks.values()),
-                                             return_exceptions=True)
+                        await asyncio.gather(
+                            heart, diagnostics, receiver, *list(self.tasks.values()),
+                            return_exceptions=True)
                         self.tasks.clear()
                         self.connected = False
+                        self._wss = None
+                        self._connected_since = 0
                         self._activity("disconnected")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                code = websocket_close_code(exc)
-                self._diag("network", code, level=(
-                    "info" if code in ("clean_close", "server_restart") else "warning"))
-                print(f"Disconnected: {code}", flush=True)
+                connection_error = websocket_close_code(exc)
+            # A stable session resets exponential backoff. Short repeated
+            # flaps progressively back off, with small per-worker jitter to
+            # avoid a synchronized reconnect storm after a proxy restart.
+            duration = time.monotonic() - begun
+            if duration >= 120:
+                delay = 2
+            reason = connection_error or "unknown_error"
+            self._last_disconnect_code = reason
+            self._last_disconnect_at = int(time.time())
+            self._diag("network", reason,
+                       level="info" if reason in ("clean_close", "server_restart")
+                       else "warning")
+            print(f"Disconnected: {reason}", flush=True)
             self.connected = False
+            self._wss = None
+            self._connected_since = 0
             self._activity("disconnected")
-            await asyncio.sleep(delay)
+            await asyncio.sleep(delay + secrets.randbelow(500) / 1000)
             delay = min(60, delay * 2)
 
 

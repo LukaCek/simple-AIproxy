@@ -726,7 +726,7 @@ def list_logs(limit: int = 200) -> List[Dict[str, Any]]:
             """
             SELECT id, api_key, api_key_name, request_id, requested_model, group_name, provider_name, provider_model,
                    status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
-                   prompt, output, error, created_at
+                   prompt, output, error, created_at, stream_outcome
             FROM Logs ORDER BY id DESC LIMIT ?
             """,
             (limit,),

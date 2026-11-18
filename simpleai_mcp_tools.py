@@ -262,7 +262,8 @@ def _catalog(compute) -> dict:
 def _logs(core, args) -> list[dict]:
     where, params = [], []
     if args.get("errors_only"):
-        where.append("(status_code IS NULL OR status_code >= 400)")
+        where.append("(status_code IS NULL OR status_code >= 400 "
+                     "OR stream_outcome IN ('cancelled','interrupted'))")
     if args.get("model"):
         where.append("requested_model = ?")
         params.append(args["model"])
@@ -277,7 +278,7 @@ def _logs(core, args) -> list[dict]:
         rows = db.execute(
             "SELECT id, request_id, requested_model, group_name, provider_name, "
             "provider_model, status_code, started_at, ended_at, first_response_ms, "
-            "total_ms, created_at, error, api_key_name "
+            "total_ms, created_at, error, api_key_name, stream_outcome "
             "FROM Logs" + clause + " ORDER BY id DESC LIMIT ?", params).fetchall()
     return [{
         "id": r["id"], "request_id": r["request_id"],
@@ -286,11 +287,16 @@ def _logs(core, args) -> list[dict]:
         "provider": _read_safe(r["provider_name"]),
         "provider_model": _read_safe(r["provider_model"]),
         "api_key_label": _read_safe(r["api_key_name"]),  # only user-assigned display label
-        "status_code": r["status_code"], "started_at": r["started_at"],
+        "status_code": r["status_code"], "stream_outcome": r["stream_outcome"],
+        "started_at": r["started_at"],
         "ended_at": r["ended_at"], "first_response_ms": r["first_response_ms"],
         "total_ms": r["total_ms"], "created_at": r["created_at"],
-        "error_category": _code(r["error"], status_code=r["status_code"])
-                          if r["error"] or (r["status_code"] or 0) >= 400 else "",
+        "error_category": (
+            "stream_cancelled" if r["stream_outcome"] == "cancelled" else
+            "stream_interrupted" if r["stream_outcome"] == "interrupted" else
+            _code(r["error"], status_code=r["status_code"])
+            if r["error"] or (r["status_code"] or 0) >= 400 else ""
+        ),
     } for r in rows]
 
 
@@ -416,8 +422,10 @@ async def execute(name: str, args: dict, app) -> dict:
         nodes=_workers(core,compute)
         with core.get_db_connection() as db:
             count=db.execute("SELECT count(*) FROM Logs").fetchone()[0]
-            last=db.execute("SELECT count(*) FROM Logs WHERE status_code >= 400 AND id > "
-                            "(SELECT max(id)-200 FROM Logs)").fetchone()[0]
+            last=db.execute("SELECT count(*) FROM Logs WHERE "
+                            "(status_code IS NULL OR status_code >= 400 "
+                            "OR stream_outcome IN ('cancelled','interrupted')) "
+                            "AND id > (SELECT max(id)-200 FROM Logs)").fetchone()[0]
         # Read-only aggregate diagnostics to distinguish missing refresh
         # grants from expired tokens. Never expose client IDs or token hashes.
         from simpleai_mcp_oauth import setup as oauth_setup

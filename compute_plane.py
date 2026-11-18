@@ -96,6 +96,12 @@ async def _send_release_notice(conn: "NodeConnection") -> None:
     sha = _latest_worker_release
     if not conn.update_capable or not sha or conn.last_update_notice == sha:
         return
+    # An already updated worker doesn't need repeated update notices on each
+    # transient reconnect. Older clients without the build hint still receive
+    # the advisory exactly as before.
+    if conn.build_revision == sha:
+        conn.last_update_notice = sha
+        return
     await conn.send({"type": "update_available", "revision": sha})
     conn.last_update_notice = sha
     _event(conn.node_id, "update_offered")
@@ -438,6 +444,32 @@ _HOST_UPDATE_ERRORS = frozenset({
     "health_check_failed", "rollback_failed", "config_invalid",
 })
 _HOST_UPDATE_SOURCES = frozenset({"proxy", "scheduled_or_manual", "host"})
+_WSS_DISCONNECT_CODES = frozenset({
+    "none", "clean_close", "server_restart", "transport_error",
+    "timeout", "unknown_error", "heartbeat_failed", "diagnostics_failed",
+})
+
+
+def _safe_worker_network(raw: object) -> dict[str, Any] | None:
+    """Only bounded, typed network telemetry; never expose raw errors or URLs."""
+    if not isinstance(raw, dict):
+        return None
+    now = int(time.time()) + 3600
+    def timestamp(key: str):
+        value = raw.get(key)
+        return value if type(value) is int and 0 <= value <= now else 0
+    attempts = raw.get("reconnect_count")
+    rtt = raw.get("ping_rtt_ms")
+    code = raw.get("last_disconnect_code")
+    return {
+        "connected_since": timestamp("connected_since"),
+        "last_disconnect_at": timestamp("last_disconnect_at"),
+        "reconnect_count": attempts if type(attempts) is int and
+                                   0 <= attempts <= 100_000_000 else 0,
+        "ping_rtt_ms": rtt if type(rtt) is int and 1 <= rtt <= 300_000 else None,
+        "last_disconnect_code": code if isinstance(code, str) and
+                                     code in _WSS_DISCONNECT_CODES else "unknown_error",
+    }
 
 
 def _safe_host_updater(raw: object) -> dict[str, Any] | None:
@@ -513,6 +545,7 @@ def _public_node(row: dict[str, Any]) -> dict[str, Any]:
     models["disk_used_bytes"] = _nonnegative_int(models.get("disk_used_bytes"))
     models["disk_limit_bytes"] = _nonnegative_int(models.get("disk_limit_bytes"))
     models["host_updater"] = _safe_host_updater(models.get("host_updater"))
+    models["network"] = _safe_worker_network(models.get("network"))
     return {
         "id": row["id"], "name": row["name"], "online": row["id"] in _connections,
         "update_protocol": bool(_connections.get(row["id"]) and
@@ -534,6 +567,7 @@ class NodeConnection:
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     catalog_capable: bool = False
     update_capable: bool = False
+    build_revision: str = ""
     last_update_notice: str = ""
     last_policy_signature: tuple | None = None
     connected_at: float = field(default_factory=time.monotonic)
@@ -993,7 +1027,7 @@ async def compute_ws(ws: WebSocket):
     disconnect_reason = "unknown"
     try:
         data = await asyncio.wait_for(ws.receive_json(), timeout=15)
-        if data.get("type") != "auth" or data.get("protocol") != 1:
+        if not isinstance(data, dict) or data.get("type") != "auth" or data.get("protocol") != 1:
             await ws.close(code=1008)
             return
         node_id = str(data.get("node_id", ""))
@@ -1009,7 +1043,12 @@ async def compute_ws(ws: WebSocket):
                               catalog_capable=(type(data.get("catalog_protocol")) is int
                                                and data["catalog_protocol"] == 1),
                               update_capable=(type(data.get("update_protocol")) is int
-                                              and data["update_protocol"] == 1))
+                                              and data["update_protocol"] == 1),
+                              build_revision=(data["build_revision"]
+                                              if isinstance(data.get("build_revision"), str)
+                                              and re.fullmatch(r"[0-9a-f]{40}",
+                                                               data["build_revision"])
+                                              else ""))
         async with _registry_lock:
             old = _connections.get(node_id)
             if old:

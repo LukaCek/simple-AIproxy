@@ -471,6 +471,7 @@ async def chat_completions(
                         first_at: Optional[str] = None
                         completed = False
                         stream_error: Optional[str] = None
+                        stream_outcome = "cancelled"
                         # Bounded SSE prefix for visible assistant text in
                         # standard Request Logs. Excludes reasoning deltas.
                         text_capture = bytearray()
@@ -482,21 +483,26 @@ async def chat_completions(
                                     text_capture.extend(part[:65536 - len(text_capture)])
                                 yield part
                             completed = True
+                            stream_outcome = "completed"
                         except asyncio.CancelledError:
                             stream_error = "Compute stream cancelled"
                             raise
                         except Exception:
+                            stream_outcome = "interrupted"
                             stream_error = "Compute stream interrupted"
                             raise
                         finally:
-                            code = 200 if completed else 502
-                            action = "success" if completed else "stream_error"
+                            # Headers were sent as HTTP 200. Keep the actual
+                            # HTTP status separate from the stream outcome.
+                            action = ("success" if completed else
+                                      "stream_error" if stream_outcome == "interrupted"
+                                      else "stream_cancelled")
                             if not completed and stream_error is None:
                                 stream_error = "Compute stream stopped before completion"
                             ended_at, first_ms, total_ms = timing(first_at)
                             # No arbitrary worker stream content in log metadata.
                             record_attempt(number, provider_name, provider_model,
-                                           code, action, stream_error,
+                                           200, action, stream_error,
                                            attempt_started_at, attempt_started_monotonic)
                             try:
                                 output_text = _impl.extract_response_text_from_sse(
@@ -507,9 +513,10 @@ async def chat_completions(
                             _impl.insert_log(
                                 api_key_value, api_key_name, requested_model,
                                 requested_model, provider_name, provider_model,
-                                code, started_at, first_at, ended_at, first_ms,
+                                200, started_at, first_at, ended_at, first_ms,
                                 total_ms, prompt_text, output_text or None,
                                 stream_error, request_id=request_id,
+                                stream_outcome=stream_outcome,
                             )
 
                     compute_response.body_iterator = metered_compute_stream()
@@ -682,6 +689,7 @@ async def chat_completions(
             captured = bytearray()
             text_parts: list[str] = []
             stream_error: Optional[str] = None
+            stream_outcome = "cancelled"
 
             def mark_first() -> None:
                 nonlocal first_response_at
@@ -696,7 +704,7 @@ async def chat_completions(
                 text_parts.append(text)
 
             async def body() -> AsyncIterator[bytes]:
-                nonlocal stream_error
+                nonlocal stream_error, stream_outcome
                 try:
                     if responses_mode:
                         async for out in responses_to_chat_sse(
@@ -714,25 +722,34 @@ async def chat_completions(
                             on_upstream_bytes=capture,
                         ):
                             yield out
-                except Exception as exc:
-                    stream_error = _impl.format_provider_exception(exc)
+                    stream_outcome = "completed"
+                except asyncio.CancelledError:
+                    stream_error = "Stream cancelled by client"
+                    raise
+                except Exception:
+                    stream_outcome = "interrupted"
+                    stream_error = "Upstream stream interrupted"
                     raise
                 finally:
                     await response.aclose()
-                    if stream_error is None:
+                    if stream_outcome == "completed":
                         _impl.clear_provider_cooldown(endpoint)
                         if hasattr(_impl, "codex_note_success"):
                             _impl.codex_note_success(endpoint)
-                    else:
+                    elif stream_outcome == "interrupted":
                         _impl.set_provider_cooldown(
                             endpoint, _impl.PROVIDER_TIMEOUT_COOLDOWN_SECONDS
                         )
+                    if stream_outcome != "completed" and stream_error is None:
+                        stream_error = "Stream stopped before completion"
                     record_attempt(
                         number,
                         provider_name,
                         provider_model,
-                        200 if stream_error is None else 502,
-                        "success" if stream_error is None else "stream_error",
+                        200,
+                        ("success" if stream_outcome == "completed" else
+                         "stream_error" if stream_outcome == "interrupted"
+                         else "stream_cancelled"),
                         stream_error,
                         attempt_started_at,
                         attempt_started_monotonic,
@@ -754,9 +771,10 @@ async def chat_completions(
                     _impl.insert_log(
                         api_key_value, api_key_name, requested_model, requested_model,
                         provider_name, provider_model,
-                        200 if stream_error is None else 502, started_at,
+                        200, started_at,
                         first_response_at, ended_at, first_ms, total_ms, prompt_text,
                         output_text, stream_error, request_id=request_id,
+                        stream_outcome=stream_outcome,
                     )
 
             media_type = "text/event-stream" if responses_mode else content_type

@@ -31,7 +31,10 @@ request and stored code must still be bound to our canonical /mcp audience.
 Wrong explicit resources and PKCE mismatches remain rejected. One-use codes
 are never reusable. The initial OAuth challenge advertises
 `offline_access` so capable clients can request rotating refresh tokens;
-the consent UI shows this permission explicitly.
+the consent UI offers **Keep this MCP connection signed in for up to 30 days**
+even when a client omits `offline_access`. This is optional owner consent
+for a narrowly scoped rotating refresh token, not an increase in write
+permissions.
 
 **ChatGPT plan limitation:** a successful OAuth login does not override
 ChatGPT's own write-tool availability. On personal plans, ChatGPT may be
@@ -39,6 +42,27 @@ limited to read/fetch tools; full custom MCP write actions are supported in
 eligible Business and Enterprise/Edu workspaces. Use a compatible MCP client
 or GitHub workflows for actual mutations when ChatGPT itself exposes only
 read permissions.
+
+## Repeated ChatGPT OAuth login prompts
+
+A new browser login every ~60 minutes can happen if a ChatGPT OAuth request
+did not include `offline_access` and an older SimpleAI grant lacked a refresh
+token. The server now supports a user-consented rotating refresh token even
+without that optional scope. **After upgrading the server, reconnect the
+existing ChatGPT MCP plugin once** so the new authorization grant can include
+the refresh token. On the consent page leave **Keep this MCP connection
+signed in for up to 30 days** selected. This does not grant model-management
+rights unless explicitly approved in the separate permissions selector.
+
+The server cannot force a remote OAuth client to store or use a returned
+refresh token. If the login prompt still recurs, inspect `system_status`'s
+`mcp_oauth_refresh_health` and the admin-only `/admin/api/mcp/oauth/diagnostics`
+page. Health reports only aggregate counts and whether the newest grant had
+an active refresh token; no credentials or client IDs are exposed. The safe
+OAuth events `refresh_issued`, `refresh_not_issued` and
+`refresh_exchange_succeeded` distinguish grant creation and actual renewal.
+An expired or revoked refresh token still requires a normal OAuth login.
+Existing tokens are preserved by the database migration.
 
 ## OAuth 2.1 browser login (recommended for ChatGPT)
 
@@ -82,8 +106,13 @@ approve **read-only** access or **read + operate** if the client requested
 the stronger scope. Approval is never automatic.
 
 Access tokens are scoped to `https://aiproxy.cekluka.com/mcp`, expire in
-one hour, and are stored only as SHA-256 hashes in `app.db`. Clients
-requesting `offline_access` receive a 30-day rotating refresh token.
+one hour, and are stored only as SHA-256 hashes in `app.db`. After the owner
+explicitly consents to **Keep this MCP connection signed in**, a rotating
+refresh token expires in 30 days, even if the OAuth client did not include
+`offline_access` in its initial scope. No long-lived access token is issued.
+Unchecking that option issues only the normal one-hour access token, whether
+or not the client requested `offline_access`. This remains revocable in
+`/admin/mcp`.
 Access tokens cannot be used as SimpleAI regular API keys or admin login
 credentials. Errors include a protected-resource `WWW-Authenticate`
 challenge, and tools advertise their OAuth scopes individually.

@@ -1161,7 +1161,7 @@ class Worker:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                connection_error = websocket_close_code(exc)
+                connection_error = connection_error or websocket_close_code(exc)
             # A stable session resets exponential backoff. Short repeated
             # flaps progressively back off, with small per-worker jitter to
             # avoid a synchronized reconnect storm after a proxy restart.

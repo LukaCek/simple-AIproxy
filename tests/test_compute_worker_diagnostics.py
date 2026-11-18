@@ -145,7 +145,19 @@ def test_websocket_close_codes_are_classified_without_private_reasons():
     assert websocket_close_code(FakeDisconnect(1001)) == "clean_close"
     assert websocket_close_code(FakeDisconnect(1012)) == "server_restart"
     assert websocket_close_code(FakeDisconnect(1006)) == "transport_error"
-    assert websocket_close_code(FakeDisconnect(1011)) == "unknown_error"
+    assert websocket_close_code(FakeDisconnect(1011)) == "server_error"
+    assert websocket_close_code(FakeDisconnect(1008)) == "protocol_rejected"
+    assert websocket_close_code(FakeDisconnect(1013)) == "server_overloaded"
+    import socket
+    from types import SimpleNamespace
+    assert websocket_close_code(socket.gaierror("SECRET_PRIVATE_PROMPT")) == "dns_error"
+    probe = FakeDisconnect(1011)
+    probe.rcvd = None
+    probe.sent = SimpleNamespace(code=1011, reason="keepalive ping timeout PRIVATE")
+    assert websocket_close_code(probe) == "ping_timeout"
+    handshake = RuntimeError("SECRET_PRIVATE_PROMPT")
+    handshake.response = SimpleNamespace(status_code=401)
+    assert websocket_close_code(handshake) == "handshake_rejected"
     assert "SECRET_PRIVATE_PROMPT" not in websocket_close_code(FakeDisconnect(1012))
 
 

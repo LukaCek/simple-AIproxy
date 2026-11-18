@@ -314,3 +314,40 @@ def test_worker_model_reasons_use_safe_status_codes():
     assert tools._model_reason_code("error", "unexpected failure") == "test_failed"
     assert tools._model_reason_code("testing", "") == "test_start"
     assert tools._model_reason_code("error", "llama-server crashed") == "llama_crashed"
+
+
+def test_request_diagnostics_separate_http_status_from_stream_outcome(client):
+    from datetime import datetime
+    now = datetime.utcnow().isoformat()
+    assert tools._code('opaque error', status_code=429) == "provider_rate_limited"
+    assert tools._code('unknown provider failure', status_code=503) == "provider_unavailable"
+    core.insert_log("test-key", "test", "model-stream", "model-stream",
+                    "provider", "model", 200, now, now, now, 50, 100,
+                    "SENSITIVE_INPUT", "SENSITIVE_OUTPUT", "Stream cancelled by client",
+                    request_id="stream-cancel-id", stream_outcome="cancelled")
+    core.insert_provider_attempt("provider-rate-test", 1, "model-rate", "provider",
+                                 "model", 429, "fallback", "opaque error", now, now, 20)
+    key = token(client)["token"]
+    results = call(client, key, "request_logs", errors_only=True, limit=10)
+    logs = results["result"]["structuredContent"]["logs"]
+    found = next(x for x in logs if x["request_id"] == "stream-cancel-id")
+    assert found["status_code"] == 200
+    assert found["stream_outcome"] == "cancelled"
+    assert found["error_category"] == "stream_cancelled"
+    assert "SENSITIVE_" not in json.dumps(found)
+    attempts = call(client, key, "provider_attempts", request_id="provider-rate-test")
+    attempt = attempts["result"]["structuredContent"]["attempts"][0]
+    assert attempt["status_code"] == 429
+    assert attempt["error_category"] == "provider_rate_limited"
+    health = call(client, key, "system_status")["result"]["structuredContent"]
+    assert health["failures_in_last_200_requests"] >= 1
+
+
+def test_existing_logs_are_migrated_without_fabricating_stream_completion(client):
+    with core.get_db_connection() as db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(Logs)")}
+    assert "stream_outcome" in columns
+    core.init_database()
+    with core.get_db_connection() as db:
+        columns2 = {row[1] for row in db.execute("PRAGMA table_info(Logs)")}
+    assert "stream_outcome" in columns2

@@ -501,6 +501,7 @@ with open(os.environ["MOCK_ACTIONS"], "a") as f:
     assert "ExecStart=%h/.local/share/simpleai-compute/%i/auto-update.sh --listen %i" in listener
     assert "Restart=always" in listener
     assert "enable --now simpleai-compute-listener@demo.service" in actions.read_text()
+    assert "restart simpleai-compute-listener@demo.service" in actions.read_text()
     assert "OnCalendar=*-*-* 03,09,15,21:00:00" in timer
 
 

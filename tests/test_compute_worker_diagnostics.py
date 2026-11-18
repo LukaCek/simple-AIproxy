@@ -171,3 +171,25 @@ def test_compute_event_migrates_old_schema_and_preserves_historical_unknown_time
         assert "occurred_at" in cols
         old = db.execute("SELECT created_at,occurred_at FROM ComputeEvents").fetchone()
         assert old == (123, None)
+
+
+def test_wss_replay_after_lost_ack_does_not_duplicate_events(tmp_path, monkeypatch):
+    # A diagnostic can be committed before its ACK is lost on a broken socket.
+    # Replaying the same sequence after reconnect must not inflate warnings.
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        item = record(seq=714, code="transport_error", level="warning")
+        for _ in range(2):
+            with client.websocket_connect("/compute/ws") as ws:
+                ws.send_json({"type": "auth", "protocol": 1, **identity})
+                assert ws.receive_json()["type"] == "auth_ok"
+                ws.send_json(item)
+                assert ws.receive_json() == {"type": "diagnostic_ack", "seq": 714}
+                ws.send_json(item)
+                assert ws.receive_json() == {"type": "diagnostic_ack", "seq": 714}
+        with sqlite3.connect(str(tmp_path / "proxy.db")) as db:
+            rows = db.execute(
+                "SELECT diagnostic_seq,detail FROM ComputeEvents "
+                "WHERE node_id=? AND event='worker_diagnostic'",
+                (identity["node_id"],)).fetchall()
+            assert rows == [(714, "model_test/transport_error ram_cap=2048MiB ram_free=422MiB disk_cap=8192MiB weights=1280MiB")]

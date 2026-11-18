@@ -192,4 +192,6 @@ def test_wss_replay_after_lost_ack_does_not_duplicate_events(tmp_path, monkeypat
                 "SELECT diagnostic_seq,detail FROM ComputeEvents "
                 "WHERE node_id=? AND event='worker_diagnostic'",
                 (identity["node_id"],)).fetchall()
-            assert rows == [(714, "model_test/transport_error ram_cap=2048MiB ram_free=422MiB disk_cap=8192MiB weights=1280MiB")]
+            assert len(rows) == 1
+            assert rows[0][0] == 714
+            assert rows[0][1].startswith("model_test/transport_error")

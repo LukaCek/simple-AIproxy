@@ -128,7 +128,7 @@ def test_worker_diagnostic_events_deleted_with_permanent_registration(tmp_path, 
 
 def test_websocket_reconnect_errors_are_classified_without_raw_messages():
     assert error_code("no close frame received or sent") == "transport_error"
-    assert error_code("keepalive ping timeout; no close frame received") == "transport_error"
+    assert error_code("keepalive ping timeout; no close frame received") == "ping_timeout"
     assert error_code("received 1006 (abnormal closure)") == "transport_error"
 
 
@@ -145,7 +145,19 @@ def test_websocket_close_codes_are_classified_without_private_reasons():
     assert websocket_close_code(FakeDisconnect(1001)) == "clean_close"
     assert websocket_close_code(FakeDisconnect(1012)) == "server_restart"
     assert websocket_close_code(FakeDisconnect(1006)) == "transport_error"
-    assert websocket_close_code(FakeDisconnect(1011)) == "unknown_error"
+    assert websocket_close_code(FakeDisconnect(1011)) == "server_error"
+    assert websocket_close_code(FakeDisconnect(1008)) == "protocol_rejected"
+    assert websocket_close_code(FakeDisconnect(1013)) == "server_overloaded"
+    import socket
+    from types import SimpleNamespace
+    assert websocket_close_code(socket.gaierror("SECRET_PRIVATE_PROMPT")) == "dns_error"
+    probe = FakeDisconnect(1011)
+    probe.rcvd = None
+    probe.sent = SimpleNamespace(code=1011, reason="keepalive ping timeout PRIVATE")
+    assert websocket_close_code(probe) == "ping_timeout"
+    handshake = RuntimeError("SECRET_PRIVATE_PROMPT")
+    handshake.response = SimpleNamespace(status_code=401)
+    assert websocket_close_code(handshake) == "handshake_rejected"
     assert "SECRET_PRIVATE_PROMPT" not in websocket_close_code(FakeDisconnect(1012))
 
 
@@ -171,3 +183,27 @@ def test_compute_event_migrates_old_schema_and_preserves_historical_unknown_time
         assert "occurred_at" in cols
         old = db.execute("SELECT created_at,occurred_at FROM ComputeEvents").fetchone()
         assert old == (123, None)
+
+
+def test_wss_replay_after_lost_ack_does_not_duplicate_events(tmp_path, monkeypatch):
+    # A diagnostic can be committed before its ACK is lost on a broken socket.
+    # Replaying the same sequence after reconnect must not inflate warnings.
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        item = record(seq=714, code="transport_error", level="warning")
+        for _ in range(2):
+            with client.websocket_connect("/compute/ws") as ws:
+                ws.send_json({"type": "auth", "protocol": 1, **identity})
+                assert ws.receive_json()["type"] == "auth_ok"
+                ws.send_json(item)
+                assert ws.receive_json() == {"type": "diagnostic_ack", "seq": 714}
+                ws.send_json(item)
+                assert ws.receive_json() == {"type": "diagnostic_ack", "seq": 714}
+        with sqlite3.connect(str(tmp_path / "proxy.db")) as db:
+            rows = db.execute(
+                "SELECT diagnostic_seq,detail FROM ComputeEvents "
+                "WHERE node_id=? AND event='worker_diagnostic'",
+                (identity["node_id"],)).fetchall()
+            assert len(rows) == 1
+            assert rows[0][0] == 714
+            assert rows[0][1].startswith("model_test/transport_error")

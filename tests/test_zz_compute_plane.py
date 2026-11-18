@@ -756,3 +756,112 @@ def test_host_updater_status_is_restricted_in_admin_nodes_and_mcp(tmp_path, monk
                         {"timer_enabled": 1}, {"reported_at": -1}):
             assert compute_plane._safe_host_updater({**valid, **invalid}) is None
         assert compute_plane._safe_host_updater(None) is None
+
+
+def test_current_build_revision_skips_redundant_update_notice(tmp_path, monkeypatch):
+    import compute_plane
+    sha = "a" * 40
+    monkeypatch.setattr(compute_plane, "_latest_worker_release", sha)
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        with client.websocket_connect("/compute/ws") as current:
+            current.send_json({"type": "auth", "protocol": 1, "update_protocol": 1,
+                               "build_revision": sha, **identity})
+            assert current.receive_json()["type"] == "auth_ok"
+            events = client.get("/admin/api/compute/events",
+                                auth=ADMIN, params={"node_id":identity["node_id"]}).json()["events"]
+            assert not any(e["event"] == "update_offered" for e in events)
+        with client.websocket_connect("/compute/ws") as older:
+            older.send_json({"type": "auth", "protocol": 1, "update_protocol": 1,
+                             "build_revision": "b" * 40, **identity})
+            assert older.receive_json()["type"] == "auth_ok"
+            assert older.receive_json() == {"type": "update_available", "revision": sha}
+
+
+def test_wss_network_status_strips_untrusted_worker_fields(tmp_path, monkeypatch):
+    import compute_plane
+    from simpleai_mcp_tools import _public_worker
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        current = int(__import__("time").time())
+        network = {
+            "connected_since": current-20,
+            "ping_rtt_ms": 17,
+            "reconnect_count": 4,
+            "last_disconnect_at": current-25,
+            "last_disconnect_code": "transport_error",
+            "leak": "sk-secret-private",
+        }
+        with compute_plane._db() as db:
+            db.execute("UPDATE ComputeNodes SET models_json=? WHERE id=?",
+                       (json.dumps({"network": network}), identity["node_id"]))
+            row = dict(db.execute("SELECT * FROM ComputeNodes WHERE id=?",
+                                  (identity["node_id"],)).fetchone())
+        safe = compute_plane._public_node(row)["models"]["network"]
+        assert safe["ping_rtt_ms"] == 17
+        assert safe["last_disconnect_code"] == "transport_error"
+        assert safe["connected_since"] == current-20
+        assert "leak" not in safe
+        assert "sk-secret-private" not in json.dumps(_public_worker(row))
+        assert _public_worker(row)["models"]["network"]["reconnect_count"] == 4
+        for broken in [
+            {"ping_rtt_ms": "slow"},
+            {"ping_rtt_ms": 10**20},
+            {"last_disconnect_code": ["SECRET"]},
+            {"reconnect_count": -1},
+            {"connected_since": current + 100000},
+        ]:
+            result = compute_plane._safe_worker_network({**network, **broken})
+            assert result is not None
+            assert "SECRET" not in json.dumps(result)
+            assert result["ping_rtt_ms"] is None or result["ping_rtt_ms"] <= 300000
+
+
+def test_reconnect_never_blocks_on_stale_websocket_shutdown(monkeypatch):
+    """An unresponsive obsolete TCP session must not block another login."""
+    import asyncio
+    import compute_plane as plane
+    old_connections = plane._connections
+    notifications = []
+    monkeypatch.setattr(plane, "_connections", {})
+    monkeypatch.setattr(plane, "_event",
+                        lambda node_id, event, **kw: notifications.append(
+                            (node_id, event, kw.get("detail", ""))))
+    class StalledSocket:
+        async def close(self, *, code):
+            await asyncio.Event().wait()
+    async def scenario():
+        node = "a" * 32
+        old = plane.NodeConnection(ws=StalledSocket(), node_id=node)
+        new = plane.NodeConnection(ws=StalledSocket(), node_id=node)
+        plane._connections[node] = old
+        # If the registry awaited old.ws.close (the previous implementation)
+        # this would hang and time out.
+        await asyncio.wait_for(plane._activate_connection(new), timeout=0.25)
+        assert plane._connections[node] is new
+        assert notifications and notifications[0][1] == "connection_replaced"
+        assert "telemetry_gap_s=" in notifications[0][2]
+        tasks = list(plane._retiring_connections)
+        for task in tasks: task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        plane._retiring_connections.difference_update(tasks)
+    asyncio.run(scenario())
+
+
+def test_websocket_disconnect_retains_safe_reason_and_telemetry_gap(tmp_path, monkeypatch):
+    # Synchronous TestClient close can result in either a clean or disconnect
+    # close code, but neither should leak the exception reason.
+    import compute_plane
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        with client.websocket_connect("/compute/ws") as ws:
+            ws.send_json({"type": "auth", "protocol": 1, **identity})
+            assert ws.receive_json()["type"] == "auth_ok"
+            ws.send_json({"type": "telemetry", "hardware": {}, "models": {}})
+        items = client.get("/admin/api/compute/events",
+                           auth=ADMIN, params={"node_id":identity["node_id"]}).json()["events"]
+        disconnects = [x for x in items if x["event"] == "disconnected"]
+        assert disconnects
+        assert "uptime_s=" in disconnects[0]["detail"]
+        assert "telemetry_gap_s=" in disconnects[0]["detail"]
+        assert "code=" in disconnects[0]["detail"]

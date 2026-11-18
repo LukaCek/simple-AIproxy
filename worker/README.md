@@ -532,3 +532,60 @@ and deletes the temporary catalog entry. Downloaded weights can remain in
 the worker's bounded LRU cache. This **must** be run on the real staging
 ARM worker; passing unit/CI tests is not a substitute. Do not merge to
 production until the output is captured and reviewed.
+
+
+### WSS connection resilience and diagnostics
+
+Workers send telemetry approximately every 15 seconds and use protocol-level
+WebSocket pings every 20 seconds to keep NAT/reverse-proxy paths active.
+Both the worker and Uvicorn allow 90 seconds for a ping reply, instead of the
+previous 20-second timeout, to tolerate short periods of CPU contention.
+This is **not** an AI generation timeout: long requests may still run, and
+inference-specific limits remain separate.
+
+The worker monitors its heartbeat, diagnostic sender, and command reader
+tasks together. If any task unexpectedly stops, it closes that session,
+cancels only its own stale in-flight tasks, and reconnects with bounded
+exponential backoff and jitter. Short flapping sessions do not reset backoff;
+a stable connection does. Only sanitized error codes are stored, never
+exception messages, URLs, prompts or WSS credentials.
+
+The Compute Nodes Admin and read-only MCP worker listing expose:
+- Current WSS ping round-trip estimate in milliseconds (if measured)
+- Connected-since timestamp, reconnect attempts since worker process start
+- Last known disconnect class and its original timestamp
+- Proxy-side bounded connection lifetime and close class in event history
+
+RTT also includes event-loop scheduling and intermediate proxy delay; it is
+not the inference latency. A missing ping sample means **unmeasured**, not
+zero latency. Disk file accounting used by display snapshots is cached for
+at most 10 seconds to avoid repeated filesystem walking once per second.
+Storage enforcement still performs fresh measurements before downloads.
+
+Worker diagnostic replay is idempotent: events use a per-node sequence and
+proxy ACKs occur only after commit, so an interrupted ACK cannot create
+duplicate warnings on reconnect. A worker already running the published
+SHA is no longer sent unnecessary release notices each time it reconnects.
+
+If the disconnects persist despite these changes, inspect the host network,
+the Nginx Proxy Manager WebSocket/idle timeout configuration and host CPU
+saturation. Host and reverse-proxy configuration may differ from the
+repository; the proxy cannot prove or correct upstream packet loss by itself.
+
+
+### Stale connection replacement in the proxy
+
+The coordinator atomically makes the newest authenticated WSS session
+authoritative before attempting to close the previous session. Closing a dead
+TCP connection is best effort with a three-second deadline, **outside** the
+global connection registry lock. Obsolete sessions are prohibited from writing
+telemetry or handling new commands after replacement. Proxy connection events
+include a bounded elapsed session time, last telemetry gap and numeric
+WebSocket close code, or `connection_replaced` for stale sessions.
+
+Close reasons distinguish protocol-level ping timeout, DNS/TLS handshake
+failure, service restart, intentional clean close, server error and ordinary
+TCP loss. No raw close reason or remote IP is persisted. When evaluating
+possible external Nginx Proxy Manager issues, compare the worker's
+`last_disconnect_code` with server `reason/code/telemetry_gap_s` and
+contemporaneous deployment times, not only the online/offline flag.

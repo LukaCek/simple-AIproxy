@@ -23,7 +23,8 @@ CODES = frozenset((
     "disk_full", "download_forbidden", "download_not_found",
     "download_failed", "checksum_mismatch", "llama_crashed",
     "llama_not_ready", "llama_http_error", "timeout", "transport_error",
-    "worker_busy", "unknown_error", "backend_unsupported", "backend_load_failed",
+    "worker_busy", "unknown_error", "clean_close", "server_restart",
+    "backend_unsupported", "backend_load_failed",
     "backend_out_of_memory", "backend_chat_template_error",
 ))
 METRICS = frozenset(("ram_limit_mib", "ram_available_mib", "disk_limit_mib",
@@ -31,9 +32,26 @@ METRICS = frozenset(("ram_limit_mib", "ram_available_mib", "disk_limit_mib",
 _MODEL_ID = re.compile(r"[a-z][a-z0-9._-]{1,63}\Z")
 
 
+def websocket_close_code(exc: BaseException) -> str:
+    """Classify only protocol close codes, not untrusted close reason strings."""
+    close = getattr(exc, "rcvd", None) or getattr(exc, "sent", None)
+    code = getattr(close, "code", None)
+    if code in (1000, 1001):
+        return "clean_close"
+    if code == 1012:
+        return "server_restart"
+    return error_code(exc)
+
+
 def error_code(reason: object) -> str:
     """Map *untrusted* exception text to a fixed safe code, not a substring."""
     s = str(reason).lower()[:4096]
+    # WebSocket standard closing codes: clean shutdown and service restart
+    # are not failed inference or evidence of broken network connectivity.
+    if "1012" in s and ("service restart" in s or "received 1012" in s):
+        return "server_restart"
+    if ("1000" in s or "1001" in s) and ("received" in s or "close" in s):
+        return "clean_close"
     if "sha256" in s or "checksum" in s or "hash mismatch" in s:
         return "checksum_mismatch"
     if "insufficient" in s and ("memory" in s or "ram" in s):

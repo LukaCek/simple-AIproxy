@@ -1121,7 +1121,17 @@ class Worker:
                             (receiver, heart, diagnostics),
                             return_when=asyncio.FIRST_COMPLETED)
                         for task in done:
-                            task.result()
+                            cause = ("heartbeat_failed" if task is heart else
+                                     "diagnostics_failed" if task is diagnostics
+                                     else "transport_error")
+                            if task.cancelled():
+                                connection_error = cause
+                                continue
+                            try:
+                                task.result()
+                            except Exception:
+                                connection_error = cause
+                                raise
                         if receiver not in done:
                             connection_error = ("heartbeat_failed" if heart in done
                                                 else "diagnostics_failed")

@@ -536,6 +536,7 @@ class NodeConnection:
     update_capable: bool = False
     last_update_notice: str = ""
     last_policy_signature: tuple | None = None
+    connected_at: float = field(default_factory=time.monotonic)
 
     async def send(self, message: dict[str, Any]) -> None:
         async with self.write_lock:
@@ -989,6 +990,7 @@ async def enroll(request: Request) -> dict[str, str]:
 async def compute_ws(ws: WebSocket):
     await ws.accept()
     conn = None
+    disconnect_reason = "unknown"
     try:
         data = await asyncio.wait_for(ws.receive_json(), timeout=15)
         if data.get("type") != "auth" or data.get("protocol") != 1:
@@ -1064,9 +1066,15 @@ async def compute_ws(ws: WebSocket):
                 pending = conn.pending.get(str(message.get("id") or ""))
                 if pending:
                     await pending.put(message)
-    except (WebSocketDisconnect, asyncio.TimeoutError):
-        pass
+    except WebSocketDisconnect as exc:
+        disconnect_reason = (
+            "clean_close" if exc.code in (1000, 1001) else
+            "server_restart" if exc.code == 1012 else "transport_error"
+        )
+    except asyncio.TimeoutError:
+        disconnect_reason = "timeout"
     except Exception:
+        disconnect_reason = "proxy_error"
         try:
             await ws.close(code=1011)
         except Exception:
@@ -1080,7 +1088,10 @@ async def compute_ws(ws: WebSocket):
                     pass
             if _connections.get(conn.node_id) is conn:
                 _connections.pop(conn.node_id, None)
-                _event(conn.node_id, "disconnected")
+                duration = max(0, min(int(time.monotonic() - conn.connected_at),
+                                      30 * 86400))
+                _event(conn.node_id, "disconnected",
+                       detail=f"reason={disconnect_reason} uptime_s={duration}")
 
 
 @router.get("/admin/api/compute/update-release", dependencies=[Depends(core.verify_admin)])
@@ -1119,7 +1130,11 @@ async def list_events(node_id: str = "", limit: int = Query(100, ge=1, le=200)):
                 "FROM ComputeEvents WHERE created_at>=? ORDER BY id DESC LIMIT ?",
                 (cutoff, limit),
             ).fetchall()
-    return {"events": [dict(row) for row in rows]}
+    return {"events": [dict(row) | {
+        "delivery_delay_seconds": (
+            max(0, row["created_at"] - row["occurred_at"])
+            if row["occurred_at"] is not None else None
+        )} for row in rows]}
 
 
 @router.get("/admin/api/compute/nodes/{node_id}/recommendations", dependencies=[Depends(core.verify_admin)])

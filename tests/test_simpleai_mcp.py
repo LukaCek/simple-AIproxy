@@ -340,7 +340,9 @@ def test_request_diagnostics_separate_http_status_from_stream_outcome(client):
     assert attempt["status_code"] == 429
     assert attempt["error_category"] == "provider_rate_limited"
     health = call(client, key, "system_status")["result"]["structuredContent"]
-    assert health["failures_in_last_200_requests"] >= 1
+    assert health["failures_in_last_200_requests"] == 0
+    assert health["client_cancelled_streams_in_last_200_requests"] >= 1
+    assert health["interrupted_streams_in_last_200_requests"] == 0
 
 
 def test_existing_logs_are_migrated_without_fabricating_stream_completion(client):

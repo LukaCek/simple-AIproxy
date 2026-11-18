@@ -273,6 +273,10 @@ _LIVE_LOGS_SCRIPT = r"""
     if (log.running) {
       return '<span class="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-700 ring-1 ring-amber-200"><span class="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500"></span>Running</span>';
     }
+    if (log.stream_outcome === 'cancelled' || log.stream_outcome === 'interrupted') {
+      const label = log.stream_outcome === 'cancelled' ? 'Stream cancelled' : 'Stream interrupted';
+      return '<span class="inline-flex rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800 ring-1 ring-amber-200">' + label + '</span>';
+    }
     const ok = Number(log.status_code) >= 200 && Number(log.status_code) < 300;
     return ok
       ? '<span class="inline-flex rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 ring-1 ring-emerald-200">Success</span>'

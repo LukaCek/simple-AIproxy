@@ -299,6 +299,10 @@ UNIT
     die "Timer is not active."
   systemctl --user enable --now "simpleai-compute-listener@$name.service" ||
     die "Proxy-driven listener not enabled; backup timer remains active."
+  # enable --now leaves an already running listener on its OLD script. Restart
+  # only the host listener (not Docker or inference) after safe re-adoption.
+  systemctl --user restart "simpleai-compute-listener@$name.service" ||
+    die "Updated host listener could not restart; backup timer remains active."
   systemctl --user is-active --quiet "simpleai-compute-listener@$name.service" ||
     die "Proxy-driven listener is not active; backup timer remains active."
   log "Automatic updates enabled for $name: proxy release listener and four daily backup checks."

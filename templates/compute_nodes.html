@@ -426,9 +426,15 @@ async function refreshComputeEvents() {
       row.className = "flex flex-wrap gap-x-3 gap-y-1 border-b border-slate-100 py-1 " +
         (event.status === "error" ? "text-red-700" :
          event.status === "warning" ? "text-amber-800" : "text-slate-700");
-      const date = new Date(event.created_at * 1000);
+      const occurred = Number.isInteger(event.occurred_at) && event.occurred_at > 0 ?
+        event.occurred_at : event.created_at;
+      const date = new Date(occurred * 1000);
+      const delayed = event.event === "worker_diagnostic" &&
+        event.delivery_delay_seconds != null && event.delivery_delay_seconds >= 5 ?
+        "Replay delay " + event.delivery_delay_seconds + "s" : "";
       const parts = [
         Number.isFinite(date.getTime()) ? date.toLocaleString() : "Unknown time",
+        delayed,
         name,
         String(event.event || "").replaceAll("_", " "),
         event.model || "",

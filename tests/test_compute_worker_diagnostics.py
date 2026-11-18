@@ -78,6 +78,7 @@ def test_authenticated_wss_worker_events_are_persisted_without_secrets(tmp_path,
             ws.send_json({"type": "auth", "protocol": 1, **identity})
             assert ws.receive_json()["type"] == "auth_ok"
             item = record()
+            item["occurred_at"] = int(time.time()) - 120
             item["prompt"] = "NEVER_STORE_THIS_PROMPT"
             item["node_secret"] = "NEVER_STORE_THIS_SECRET"
             ws.send_json(item)
@@ -95,6 +96,9 @@ def test_authenticated_wss_worker_events_are_persisted_without_secrets(tmp_path,
             assert diagnostics[1]["status"] == "error"
             assert diagnostics[1]["model"] == "qwen35-0.8b-q4"
             assert "ram_free=422MiB" in diagnostics[1]["detail"]
+            assert diagnostics[1]["occurred_at"] == item["occurred_at"]
+            assert diagnostics[1]["created_at"] >= item["occurred_at"] + 120
+            assert diagnostics[1]["delivery_delay_seconds"] >= 120
             blob = repr(diagnostics)
             assert "NEVER_STORE_THIS" not in blob
             assert "PRIVATE" not in blob
@@ -126,3 +130,44 @@ def test_websocket_reconnect_errors_are_classified_without_raw_messages():
     assert error_code("no close frame received or sent") == "transport_error"
     assert error_code("keepalive ping timeout; no close frame received") == "transport_error"
     assert error_code("received 1006 (abnormal closure)") == "transport_error"
+
+
+def test_websocket_close_codes_are_classified_without_private_reasons():
+    from compute_worker_diagnostics import websocket_close_code
+    class Close:
+        def __init__(self, code): self.code = code
+    class FakeDisconnect(Exception):
+        def __init__(self, code, message="SECRET_PRIVATE_PROMPT"):
+            super().__init__(message)
+            self.rcvd = Close(code)
+            self.sent = None
+    assert websocket_close_code(FakeDisconnect(1000)) == "clean_close"
+    assert websocket_close_code(FakeDisconnect(1001)) == "clean_close"
+    assert websocket_close_code(FakeDisconnect(1012)) == "server_restart"
+    assert websocket_close_code(FakeDisconnect(1006)) == "transport_error"
+    assert websocket_close_code(FakeDisconnect(1011)) == "unknown_error"
+    assert "SECRET_PRIVATE_PROMPT" not in websocket_close_code(FakeDisconnect(1012))
+
+
+def test_compute_event_migrates_old_schema_and_preserves_historical_unknown_time(tmp_path, monkeypatch):
+    import compute_plane, main_impl as core
+    monkeypatch.setattr(core, "DB_PATH", tmp_path / "legacy.db")
+    core.init_database()
+    with sqlite3.connect(str(core.DB_PATH)) as db:
+        db.executescript("""
+          CREATE TABLE ComputeEvents (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              node_id TEXT NOT NULL, event TEXT NOT NULL,
+              model TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT '',
+              detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL
+          );
+        """)
+        db.execute("INSERT INTO ComputeEvents(node_id,event,created_at) VALUES(?,?,?)",
+                   ("test", "connected", 123))
+    compute_plane._setup()
+    compute_plane._setup()
+    with sqlite3.connect(str(core.DB_PATH)) as db:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(ComputeEvents)")}
+        assert "occurred_at" in cols
+        old = db.execute("SELECT created_at,occurred_at FROM ComputeEvents").fetchone()
+        assert old == (123, None)

@@ -106,7 +106,8 @@ def init_database() -> None:
                 prompt TEXT,
                 output TEXT,
                 error TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                stream_outcome TEXT NOT NULL DEFAULT 'not_streamed'
             )
             """
         )
@@ -121,6 +122,7 @@ def init_database() -> None:
             "total_ms": "REAL",
             "prompt": "TEXT",
             "output": "TEXT",
+            "stream_outcome": "TEXT NOT NULL DEFAULT 'not_streamed'",
         }
         for column, column_type in migrations.items():
             if column not in existing_columns:
@@ -724,7 +726,7 @@ def list_logs(limit: int = 200) -> List[Dict[str, Any]]:
             """
             SELECT id, api_key, api_key_name, request_id, requested_model, group_name, provider_name, provider_model,
                    status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
-                   prompt, output, error, created_at
+                   prompt, output, error, created_at, stream_outcome
             FROM Logs ORDER BY id DESC LIMIT ?
             """,
             (limit,),
@@ -767,7 +769,10 @@ def insert_log(
     output: Optional[str],
     error: Optional[str],
     request_id: Optional[str] = None,
+    stream_outcome: str = "not_streamed",
 ) -> None:
+    if stream_outcome not in ("not_streamed", "completed", "cancelled", "interrupted"):
+        raise ValueError("Unsupported stream outcome")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -775,8 +780,8 @@ def insert_log(
             INSERT INTO Logs (
                 api_key, api_key_name, request_id, requested_model, group_name, provider_name, provider_model,
                 status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
-                prompt, output, error, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                prompt, output, error, created_at, stream_outcome
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 api_key,
@@ -796,6 +801,7 @@ def insert_log(
                 truncate_text(output or ""),
                 truncate_text(error or "", 4000) if error else None,
                 datetime.utcnow().isoformat(),
+                stream_outcome,
             ),
         )
         conn.commit()
@@ -2776,6 +2782,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                         first_response_at: Optional[str] = None
                         captured = bytearray()
                         error_msg: Optional[str] = None
+                        stream_outcome = "cancelled"
                         try:
                             async for chunk in response.aiter_bytes():
                                 if chunk and first_response_at is None:
@@ -2783,19 +2790,30 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                                 if chunk and len(captured) < 12000:
                                     captured.extend(chunk[: 12000 - len(captured)])
                                 yield chunk
-                        except Exception as exc:
-                            error_msg = str(exc)
+                            stream_outcome = "completed"
+                        except asyncio.CancelledError:
+                            error_msg = "Stream cancelled by client"
+                            raise
+                        except Exception:
+                            stream_outcome = "interrupted"
+                            error_msg = "Upstream stream interrupted"
                             raise
                         finally:
                             await response.aclose()
-                            if error_msg is None:
+                            if stream_outcome == "completed":
                                 clear_provider_cooldown(endpoint)
-                            else:
+                            elif stream_outcome == "interrupted":
                                 set_provider_cooldown(endpoint, PROVIDER_TIMEOUT_COOLDOWN_SECONDS)
-                            record_attempt(number, provider_name, provider_model, 200 if error_msg is None else 502, "success" if error_msg is None else "stream_error", error_msg, attempt_started_at, attempt_started_monotonic)
+                            if stream_outcome != "completed" and error_msg is None:
+                                error_msg = "Stream stopped before completion"
+                            record_attempt(number, provider_name, provider_model, 200,
+                                           ("success" if stream_outcome == "completed"
+                                            else "stream_error" if stream_outcome == "interrupted"
+                                            else "stream_cancelled"),
+                                           error_msg, attempt_started_at, attempt_started_monotonic)
                             ended_at, first_ms, total_ms = timing(first_response_at)
                             output_text = extract_output_from_body(bytes(captured), content_type) if captured else ""
-                            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200 if error_msg is None else 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, error_msg, request_id=request_id)
+                            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, error_msg, request_id=request_id, stream_outcome=stream_outcome)
                     return StreamingResponse(proxy_stream(), status_code=200, media_type=content_type)
                 content = await response.aread()
                 await response.aclose()

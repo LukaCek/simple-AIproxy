@@ -646,7 +646,9 @@ def test_compute_events_capture_lifecycle_without_heartbeat_or_secrets(tmp_path,
         assert "private_access_enabled" in types
         assert "private_access_disabled" in types
         assert all(set(event) == {"id", "node_id", "event", "model", "status",
-                                  "detail", "created_at"} for event in events)
+                                  "detail", "created_at", "occurred_at",
+                                  "delivery_delay_seconds"} for event in events)
+        assert all(event["occurred_at"] is not None for event in events)
         dump = json.dumps(events)
         assert identity["node_secret"] not in dump
         assert "secret prompt" not in dump

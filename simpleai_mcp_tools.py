@@ -125,7 +125,15 @@ def _read_safe(value: object, limit: int = 120) -> str:
     return s
 
 
-def _code(value: object) -> str:
+def _code(value: object, *, status_code: int | None = None) -> str:
+    # Prefer the actual HTTP status over untrusted provider error text.
+    # A body saying "unknown" must never hide a real upstream HTTP 429.
+    if status_code == 429:
+        return "provider_rate_limited"
+    if status_code in (401, 403):
+        return "provider_unauthorized"
+    if status_code in (502, 503, 504):
+        return "provider_unavailable"
     # Fixed allowlist diagnostics rather than forwarding freeform exceptions.
     # Explicit Codex/OAuth/provider classifications make metadata useful for
     # debugging while preventing raw upstream error bodies from being returned.
@@ -254,7 +262,8 @@ def _catalog(compute) -> dict:
 def _logs(core, args) -> list[dict]:
     where, params = [], []
     if args.get("errors_only"):
-        where.append("(status_code IS NULL OR status_code >= 400)")
+        where.append("(status_code IS NULL OR status_code >= 400 "
+                     "OR stream_outcome IN ('cancelled','interrupted'))")
     if args.get("model"):
         where.append("requested_model = ?")
         params.append(args["model"])
@@ -269,7 +278,7 @@ def _logs(core, args) -> list[dict]:
         rows = db.execute(
             "SELECT id, request_id, requested_model, group_name, provider_name, "
             "provider_model, status_code, started_at, ended_at, first_response_ms, "
-            "total_ms, created_at, error, api_key_name "
+            "total_ms, created_at, error, api_key_name, stream_outcome "
             "FROM Logs" + clause + " ORDER BY id DESC LIMIT ?", params).fetchall()
     return [{
         "id": r["id"], "request_id": r["request_id"],
@@ -278,10 +287,16 @@ def _logs(core, args) -> list[dict]:
         "provider": _read_safe(r["provider_name"]),
         "provider_model": _read_safe(r["provider_model"]),
         "api_key_label": _read_safe(r["api_key_name"]),  # only user-assigned display label
-        "status_code": r["status_code"], "started_at": r["started_at"],
+        "status_code": r["status_code"], "stream_outcome": r["stream_outcome"],
+        "started_at": r["started_at"],
         "ended_at": r["ended_at"], "first_response_ms": r["first_response_ms"],
         "total_ms": r["total_ms"], "created_at": r["created_at"],
-        "error_category": _code(r["error"]) if r["error"] else "",
+        "error_category": (
+            "stream_cancelled" if r["stream_outcome"] == "cancelled" else
+            "stream_interrupted" if r["stream_outcome"] == "interrupted" else
+            _code(r["error"], status_code=r["status_code"])
+            if r["error"] or (r["status_code"] or 0) >= 400 else ""
+        ),
     } for r in rows]
 
 
@@ -303,7 +318,11 @@ def _attempts(core, args) -> list[dict]:
              "model":_read_safe(r["requested_model"]), "provider":_read_safe(r["provider_name"]),
              "provider_model":_read_safe(r["provider_model"]),
              "status_code":r["status_code"],"action":_read_safe(r["action"]),
-             "error_category":_code(r["error"]) if r["error"] else "",
+             "error_category":(
+                 "stream_cancelled" if r["action"] == "stream_cancelled" else
+                 "stream_interrupted" if r["action"] == "stream_error" else
+                 _code(r["error"], status_code=r["status_code"])
+                 if r["error"] or (r["status_code"] or 0) >= 400 else ""),
              "total_ms":r["total_ms"],"created_at":r["created_at"]} for r in rows]
 
 
@@ -320,12 +339,15 @@ def _events(core, args) -> list[dict]:
         params.append(args["level"])
     params.append(_limit(args))
     with core.get_db_connection() as db:
-        rows = db.execute("SELECT id,node_id,event,model,status,detail,created_at "
+        rows = db.execute("SELECT id,node_id,event,model,status,detail,created_at,occurred_at "
                           "FROM ComputeEvents WHERE " + " AND ".join(where) +
                           " ORDER BY id DESC LIMIT ?", params).fetchall()
     return [{"id":r["id"], "node_id":r["node_id"], "event":_read_safe(r["event"]),
              "model":_read_safe(r["model"]), "status":_read_safe(r["status"]),
-             "detail":_read_safe(r["detail"],220), "created_at":r["created_at"]}
+             "detail":_read_safe(r["detail"],220), "created_at":r["created_at"],
+             "occurred_at": r["occurred_at"],
+             "delivery_delay_seconds": (max(0, r["created_at"] - r["occurred_at"])
+                                        if r["occurred_at"] is not None else None)}
             for r in rows]
 
 
@@ -403,8 +425,16 @@ async def execute(name: str, args: dict, app) -> dict:
         nodes=_workers(core,compute)
         with core.get_db_connection() as db:
             count=db.execute("SELECT count(*) FROM Logs").fetchone()[0]
-            last=db.execute("SELECT count(*) FROM Logs WHERE status_code >= 400 AND id > "
-                            "(SELECT max(id)-200 FROM Logs)").fetchone()[0]
+            recent = "id > (SELECT max(id)-200 FROM Logs)"
+            last=db.execute(
+                "SELECT count(*) FROM Logs WHERE (status_code IS NULL OR status_code >= 400 "
+                "OR stream_outcome='interrupted') AND " + recent).fetchone()[0]
+            cancelled=db.execute(
+                "SELECT count(*) FROM Logs WHERE stream_outcome='cancelled' AND " +
+                recent).fetchone()[0]
+            interrupted=db.execute(
+                "SELECT count(*) FROM Logs WHERE stream_outcome='interrupted' AND " +
+                recent).fetchone()[0]
         # Read-only aggregate diagnostics to distinguish missing refresh
         # grants from expired tokens. Never expose client IDs or token hashes.
         from simpleai_mcp_oauth import setup as oauth_setup
@@ -426,6 +456,8 @@ async def execute(name: str, args: dict, app) -> dict:
                 "models":len(compute.CATALOG),"groups":len(_groups(core)),
                 "providers":len(_providers(core)),
                 "logged_requests":count,"failures_in_last_200_requests":last,
+                "interrupted_streams_in_last_200_requests":interrupted,
+                "client_cancelled_streams_in_last_200_requests":cancelled,
                 "mcp_oauth_refresh_health":{"active_refresh_tokens":active_refresh,
                                             "latest_grant_refreshable":latest_refreshable,
                                             "latest_grant_at":latest["created_at"] if latest else None},

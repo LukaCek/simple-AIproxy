@@ -267,3 +267,43 @@ to `main`. Start with a read-only token and inspect `system_status`/
 MCP access remains **off by default** until a dedicated token is generated.
 Use distinct tokens per client and short expirations. Do not reuse API tokens
 in any other service. Rotate by revoking and creating another token.
+
+
+## P0 Observability: event timestamps and streaming outcomes
+
+The `worker_events` tool and the authenticated Admin Compute Events API preserve
+**two clocks** for worker diagnostics:
+- `occurred_at`: the original, strictly validated worker event time (Unix seconds).
+- `created_at`: when the proxy committed the event to SQLite.
+- `delivery_delay_seconds`: a nonnegative estimate of replay/transport delay.
+  This is *not* pure network latency: reconnect backlog, queueing, and clock skew
+  also contribute. Historical events recorded before the schema upgrade have
+  `occurred_at=null` rather than a fabricated original time.
+
+WSS disconnect events record only a safe reason class and bounded connection
+uptime. A normal close or service restart is not classified as a network failure;
+unexpected closures remain warnings. No raw close reasons or private messages
+are persisted.
+
+For AI request logs, `status_code` means the actual HTTP status sent to the
+caller. Once streaming response headers are sent as HTTP 200, an interrupted
+stream cannot retroactively become HTTP 502. `request_logs` therefore exposes
+`stream_outcome` with `not_streamed`, `completed`, `interrupted`, or
+`cancelled`. The last two appear in errors-only queries, but client
+cancellations are counted separately from server failures in `system_status`:
+
+- `failures_in_last_200_requests` includes HTTP errors and interrupted streams.
+- `interrupted_streams_in_last_200_requests` identifies unexpected incomplete streams.
+- `client_cancelled_streams_in_last_200_requests` identifies deliberate or
+  transport-level client cancellations; it is **not** automatically a proxy failure.
+
+The corresponding `provider_attempts` actions are `success`, `stream_error`,
+or `stream_cancelled`. Real upstream HTTP 429 always maps to
+`provider_rate_limited`, even if a provider returned an opaque error body.
+Older logs default to `not_streamed`, not retroactively inferred success.
+
+Diagnostics are metadata, not a packet capture. Do not include raw prompts,
+responses, API keys, OAuth tokens, model files, URLs with tokens, or stdout/stderr
+in worker events. Existing request-log prompt/output storage remains unchanged;
+these P0 changes do not increase collection of user content. Sensitive diagnostics
+should continue to use authenticated access and existing retention controls.

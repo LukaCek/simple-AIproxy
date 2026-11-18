@@ -8,6 +8,8 @@ sanitized events for reconnect replay.
 from __future__ import annotations
 
 import re
+import socket
+import ssl
 import time
 
 KINDS = frozenset(("lifecycle", "network", "policy", "model", "model_test",
@@ -24,7 +26,9 @@ CODES = frozenset((
     "download_failed", "checksum_mismatch", "llama_crashed",
     "llama_not_ready", "llama_http_error", "timeout", "transport_error",
     "worker_busy", "unknown_error", "clean_close", "server_restart",
-    "heartbeat_failed", "diagnostics_failed",
+    "heartbeat_failed", "diagnostics_failed", "ping_timeout",
+    "dns_error", "tls_error", "handshake_rejected", "server_error",
+    "protocol_rejected", "server_overloaded",
     "backend_unsupported", "backend_load_failed",
     "backend_out_of_memory", "backend_chat_template_error",
 ))
@@ -34,13 +38,36 @@ _MODEL_ID = re.compile(r"[a-z][a-z0-9._-]{1,63}\Z")
 
 
 def websocket_close_code(exc: BaseException) -> str:
-    """Classify only protocol close codes, not untrusted close reason strings."""
-    close = getattr(exc, "rcvd", None) or getattr(exc, "sent", None)
+    """Classify protocol/exception types without exposing raw exception text."""
+    if isinstance(exc, socket.gaierror):
+        return "dns_error"
+    if isinstance(exc, ssl.SSLError):
+        return "tls_error"
+    response = getattr(exc, "response", None)
+    http_status = getattr(response, "status_code", None)
+    if http_status in (400, 401, 403, 404, 426):
+        return "handshake_rejected"
+    sent = getattr(exc, "sent", None)
+    received = getattr(exc, "rcvd", None)
+    # The local side sends 1011 with a controlled keepalive reason when the
+    # Pong is not received by the configured deadline. Never log that reason.
+    reason = getattr(sent, "reason", "")
+    if (getattr(sent, "code", None) == 1011
+            and isinstance(reason, str)
+            and "keepalive ping timeout" in reason.lower()):
+        return "ping_timeout"
+    close = received or sent
     code = getattr(close, "code", None)
     if code in (1000, 1001):
         return "clean_close"
     if code == 1012:
         return "server_restart"
+    if code == 1013:
+        return "server_overloaded"
+    if code == 1008:
+        return "protocol_rejected"
+    if code == 1011:
+        return "server_error"
     if code == 1006:
         return "transport_error"
     return error_code(exc)
@@ -77,7 +104,7 @@ def error_code(reason: object) -> str:
         return "llama_http_error"
     # The WebSocket keepalive is a transport failure, not an inference timeout.
     if "keepalive ping timeout" in s or "ping timed out" in s:
-        return "transport_error"
+        return "ping_timeout"
     if "timed out" in s or "timeout" in s:
         return "timeout"
     if "download" in s or "huggingface" in s or "httpx" in s:

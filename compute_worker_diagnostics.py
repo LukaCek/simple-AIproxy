@@ -24,6 +24,7 @@ CODES = frozenset((
     "download_failed", "checksum_mismatch", "llama_crashed",
     "llama_not_ready", "llama_http_error", "timeout", "transport_error",
     "worker_busy", "unknown_error", "clean_close", "server_restart",
+    "heartbeat_failed", "diagnostics_failed",
     "backend_unsupported", "backend_load_failed",
     "backend_out_of_memory", "backend_chat_template_error",
 ))

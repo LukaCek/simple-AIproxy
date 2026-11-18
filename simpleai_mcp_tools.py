@@ -318,8 +318,11 @@ def _attempts(core, args) -> list[dict]:
              "model":_read_safe(r["requested_model"]), "provider":_read_safe(r["provider_name"]),
              "provider_model":_read_safe(r["provider_model"]),
              "status_code":r["status_code"],"action":_read_safe(r["action"]),
-             "error_category":_code(r["error"], status_code=r["status_code"])
-                              if r["error"] or (r["status_code"] or 0) >= 400 else "",
+             "error_category":(
+                 "stream_cancelled" if r["action"] == "stream_cancelled" else
+                 "stream_interrupted" if r["action"] == "stream_error" else
+                 _code(r["error"], status_code=r["status_code"])
+                 if r["error"] or (r["status_code"] or 0) >= 400 else ""),
              "total_ms":r["total_ms"],"created_at":r["created_at"]} for r in rows]
 
 
@@ -422,10 +425,16 @@ async def execute(name: str, args: dict, app) -> dict:
         nodes=_workers(core,compute)
         with core.get_db_connection() as db:
             count=db.execute("SELECT count(*) FROM Logs").fetchone()[0]
-            last=db.execute("SELECT count(*) FROM Logs WHERE "
-                            "(status_code IS NULL OR status_code >= 400 "
-                            "OR stream_outcome IN ('cancelled','interrupted')) "
-                            "AND id > (SELECT max(id)-200 FROM Logs)").fetchone()[0]
+            recent = "id > (SELECT max(id)-200 FROM Logs)"
+            last=db.execute(
+                "SELECT count(*) FROM Logs WHERE (status_code IS NULL OR status_code >= 400 "
+                "OR stream_outcome='interrupted') AND " + recent).fetchone()[0]
+            cancelled=db.execute(
+                "SELECT count(*) FROM Logs WHERE stream_outcome='cancelled' AND " +
+                recent).fetchone()[0]
+            interrupted=db.execute(
+                "SELECT count(*) FROM Logs WHERE stream_outcome='interrupted' AND " +
+                recent).fetchone()[0]
         # Read-only aggregate diagnostics to distinguish missing refresh
         # grants from expired tokens. Never expose client IDs or token hashes.
         from simpleai_mcp_oauth import setup as oauth_setup
@@ -447,6 +456,8 @@ async def execute(name: str, args: dict, app) -> dict:
                 "models":len(compute.CATALOG),"groups":len(_groups(core)),
                 "providers":len(_providers(core)),
                 "logged_requests":count,"failures_in_last_200_requests":last,
+                "interrupted_streams_in_last_200_requests":interrupted,
+                "client_cancelled_streams_in_last_200_requests":cancelled,
                 "mcp_oauth_refresh_health":{"active_refresh_tokens":active_refresh,
                                             "latest_grant_refreshable":latest_refreshable,
                                             "latest_grant_at":latest["created_at"] if latest else None},

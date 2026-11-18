@@ -99,7 +99,7 @@ async def _send_release_notice(conn: "NodeConnection") -> None:
     # An already updated worker doesn't need repeated update notices on each
     # transient reconnect. Older clients without the build hint still receive
     # the advisory exactly as before.
-    if conn.build_revision == sha:
+    if getattr(conn, "build_revision", "") == sha:
         conn.last_update_notice = sha
         return
     await conn.send({"type": "update_available", "revision": sha})

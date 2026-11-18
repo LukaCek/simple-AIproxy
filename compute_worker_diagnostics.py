@@ -40,6 +40,8 @@ def websocket_close_code(exc: BaseException) -> str:
         return "clean_close"
     if code == 1012:
         return "server_restart"
+    if code == 1006:
+        return "transport_error"
     return error_code(exc)
 
 

@@ -38,7 +38,8 @@ def register(client, redirect=CALLBACK):
 
 
 def authorize(client, client_id, scope="simpleai:read offline_access",
-              redirect=CALLBACK, state="session-state-12345", permission="read"):
+              redirect=CALLBACK, state="session-state-12345", permission="read",
+              remember_connection=True):
     params={
         "response_type":"code","client_id":client_id,
         "redirect_uri":redirect,"scope":scope,"state":state,
@@ -55,6 +56,8 @@ def authorize(client, client_id, scope="simpleai:read offline_access",
         "csrf":html.unescape(csrf.group(1)),
         "permission":permission,"decision":"approve",
     }
+    if remember_connection:
+        data["remember_connection"] = "yes"
     accepted=client.post("/oauth/authorize",data=data,auth=ADMIN,
                          headers={"Origin":ISSUER}, follow_redirects=False)
     assert accepted.status_code==303,accepted.text
@@ -327,11 +330,55 @@ def test_repeated_browser_consent_shows_actionable_error_without_new_code(client
     assert "location" not in third.headers
 
 
-def test_no_offline_access_means_no_refresh_token(client):
-    cid=register(client)
-    code,_=authorize(client,cid,scope="simpleai:read")
-    issued=exchange(client,cid,code).json()
+def test_no_offline_access_scope_still_allows_consented_refresh_for_chatgpt(client):
+    # Some OAuth clients do not request offline_access, which previously
+    # forced a fresh browser login every hour after the access token expired.
+    cid = register(client)
+    code, _ = authorize(client, cid, scope="simpleai:read",
+                        remember_connection=True)
+    issued = exchange(client, cid, code).json()
+    assert issued["scope"] == "simpleai:read"
+    assert issued["refresh_token"].startswith("simpleai_refresh_")
+    renewed = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": cid,
+        "refresh_token": issued["refresh_token"],
+    })
+    assert renewed.status_code == 200
+    assert renewed.json()["scope"] == "simpleai:read"
+    assert renewed.json()["refresh_token"] != issued["refresh_token"]
+    assert rpc(client, renewed.json()["access_token"], "ping").status_code == 200
+    # Re-use of a rotated token is still rejected.
+    reused = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": cid,
+        "refresh_token": issued["refresh_token"],
+    })
+    assert reused.status_code == 400
+
+
+@pytest.mark.parametrize("scope", ["simpleai:read", "simpleai:read offline_access"])
+def test_explicit_opt_out_does_not_grant_long_lived_refresh(client, scope):
+    cid = register(client)
+    code, _ = authorize(client, cid, scope=scope, remember_connection=False)
+    issued = exchange(client, cid, code).json()
     assert "refresh_token" not in issued
+    assert "offline_access" not in issued["scope"]
+
+
+def test_oauth_refresh_compatibility_with_schema_setup(client):
+    import simpleai_mcp_oauth as oauth
+    # Re-running setup on a migrated live database must preserve tokens.
+    cid = register(client)
+    code, _ = authorize(client, cid, scope="simpleai:read",
+                        remember_connection=True)
+    existing = exchange(client, cid, code).json()
+    oauth.setup()
+    oauth.setup()
+    refreshed = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": cid,
+        "refresh_token": existing["refresh_token"],
+    })
+    assert refreshed.status_code == 200
+    assert "refresh_token" in refreshed.json()
 
 
 def test_oauth_revocation_and_expiration(client):

@@ -770,3 +770,41 @@ def test_mcp_status_reports_refresh_health_without_client_or_token_details(clien
     recent = report2["result"]["structuredContent"]["mcp_oauth_refresh_health"]
     assert recent["latest_grant_refreshable"] is False
     assert no_refresh["access_token"] not in json.dumps(recent)
+
+
+def test_migrates_preexisting_oauth_codes_table_in_place(tmp_path, monkeypatch):
+    import sqlite3
+    import simpleai_mcp_oauth as oauth
+    database_path = tmp_path / "previous-oauth-schema.db"
+
+    def old_database():
+        db = sqlite3.connect(database_path)
+        db.row_factory = sqlite3.Row
+        return db
+
+    with old_database() as db:
+        db.execute("""CREATE TABLE MCPOAuthCodes (
+            code_hash TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            challenge TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            consumed INTEGER NOT NULL DEFAULT 0
+        )""")
+        db.execute("""INSERT INTO MCPOAuthCodes
+            (code_hash,client_id,redirect_uri,scope,resource,challenge,
+             expires_at,consumed) VALUES (?,?,?,?,?,?,?,?)""",
+            ("a"*64, "old-public-client", CALLBACK, "offline_access simpleai:read",
+             RESOURCE, CHALLENGE, int(time.time()) + 300, 0))
+    monkeypatch.setattr(oauth, "_db", old_database)
+    oauth.setup()
+    oauth.setup()
+    with old_database() as db:
+        fields = {row["name"] for row in db.execute("PRAGMA table_info(MCPOAuthCodes)")}
+        assert "refresh_enabled" in fields
+        old = db.execute("SELECT * FROM MCPOAuthCodes WHERE code_hash=?", ("a"*64,)).fetchone()
+        assert old["consumed"] == 0
+        assert old["scope"] == "offline_access simpleai:read"
+        assert old["refresh_enabled"] == 0

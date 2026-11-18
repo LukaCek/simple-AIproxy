@@ -125,7 +125,15 @@ def _read_safe(value: object, limit: int = 120) -> str:
     return s
 
 
-def _code(value: object) -> str:
+def _code(value: object, *, status_code: int | None = None) -> str:
+    # Prefer the actual HTTP status over untrusted provider error text.
+    # A body saying "unknown" must never hide a real upstream HTTP 429.
+    if status_code == 429:
+        return "provider_rate_limited"
+    if status_code in (401, 403):
+        return "provider_unauthorized"
+    if status_code in (502, 503, 504):
+        return "provider_unavailable"
     # Fixed allowlist diagnostics rather than forwarding freeform exceptions.
     # Explicit Codex/OAuth/provider classifications make metadata useful for
     # debugging while preventing raw upstream error bodies from being returned.
@@ -281,7 +289,8 @@ def _logs(core, args) -> list[dict]:
         "status_code": r["status_code"], "started_at": r["started_at"],
         "ended_at": r["ended_at"], "first_response_ms": r["first_response_ms"],
         "total_ms": r["total_ms"], "created_at": r["created_at"],
-        "error_category": _code(r["error"]) if r["error"] else "",
+        "error_category": _code(r["error"], status_code=r["status_code"])
+                          if r["error"] or (r["status_code"] or 0) >= 400 else "",
     } for r in rows]
 
 
@@ -303,7 +312,8 @@ def _attempts(core, args) -> list[dict]:
              "model":_read_safe(r["requested_model"]), "provider":_read_safe(r["provider_name"]),
              "provider_model":_read_safe(r["provider_model"]),
              "status_code":r["status_code"],"action":_read_safe(r["action"]),
-             "error_category":_code(r["error"]) if r["error"] else "",
+             "error_category":_code(r["error"], status_code=r["status_code"])
+                              if r["error"] or (r["status_code"] or 0) >= 400 else "",
              "total_ms":r["total_ms"],"created_at":r["created_at"]} for r in rows]
 
 
@@ -320,12 +330,15 @@ def _events(core, args) -> list[dict]:
         params.append(args["level"])
     params.append(_limit(args))
     with core.get_db_connection() as db:
-        rows = db.execute("SELECT id,node_id,event,model,status,detail,created_at "
+        rows = db.execute("SELECT id,node_id,event,model,status,detail,created_at,occurred_at "
                           "FROM ComputeEvents WHERE " + " AND ".join(where) +
                           " ORDER BY id DESC LIMIT ?", params).fetchall()
     return [{"id":r["id"], "node_id":r["node_id"], "event":_read_safe(r["event"]),
              "model":_read_safe(r["model"]), "status":_read_safe(r["status"]),
-             "detail":_read_safe(r["detail"],220), "created_at":r["created_at"]}
+             "detail":_read_safe(r["detail"],220), "created_at":r["created_at"],
+             "occurred_at": r["occurred_at"],
+             "delivery_delay_seconds": (max(0, r["created_at"] - r["occurred_at"])
+                                        if r["occurred_at"] is not None else None)}
             for r in rows]
 
 

@@ -99,7 +99,8 @@ def setup() -> None:
             resource TEXT NOT NULL,
             challenge TEXT NOT NULL,
             expires_at INTEGER NOT NULL,
-            consumed INTEGER NOT NULL DEFAULT 0
+            consumed INTEGER NOT NULL DEFAULT 0,
+            refresh_enabled INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS MCPOAuthAccess (
             token_hash TEXT PRIMARY KEY,
@@ -125,6 +126,12 @@ def setup() -> None:
         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_refresh_family
             ON MCPOAuthRefresh(family);
         """)
+        # Upgrade existing databases without invalidating currently connected
+        # clients or any tokens. Older in-flight codes still work as before.
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(MCPOAuthCodes)")}
+        if "refresh_enabled" not in columns:
+            db.execute("ALTER TABLE MCPOAuthCodes ADD COLUMN refresh_enabled "
+                       "INTEGER NOT NULL DEFAULT 0")
 
 
 def challenge_header(error: str = "invalid_token", scope: str = READ + " " + OPERATE + " " + OFFLINE) -> str:
@@ -461,7 +468,12 @@ async def authorize(req: Request):
         <input type="hidden" name="authorization_request_id" value="{esc(nonce)}">
         <input type="hidden" name="csrf" value="{esc(csrf)}">
         <label>Permissions<select name="permission">{choices}</select></label>
-        <p><small>{'Offline access requested: refreshing the connection for up to 30 days.' if wants_offline else 'No offline access requested.'}</small></p>
+        <label><input type="checkbox" name="remember_connection" value="yes" checked>
+          Keep this MCP connection signed in for up to 30 days</label>
+        <p><small>Allows a rotating, revocable refresh token instead of
+          requiring a new browser login whenever the one-hour access token
+          expires. This does not add management permissions.
+          {'Your client explicitly requested offline_access.' if wants_offline else 'Your client did not explicitly request offline_access; you can still approve a renewable login here.'}</small></p>
         <button class="approve" type="submit" name="decision" value="approve">Authorize</button>
         <button type="submit" name="decision" value="deny">Deny</button>
       </form></section>
@@ -488,10 +500,12 @@ async def authorize_decision(req: Request):
     csrf = data.get("csrf", "")
     decision = data.get("decision", "")
     permission = data.get("permission", "")
+    remember = data.get("remember_connection", "")
     if (not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", attempt_id) or
             not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", csrf) or
             decision not in ("approve","deny") or
-            permission not in ("read","operate")):
+            permission not in ("read","operate") or
+            remember not in ("", "yes")):
         return HTMLResponse("Invalid OAuth consent", status_code=400)
     now = int(time.time())
     with _db() as db:
@@ -542,14 +556,19 @@ async def authorize_decision(req: Request):
         else:
             code = _consent_code(attempt_id, csrf)
             granted = {READ} if permission == "read" else {READ,OPERATE}
-            if OFFLINE in original:
+            # The owner explicitly approves persistent login even if a
+            # public OAuth client omitted the optional offline_access scope.
+            # RFC 6749 allows authorization servers to issue refresh tokens
+            # without an offline_access scope. Never grant extra tools.
+            if remember == "yes" and OFFLINE in original:
                 granted.add(OFFLINE)
             db.execute("""INSERT INTO MCPOAuthCodes
-                (code_hash,client_id,redirect_uri,scope,resource,challenge,expires_at)
-                VALUES(?,?,?,?,?,?,?)""",
+                (code_hash,client_id,redirect_uri,scope,resource,challenge,
+                 expires_at,refresh_enabled)
+                VALUES(?,?,?,?,?,?,?,?)""",
                 (_hash(code),row["client_id"],row["redirect_uri"],
                  " ".join(sorted(granted)),row["resource"],row["challenge"],
-                 now + CODE_TTL))
+                 now + CODE_TTL, int(remember == "yes")))
             target = row["redirect_uri"]
             query = {"code": code, "state": row["state"], "iss": issuer()}
     diagnostics.record("mcp_oauth", "info",
@@ -558,7 +577,8 @@ async def authorize_decision(req: Request):
     return _callback_redirect(target, query)
 
 
-def _new_tokens(db, client_id: str, scope: str, family: str, now: int) -> dict:
+def _new_tokens(db, client_id: str, scope: str, family: str, now: int,
+                *, allow_refresh: bool = False) -> dict:
     access = "simpleai_oauth_" + secrets.token_urlsafe(36)
     db.execute("""INSERT INTO MCPOAuthAccess
         (token_hash,client_id,scope,audience,created_at,expires_at,family)
@@ -566,7 +586,7 @@ def _new_tokens(db, client_id: str, scope: str, family: str, now: int) -> dict:
         (_hash(access), client_id, scope, resource(), now, now+ACCESS_TTL, family))
     result = {"access_token": access,"token_type":"Bearer","expires_in":ACCESS_TTL,
               "scope":scope}
-    if OFFLINE in scope.split():
+    if allow_refresh or OFFLINE in scope.split():
         refresh = "simpleai_refresh_" + secrets.token_urlsafe(36)
         db.execute("""INSERT INTO MCPOAuthRefresh
             (token_hash,client_id,scope,audience,family,expires_at)
@@ -632,9 +652,15 @@ async def token_exchange(req: Request):
             if updated.rowcount != 1:
                 _audit_failure("authorization_code_concurrent_reuse")
                 return _oauth_error("invalid_grant")
-            result = _json(_new_tokens(db,client_id,row["scope"],uuid.uuid4().hex,now))
+            refresh_allowed = bool(row["refresh_enabled"]) or OFFLINE in row["scope"].split()
+            credentials = _new_tokens(db, client_id, row["scope"],
+                                      uuid.uuid4().hex, now,
+                                      allow_refresh=refresh_allowed)
+            result = _json(credentials)
             import simpleai_mcp_logging as diagnostics
             diagnostics.record("mcp_oauth", "info", "authorization_code_exchange_succeeded")
+            diagnostics.record("mcp_oauth", "info", "refresh_issued"
+                               if "refresh_token" in credentials else "refresh_not_issued")
             return result
     if grant_type == "refresh_token":
         refresh = data.get("refresh_token","")
@@ -660,7 +686,11 @@ async def token_exchange(req: Request):
             if updated.rowcount != 1:
                 _audit_failure("refresh_token_concurrent_reuse")
                 return _oauth_error("invalid_grant")
-            return _json(_new_tokens(db,client_id,row["scope"],row["family"],now))
+            tokens = _new_tokens(db,client_id,row["scope"],row["family"],now,
+                                 allow_refresh=True)
+            import simpleai_mcp_logging as diagnostics
+            diagnostics.record("mcp_oauth", "info", "refresh_exchange_succeeded")
+            return _json(tokens)
     return _oauth_error("unsupported_grant_type")
 
 

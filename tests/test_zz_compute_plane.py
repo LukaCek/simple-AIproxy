@@ -756,3 +756,62 @@ def test_host_updater_status_is_restricted_in_admin_nodes_and_mcp(tmp_path, monk
                         {"timer_enabled": 1}, {"reported_at": -1}):
             assert compute_plane._safe_host_updater({**valid, **invalid}) is None
         assert compute_plane._safe_host_updater(None) is None
+
+
+def test_current_build_revision_skips_redundant_update_notice(tmp_path, monkeypatch):
+    import compute_plane
+    sha = "a" * 40
+    monkeypatch.setattr(compute_plane, "_latest_worker_release", sha)
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        with client.websocket_connect("/compute/ws") as current:
+            current.send_json({"type": "auth", "protocol": 1, "update_protocol": 1,
+                               "build_revision": sha, **identity})
+            assert current.receive_json()["type"] == "auth_ok"
+            events = client.get("/admin/api/compute/events",
+                                auth=ADMIN, params={"node_id":identity["node_id"]}).json()["events"]
+            assert not any(e["event"] == "update_offered" for e in events)
+        with client.websocket_connect("/compute/ws") as older:
+            older.send_json({"type": "auth", "protocol": 1, "update_protocol": 1,
+                             "build_revision": "b" * 40, **identity})
+            assert older.receive_json()["type"] == "auth_ok"
+            assert older.receive_json() == {"type": "update_available", "revision": sha}
+
+
+def test_wss_network_status_strips_untrusted_worker_fields(tmp_path, monkeypatch):
+    import compute_plane
+    from simpleai_mcp_tools import _public_worker
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        current = int(__import__("time").time())
+        network = {
+            "connected_since": current-20,
+            "ping_rtt_ms": 17,
+            "reconnect_count": 4,
+            "last_disconnect_at": current-25,
+            "last_disconnect_code": "transport_error",
+            "leak": "sk-secret-private",
+        }
+        with compute_plane._db() as db:
+            db.execute("UPDATE ComputeNodes SET models_json=? WHERE id=?",
+                       (json.dumps({"network": network}), identity["node_id"]))
+            row = dict(db.execute("SELECT * FROM ComputeNodes WHERE id=?",
+                                  (identity["node_id"],)).fetchone())
+        safe = compute_plane._public_node(row)["models"]["network"]
+        assert safe["ping_rtt_ms"] == 17
+        assert safe["last_disconnect_code"] == "transport_error"
+        assert safe["connected_since"] == current-20
+        assert "leak" not in safe
+        assert "sk-secret-private" not in json.dumps(_public_worker(row))
+        assert _public_worker(row)["models"]["network"]["reconnect_count"] == 4
+        for broken in [
+            {"ping_rtt_ms": "slow"},
+            {"ping_rtt_ms": 10**20},
+            {"last_disconnect_code": ["SECRET"]},
+            {"reconnect_count": -1},
+            {"connected_since": current + 100000},
+        ]:
+            result = compute_plane._safe_worker_network({**network, **broken})
+            assert result is not None
+            assert "SECRET" not in json.dumps(result)
+            assert result["ping_rtt_ms"] is None or result["ping_rtt_ms"] <= 300000

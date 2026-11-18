@@ -2782,6 +2782,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                         first_response_at: Optional[str] = None
                         captured = bytearray()
                         error_msg: Optional[str] = None
+                        stream_outcome = "cancelled"
                         try:
                             async for chunk in response.aiter_bytes():
                                 if chunk and first_response_at is None:
@@ -2789,19 +2790,30 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                                 if chunk and len(captured) < 12000:
                                     captured.extend(chunk[: 12000 - len(captured)])
                                 yield chunk
-                        except Exception as exc:
-                            error_msg = str(exc)
+                            stream_outcome = "completed"
+                        except asyncio.CancelledError:
+                            error_msg = "Stream cancelled by client"
+                            raise
+                        except Exception:
+                            stream_outcome = "interrupted"
+                            error_msg = "Upstream stream interrupted"
                             raise
                         finally:
                             await response.aclose()
-                            if error_msg is None:
+                            if stream_outcome == "completed":
                                 clear_provider_cooldown(endpoint)
-                            else:
+                            elif stream_outcome == "interrupted":
                                 set_provider_cooldown(endpoint, PROVIDER_TIMEOUT_COOLDOWN_SECONDS)
-                            record_attempt(number, provider_name, provider_model, 200 if error_msg is None else 502, "success" if error_msg is None else "stream_error", error_msg, attempt_started_at, attempt_started_monotonic)
+                            if stream_outcome != "completed" and error_msg is None:
+                                error_msg = "Stream stopped before completion"
+                            record_attempt(number, provider_name, provider_model, 200,
+                                           ("success" if stream_outcome == "completed"
+                                            else "stream_error" if stream_outcome == "interrupted"
+                                            else "stream_cancelled"),
+                                           error_msg, attempt_started_at, attempt_started_monotonic)
                             ended_at, first_ms, total_ms = timing(first_response_at)
                             output_text = extract_output_from_body(bytes(captured), content_type) if captured else ""
-                            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200 if error_msg is None else 502, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, error_msg, request_id=request_id)
+                            insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 200, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, output_text, error_msg, request_id=request_id, stream_outcome=stream_outcome)
                     return StreamingResponse(proxy_stream(), status_code=200, media_type=content_type)
                 content = await response.aread()
                 await response.aclose()

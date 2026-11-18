@@ -102,11 +102,13 @@ def test_compute_stream_error_is_not_logged_as_success(tmp_path, monkeypatch):
             "WHERE requested_model='local/qwen35-0.8b-q4'",
         ).fetchall()
         logs = db.execute(
-            "SELECT status_code,error,output FROM Logs "
+            "SELECT status_code,error,output,stream_outcome FROM Logs "
             "WHERE requested_model='local/qwen35-0.8b-q4'",
         ).fetchall()
-    assert attempts == [("stream_error", 502)]
-    assert len(logs) == 1 and logs[0][0] == 502
+    # HTTP headers already went out as 200; track stream failure separately.
+    assert attempts == [("stream_error", 200)]
+    assert len(logs) == 1 and logs[0][0] == 200
     assert logs[0][1] == "Compute stream interrupted"
+    assert logs[0][3] == "interrupted"
     # The partial message is retained for diagnosis without marking it success.
     assert logs[0][2] is None or "partial" in logs[0][2]

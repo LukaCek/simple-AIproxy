@@ -469,10 +469,12 @@ async def authorize(req: Request):
         <input type="hidden" name="csrf" value="{esc(csrf)}">
         <label>Permissions<select name="permission">{choices}</select></label>
         <label><input type="checkbox" name="remember_connection" value="yes" checked>
-          Keep this MCP connection signed in for up to 30 days</label>
+          Keep this MCP connection signed in (renewable 30-day refresh token)</label>
         <p><small>Allows a rotating, revocable refresh token instead of
           requiring a new browser login whenever the one-hour access token
-          expires. This does not add management permissions.
+          expires. Each refresh token expires after 30 days without renewal,
+          and is replaced on use until revoked. This does not add management
+          permissions.
           {'Your client explicitly requested offline_access.' if wants_offline else 'Your client did not explicitly request offline_access; you can still approve a renewable login here.'}</small></p>
         <button class="approve" type="submit" name="decision" value="approve">Authorize</button>
         <button type="submit" name="decision" value="deny">Deny</button>

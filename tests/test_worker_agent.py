@@ -556,3 +556,70 @@ def test_host_updater_status_reader_is_bounded_and_never_exposes_raw_log(tmp_pat
     assert agent.read_host_updater_status() is None
     path.unlink()
     assert agent.read_host_updater_status() is None
+
+
+def test_telemetry_reuses_short_lived_disk_accounting_cache(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    worker = isolated_worker(tmp_path, monkeypatch)
+    counter = [0]
+    def count_usage(path):
+        counter[0] += 1
+        assert path == agent.MODELS
+        return 123456
+    monkeypatch.setattr(agent, "used_bytes", count_usage)
+    worker._usage_cache = (0.0, 0)
+    first = worker.status()
+    second = worker.status()
+    assert first["disk_used_bytes"] == second["disk_used_bytes"] == 123456
+    assert counter[0] == 1
+    worker._usage_cache = (agent.time.monotonic() - 11, 123456)
+    assert worker.status()["disk_used_bytes"] == 123456
+    assert counter[0] == 2
+    worker.connected = True
+    worker._wss = SimpleNamespace(latency=0.021)
+    worker._connected_since = int(agent.time.time()) - 25
+    status = worker.status()["network"]
+    assert status["ping_rtt_ms"] == 21
+    assert status["connected_since"] > 0
+    assert status["last_disconnect_code"] == "none"
+
+
+def test_failed_heartbeat_forces_reconnect_with_safe_diagnostic(tmp_path, monkeypatch):
+    worker = isolated_worker(tmp_path, monkeypatch)
+    seen = []
+    class FakeWebSocket:
+        latency = 0.018
+        async def send(self, payload):
+            seen.append(("send", json.loads(payload).get("type")))
+        async def recv(self):
+            return json.dumps({"type": "auth_ok"})
+    class FakeConnection:
+        async def __aenter__(self):
+            return FakeWebSocket()
+        async def __aexit__(self, *args):
+            return False
+    def fake_connect(*args, **kwargs):
+        seen.append(("connect", kwargs))
+        return FakeConnection()
+    monkeypatch.setattr(agent, "connect", fake_connect)
+    async def credentials():
+        return {"node_id": "a" * 32, "node_secret": "test-secret"}
+    async def broken_heartbeat(ws):
+        raise RuntimeError("heartbeat sender failed SECRET_PRIVATE_MESSAGE")
+    async def pending(ws):
+        await asyncio.Event().wait()
+    monkeypatch.setattr(worker, "credentials", credentials)
+    monkeypatch.setattr(worker, "heartbeat", broken_heartbeat)
+    monkeypatch.setattr(worker, "_send_diagnostics", pending)
+    monkeypatch.setattr(worker, "_receive_ws_messages", pending)
+    async def scenario():
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(worker.run(), timeout=0.15)
+    asyncio.run(scenario())
+    assert worker._last_disconnect_code == "heartbeat_failed"
+    assert worker._last_disconnect_at > 0
+    assert worker._wss is None and worker.connected is False
+    assert len(seen) >= 2
+    assert next(item[1] for item in seen if item[0] == "connect")["ping_timeout"] == 90
+    assert any(item["code"] == "heartbeat_failed" for item in worker._diag_pending)
+    assert "SECRET_PRIVATE_MESSAGE" not in worker._diag_path.read_text()

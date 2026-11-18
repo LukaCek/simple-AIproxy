@@ -325,6 +325,13 @@ def test_request_diagnostics_separate_http_status_from_stream_outcome(client):
                     "provider", "model", 200, now, now, now, 50, 100,
                     "SENSITIVE_INPUT", "SENSITIVE_OUTPUT", "Stream cancelled by client",
                     request_id="stream-cancel-id", stream_outcome="cancelled")
+    core.insert_log("test-key", "test", "model-stream", "model-stream",
+                    "provider", "model", 200, now, now, now, 50, 100,
+                    "SENSITIVE_INPUT", "SENSITIVE_OUTPUT", "Upstream stream interrupted",
+                    request_id="stream-failed-id", stream_outcome="interrupted")
+    core.insert_provider_attempt("stream-failed-id", 1, "model-stream", "provider",
+                                 "model", 200, "stream_error", "Upstream stream interrupted",
+                                 now, now, 100)
     core.insert_provider_attempt("provider-rate-test", 1, "model-rate", "provider",
                                  "model", 429, "fallback", "opaque error", now, now, 20)
     key = token(client)["token"]
@@ -334,15 +341,21 @@ def test_request_diagnostics_separate_http_status_from_stream_outcome(client):
     assert found["status_code"] == 200
     assert found["stream_outcome"] == "cancelled"
     assert found["error_category"] == "stream_cancelled"
-    assert "SENSITIVE_" not in json.dumps(found)
+    interrupted = next(x for x in logs if x["request_id"] == "stream-failed-id")
+    assert interrupted["status_code"] == 200
+    assert interrupted["stream_outcome"] == "interrupted"
+    assert interrupted["error_category"] == "stream_interrupted"
+    assert "SENSITIVE_" not in json.dumps(logs)
+    stream_attempts = call(client, key, "provider_attempts", request_id="stream-failed-id")
+    assert stream_attempts["result"]["structuredContent"]["attempts"][0]["error_category"] == "stream_interrupted"
     attempts = call(client, key, "provider_attempts", request_id="provider-rate-test")
     attempt = attempts["result"]["structuredContent"]["attempts"][0]
     assert attempt["status_code"] == 429
     assert attempt["error_category"] == "provider_rate_limited"
     health = call(client, key, "system_status")["result"]["structuredContent"]
-    assert health["failures_in_last_200_requests"] == 0
+    assert health["failures_in_last_200_requests"] >= 1
     assert health["client_cancelled_streams_in_last_200_requests"] >= 1
-    assert health["interrupted_streams_in_last_200_requests"] == 0
+    assert health["interrupted_streams_in_last_200_requests"] >= 1
 
 
 def test_existing_logs_are_migrated_without_fabricating_stream_completion(client):

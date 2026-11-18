@@ -38,7 +38,8 @@ def register(client, redirect=CALLBACK):
 
 
 def authorize(client, client_id, scope="simpleai:read offline_access",
-              redirect=CALLBACK, state="session-state-12345", permission="read"):
+              redirect=CALLBACK, state="session-state-12345", permission="read",
+              remember_connection=True):
     params={
         "response_type":"code","client_id":client_id,
         "redirect_uri":redirect,"scope":scope,"state":state,
@@ -55,6 +56,8 @@ def authorize(client, client_id, scope="simpleai:read offline_access",
         "csrf":html.unescape(csrf.group(1)),
         "permission":permission,"decision":"approve",
     }
+    if remember_connection:
+        data["remember_connection"] = "yes"
     accepted=client.post("/oauth/authorize",data=data,auth=ADMIN,
                          headers={"Origin":ISSUER}, follow_redirects=False)
     assert accepted.status_code==303,accepted.text
@@ -327,11 +330,55 @@ def test_repeated_browser_consent_shows_actionable_error_without_new_code(client
     assert "location" not in third.headers
 
 
-def test_no_offline_access_means_no_refresh_token(client):
-    cid=register(client)
-    code,_=authorize(client,cid,scope="simpleai:read")
-    issued=exchange(client,cid,code).json()
+def test_no_offline_access_scope_still_allows_consented_refresh_for_chatgpt(client):
+    # Some OAuth clients do not request offline_access, which previously
+    # forced a fresh browser login every hour after the access token expired.
+    cid = register(client)
+    code, _ = authorize(client, cid, scope="simpleai:read",
+                        remember_connection=True)
+    issued = exchange(client, cid, code).json()
+    assert issued["scope"] == "simpleai:read"
+    assert issued["refresh_token"].startswith("simpleai_refresh_")
+    renewed = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": cid,
+        "refresh_token": issued["refresh_token"],
+    })
+    assert renewed.status_code == 200
+    assert renewed.json()["scope"] == "simpleai:read"
+    assert renewed.json()["refresh_token"] != issued["refresh_token"]
+    assert rpc(client, renewed.json()["access_token"], "ping").status_code == 200
+    # Re-use of a rotated token is still rejected.
+    reused = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": cid,
+        "refresh_token": issued["refresh_token"],
+    })
+    assert reused.status_code == 400
+
+
+@pytest.mark.parametrize("scope", ["simpleai:read", "simpleai:read offline_access"])
+def test_explicit_opt_out_does_not_grant_long_lived_refresh(client, scope):
+    cid = register(client)
+    code, _ = authorize(client, cid, scope=scope, remember_connection=False)
+    issued = exchange(client, cid, code).json()
     assert "refresh_token" not in issued
+    assert "offline_access" not in issued["scope"]
+
+
+def test_oauth_refresh_compatibility_with_schema_setup(client):
+    import simpleai_mcp_oauth as oauth
+    # Re-running setup on a migrated live database must preserve tokens.
+    cid = register(client)
+    code, _ = authorize(client, cid, scope="simpleai:read",
+                        remember_connection=True)
+    existing = exchange(client, cid, code).json()
+    oauth.setup()
+    oauth.setup()
+    refreshed = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "client_id": cid,
+        "refresh_token": existing["refresh_token"],
+    })
+    assert refreshed.status_code == 200
+    assert "refresh_token" in refreshed.json()
 
 
 def test_oauth_revocation_and_expiration(client):
@@ -699,3 +746,65 @@ def test_chromium_csp_form_action_allows_registered_chatgpt_oauth_return(client)
     }, auth=ADMIN, follow_redirects=False)
     assert rejected.status_code == 400
     assert "location" not in rejected.headers
+
+
+def test_mcp_status_reports_refresh_health_without_client_or_token_details(client):
+    from test_simpleai_mcp import token, call
+    cid = register(client)
+    code, _ = authorize(client, cid, scope="simpleai:read",
+                        remember_connection=True)
+    oauth_tokens = exchange(client, cid, code).json()
+    read_key = token(client)["token"]
+    report = call(client, read_key, "system_status")
+    health = report["result"]["structuredContent"]["mcp_oauth_refresh_health"]
+    assert health["active_refresh_tokens"] >= 1
+    assert health["latest_grant_refreshable"] is True
+    assert type(health["latest_grant_at"]) is int
+    assert cid not in json.dumps(health)
+    assert oauth_tokens["refresh_token"] not in json.dumps(health)
+
+    opt_out, _ = authorize(client, cid, scope="simpleai:read",
+                           remember_connection=False)
+    no_refresh = exchange(client, cid, opt_out).json()
+    report2 = call(client, read_key, "system_status")
+    recent = report2["result"]["structuredContent"]["mcp_oauth_refresh_health"]
+    assert recent["latest_grant_refreshable"] is False
+    assert no_refresh["access_token"] not in json.dumps(recent)
+
+
+def test_migrates_preexisting_oauth_codes_table_in_place(tmp_path, monkeypatch):
+    import sqlite3
+    import simpleai_mcp_oauth as oauth
+    database_path = tmp_path / "previous-oauth-schema.db"
+
+    def old_database():
+        db = sqlite3.connect(database_path)
+        db.row_factory = sqlite3.Row
+        return db
+
+    with old_database() as db:
+        db.execute("""CREATE TABLE MCPOAuthCodes (
+            code_hash TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            challenge TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            consumed INTEGER NOT NULL DEFAULT 0
+        )""")
+        db.execute("""INSERT INTO MCPOAuthCodes
+            (code_hash,client_id,redirect_uri,scope,resource,challenge,
+             expires_at,consumed) VALUES (?,?,?,?,?,?,?,?)""",
+            ("a"*64, "old-public-client", CALLBACK, "offline_access simpleai:read",
+             RESOURCE, CHALLENGE, int(time.time()) + 300, 0))
+    monkeypatch.setattr(oauth, "_db", old_database)
+    oauth.setup()
+    oauth.setup()
+    with old_database() as db:
+        fields = {row["name"] for row in db.execute("PRAGMA table_info(MCPOAuthCodes)")}
+        assert "refresh_enabled" in fields
+        old = db.execute("SELECT * FROM MCPOAuthCodes WHERE code_hash=?", ("a"*64,)).fetchone()
+        assert old["consumed"] == 0
+        assert old["scope"] == "offline_access simpleai:read"
+        assert old["refresh_enabled"] == 0

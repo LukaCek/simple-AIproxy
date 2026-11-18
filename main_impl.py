@@ -106,7 +106,8 @@ def init_database() -> None:
                 prompt TEXT,
                 output TEXT,
                 error TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                stream_outcome TEXT NOT NULL DEFAULT 'not_streamed'
             )
             """
         )
@@ -121,6 +122,7 @@ def init_database() -> None:
             "total_ms": "REAL",
             "prompt": "TEXT",
             "output": "TEXT",
+            "stream_outcome": "TEXT NOT NULL DEFAULT 'not_streamed'",
         }
         for column, column_type in migrations.items():
             if column not in existing_columns:
@@ -767,7 +769,10 @@ def insert_log(
     output: Optional[str],
     error: Optional[str],
     request_id: Optional[str] = None,
+    stream_outcome: str = "not_streamed",
 ) -> None:
+    if stream_outcome not in ("not_streamed", "completed", "cancelled", "interrupted"):
+        raise ValueError("Unsupported stream outcome")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -775,8 +780,8 @@ def insert_log(
             INSERT INTO Logs (
                 api_key, api_key_name, request_id, requested_model, group_name, provider_name, provider_model,
                 status_code, started_at, first_response_at, ended_at, first_response_ms, total_ms,
-                prompt, output, error, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                prompt, output, error, created_at, stream_outcome
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 api_key,
@@ -796,6 +801,7 @@ def insert_log(
                 truncate_text(output or ""),
                 truncate_text(error or "", 4000) if error else None,
                 datetime.utcnow().isoformat(),
+                stream_outcome,
             ),
         )
         conn.commit()

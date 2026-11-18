@@ -457,6 +457,8 @@ _HOST_UPDATE_SOURCES = frozenset({"proxy", "scheduled_or_manual", "host"})
 _WSS_DISCONNECT_CODES = frozenset({
     "none", "clean_close", "server_restart", "transport_error",
     "timeout", "unknown_error", "heartbeat_failed", "diagnostics_failed",
+    "ping_timeout", "dns_error", "tls_error", "handshake_rejected",
+    "server_error", "protocol_rejected", "server_overloaded",
 })
 
 

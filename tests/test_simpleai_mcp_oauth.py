@@ -746,3 +746,27 @@ def test_chromium_csp_form_action_allows_registered_chatgpt_oauth_return(client)
     }, auth=ADMIN, follow_redirects=False)
     assert rejected.status_code == 400
     assert "location" not in rejected.headers
+
+
+def test_mcp_status_reports_refresh_health_without_client_or_token_details(client):
+    from test_simpleai_mcp import token, call
+    cid = register(client)
+    code, _ = authorize(client, cid, scope="simpleai:read",
+                        remember_connection=True)
+    oauth_tokens = exchange(client, cid, code).json()
+    read_key = token(client)["token"]
+    report = call(client, read_key, "system_status")
+    health = report["result"]["structuredContent"]["mcp_oauth_refresh_health"]
+    assert health["active_refresh_tokens"] >= 1
+    assert health["latest_grant_refreshable"] is True
+    assert type(health["latest_grant_at"]) is int
+    assert cid not in json.dumps(health)
+    assert oauth_tokens["refresh_token"] not in json.dumps(health)
+
+    opt_out, _ = authorize(client, cid, scope="simpleai:read",
+                           remember_connection=False)
+    no_refresh = exchange(client, cid, opt_out).json()
+    report2 = call(client, read_key, "system_status")
+    recent = report2["result"]["structuredContent"]["mcp_oauth_refresh_health"]
+    assert recent["latest_grant_refreshable"] is False
+    assert no_refresh["access_token"] not in json.dumps(recent)

@@ -571,3 +571,21 @@ If the disconnects persist despite these changes, inspect the host network,
 the Nginx Proxy Manager WebSocket/idle timeout configuration and host CPU
 saturation. Host and reverse-proxy configuration may differ from the
 repository; the proxy cannot prove or correct upstream packet loss by itself.
+
+
+### Stale connection replacement in the proxy
+
+The coordinator atomically makes the newest authenticated WSS session
+authoritative before attempting to close the previous session. Closing a dead
+TCP connection is best effort with a three-second deadline, **outside** the
+global connection registry lock. Obsolete sessions are prohibited from writing
+telemetry or handling new commands after replacement. Proxy connection events
+include a bounded elapsed session time, last telemetry gap and numeric
+WebSocket close code, or `connection_replaced` for stale sessions.
+
+Close reasons distinguish protocol-level ping timeout, DNS/TLS handshake
+failure, service restart, intentional clean close, server error and ordinary
+TCP loss. No raw close reason or remote IP is persisted. When evaluating
+possible external Nginx Proxy Manager issues, compare the worker's
+`last_disconnect_code` with server `reason/code/telemetry_gap_s` and
+contemporaneous deployment times, not only the online/offline flag.

@@ -405,11 +405,30 @@ async def execute(name: str, args: dict, app) -> dict:
             count=db.execute("SELECT count(*) FROM Logs").fetchone()[0]
             last=db.execute("SELECT count(*) FROM Logs WHERE status_code >= 400 AND id > "
                             "(SELECT max(id)-200 FROM Logs)").fetchone()[0]
+        # Read-only aggregate diagnostics to distinguish missing refresh
+        # grants from expired tokens. Never expose client IDs or token hashes.
+        from simpleai_mcp_oauth import setup as oauth_setup
+        oauth_setup()
+        now = int(datetime.now(timezone.utc).timestamp())
+        with core.get_db_connection() as db:
+            active_refresh = db.execute(
+                "SELECT count(*) FROM MCPOAuthRefresh "
+                "WHERE revoked=0 AND expires_at>?", (now,)).fetchone()[0]
+            latest = db.execute(
+                "SELECT family,created_at FROM MCPOAuthAccess "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 1").fetchone()
+            latest_refreshable = bool(latest and db.execute(
+                "SELECT 1 FROM MCPOAuthRefresh "
+                "WHERE family=? AND revoked=0 AND expires_at>? LIMIT 1",
+                (latest["family"],now)).fetchone())
         return {"status":"ok","service":"SimpleAI Proxy","time_utc":datetime.now(timezone.utc).isoformat(),
                 "registered_workers":len(nodes),"online_workers":sum(n["online"] for n in nodes),
                 "models":len(compute.CATALOG),"groups":len(_groups(core)),
                 "providers":len(_providers(core)),
                 "logged_requests":count,"failures_in_last_200_requests":last,
+                "mcp_oauth_refresh_health":{"active_refresh_tokens":active_refresh,
+                                            "latest_grant_refreshable":latest_refreshable,
+                                            "latest_grant_at":latest["created_at"] if latest else None},
                 "mcp_access":"separate revocable scoped credentials; no secret export"}
     if name == "list_providers": return {"providers":_providers(core)}
     if name == "list_groups": return {"groups":_groups(core)}

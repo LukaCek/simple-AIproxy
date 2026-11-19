@@ -1129,8 +1129,12 @@ class Worker:
                                 continue
                             try:
                                 task.result()
-                            except Exception:
-                                connection_error = cause
+                            except Exception as exc:
+                                # Preserve the receiver's typed close cause. The
+                                # previous generic transport_error masked ping
+                                # deadlines and server close codes in telemetry.
+                                connection_error = (websocket_close_code(exc)
+                                                    if task is receiver else cause)
                                 raise
                         if receiver not in done:
                             connection_error = ("heartbeat_failed" if heart in done

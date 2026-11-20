@@ -294,7 +294,7 @@ _EVENT_TYPES = frozenset({
     "model_loaded", "model_unloaded", "operation_started", "operation_succeeded",
     "operation_failed", "private_access_enabled", "private_access_disabled",
     "revoked", "removed", "worker_diagnostic", "update_offered",
-    "connection_replaced",
+    "connection_replaced", "inference_started", "inference_finished",
 })
 _MODEL_STATES = frozenset({"untested", "testing", "supported", "unsupported", "error"})
 
@@ -655,6 +655,12 @@ async def _stream(node_id: str, model: str, payload: dict[str, Any], *, visibili
     request_id = uuid.uuid4().hex
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     conn.pending[request_id] = queue
+    # Only an opaque correlation ID and controlled outcome labels are audited.
+    # Never persist inference prompts, chunks or exception text.
+    _event(node_id, "inference_started", model=model,
+           detail=f"request_id={request_id}")
+    outcome = "uncertain"
+    started_at = time.monotonic()
     try:
         await conn.send({"type": "run", "id": request_id, "model": model, "payload": payload})
         while True:
@@ -669,11 +675,22 @@ async def _stream(node_id: str, model: str, payload: dict[str, Any], *, visibili
                 yield data
             elif item.get("type") == "end":
                 if int(item.get("status", 200)) != 200:
+                    outcome = "failed"
                     raise RuntimeError("Inference failed")
+                outcome = "succeeded"
                 return
             elif item.get("type") == "error":
+                outcome = "failed"
                 raise RuntimeError(str(item.get("error", "Worker error"))[:500])
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
     finally:
+        elapsed_ms = max(0, min(int((time.monotonic() - started_at) * 1000),
+                                86_400_000))
+        _event(node_id, "inference_finished", model=model,
+               status="ok" if outcome == "succeeded" else "failed",
+               detail=f"request_id={request_id} outcome={outcome} elapsed_ms={elapsed_ms}")
         conn.pending.pop(request_id, None)
         if _connections.get(node_id) is conn:
             try:

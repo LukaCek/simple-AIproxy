@@ -1243,6 +1243,52 @@ async def list_events(node_id: str = "", limit: int = Query(100, ge=1, le=200)):
         )} for row in rows]}
 
 
+@router.get("/admin/api/compute/inference-stats", dependencies=[Depends(core.verify_admin)])
+async def inference_stats(node_id: str = "", hours: int = Query(24, ge=1, le=168)):
+    """Bounded outcome counts from durable server-side inference lifecycle events.
+
+    Started-but-unfinished requests are reported separately, not as successes.
+    These are worker WSS outcomes, not guaranteed client delivery receipts.
+    """
+    cutoff = int(time.time()) - hours * 3600
+    _setup()
+    with _db() as db:
+        if node_id:
+            rows = db.execute(
+                "SELECT event,detail FROM ComputeEvents "
+                "WHERE node_id=? AND event IN ('inference_started','inference_finished') "
+                "AND created_at>=? ORDER BY id",
+                (node_id, cutoff),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT event,detail FROM ComputeEvents "
+                "WHERE event IN ('inference_started','inference_finished') "
+                "AND created_at>=? ORDER BY id", (cutoff,),
+            ).fetchall()
+    counts = {"succeeded": 0, "failed": 0, "cancelled": 0, "uncertain": 0,
+              "unfinished": 0}
+    started = set()
+    finished = set()
+    for row in rows:
+        fields = dict(part.split("=", 1) for part in row["detail"].split()
+                      if "=" in part)
+        rid = fields.get("request_id", "")
+        if len(rid) != 32 or not all(c in "0123456789abcdef" for c in rid):
+            continue
+        if row["event"] == "inference_started":
+            started.add(rid)
+        elif row["event"] == "inference_finished":
+            outcome = fields.get("outcome")
+            if outcome in counts and outcome != "unfinished":
+                counts[outcome] += 1
+            finished.add(rid)
+    counts["unfinished"] = len(started - finished)
+    return {"window_hours": hours, "node_id": node_id or None,
+            "counts": counts, "scope": "worker_wss_outcomes",
+            "note": "Unfinished can include active requests or expired audit records."}
+
+
 @router.get("/admin/api/compute/nodes/{node_id}/recommendations", dependencies=[Depends(core.verify_admin)])
 async def node_recommendations(node_id: str):
     node = _record(node_id)

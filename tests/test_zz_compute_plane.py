@@ -865,3 +865,68 @@ def test_websocket_disconnect_retains_safe_reason_and_telemetry_gap(tmp_path, mo
         assert "uptime_s=" in disconnects[0]["detail"]
         assert "telemetry_gap_s=" in disconnects[0]["detail"]
         assert "code=" in disconnects[0]["detail"]
+
+
+def test_inference_reliability_outcomes_and_stats(tmp_path, monkeypatch):
+    """Success, explicit worker error, lost transport and client cancellation."""
+    import asyncio
+    import compute_plane as plane
+
+    class FakeConnection:
+        def __init__(self, response):
+            self.pending = {}
+            self.response = response
+            self.sent = []
+
+        async def send(self, message):
+            self.sent.append(message)
+            if message["type"] == "run":
+                if self.response == "lost":
+                    await self.pending[message["id"]].put(
+                        {"type": "error", "error": "Worker disconnected"})
+                elif self.response == "error":
+                    await self.pending[message["id"]].put(
+                        {"type": "error", "error": "Model failed"})
+                elif self.response == "success":
+                    await self.pending[message["id"]].put(
+                        {"type": "end", "status": 200})
+
+    with fixture_client(tmp_path, monkeypatch) as client:
+        identity = enroll_node(client)
+        node = identity["node_id"]
+        fake = FakeConnection("success")
+        monkeypatch.setitem(plane._connections, node, fake)
+        async def consume():
+            return [x async for x in plane._stream(
+                node, "qwen35-0.8b-q4", {"stream": True}, visibility="public")]
+        assert asyncio.run(consume()) == []
+        fake.response = "error"
+        import pytest
+        with pytest.raises(RuntimeError, match="Model failed"):
+            asyncio.run(consume())
+        fake.response = "lost"
+        with pytest.raises(RuntimeError, match="Worker disconnected"):
+            asyncio.run(consume())
+        fake.response = "hang"
+        async def cancelled():
+            task = asyncio.create_task(consume())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(cancelled())
+        stats = client.get("/admin/api/compute/inference-stats", auth=ADMIN).json()
+        assert stats["counts"]["succeeded"] == 1
+        assert stats["counts"]["failed"] == 2
+        assert stats["counts"]["cancelled"] == 1
+        assert stats["counts"]["unfinished"] == 0
+        assert not fake.pending
+        assert len([m for m in fake.sent if m["type"] == "run"]) == 4
+        events = client.get("/admin/api/compute/events", auth=ADMIN,
+                            params={"node_id": node}).json()["events"]
+        lifecycle = [e for e in events if e["event"].startswith("inference_")]
+        assert len(lifecycle) == 8
+        assert all("Model failed" not in e["detail"] for e in lifecycle)
+        assert all("stream" not in e["detail"] for e in lifecycle)

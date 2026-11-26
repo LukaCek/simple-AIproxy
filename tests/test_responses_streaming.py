@@ -531,17 +531,18 @@ class FreePoolBadRequestClient(SequencedStreamingRouteClient):
 
 
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("upstream_status", [400, 422])
 @pytest.mark.parametrize("scenario", ["recover", "tool_history", "exhaust", "mixed_exhaust", "direct", "other_group", "malformed", "malformed_role"])
-def test_free_pool_upstream_400_fallback(tmp_path, monkeypatch, stream, scenario):
+def test_free_pool_upstream_client_error_fallback(tmp_path, monkeypatch, stream, upstream_status, scenario):
     streaming = get_streaming_module()
     setup_streaming_key_db(streaming, tmp_path, monkeypatch)
-    first_error = {"error": {"code": 400, "message": "provider-specific bad request"}}
+    first_error = {"error": {"code": upstream_status, "message": "provider-specific bad request"}}
     second_error = {"error": {"message": "second provider rejected"}}
-    outcomes = [(400, first_error)]
+    outcomes = [(upstream_status, first_error)]
     if scenario in {"recover", "tool_history"}:
         outcomes.append((200, "recovered"))
     elif scenario == "exhaust":
-        outcomes.append((400, second_error))
+        outcomes.append((upstream_status, second_error))
     elif scenario == "mixed_exhaust":
         outcomes.append((429, second_error))
     fake = FreePoolBadRequestClient(outcomes)
@@ -590,7 +591,7 @@ def test_free_pool_upstream_400_fallback(tmp_path, monkeypatch, stream, scenario
         assert response.status_code == 200
         assert "recovered" in response.text
     else:
-        assert response.status_code == 400
+        assert response.status_code == upstream_status
         assert response.json() == first_error
     with sqlite3.connect(tmp_path / "streaming.db") as conn:
         attempts = conn.execute(
@@ -602,6 +603,73 @@ def test_free_pool_upstream_400_fallback(tmp_path, monkeypatch, stream, scenario
     assert len(attempts) == (2 if retry else 1)
     assert attempts[0][3] == ("fallback" if retry else "returned_error")
     assert all(row[0] == final[0] for row in attempts)
-    assert final[1:] == (("groq", 200) if scenario in {"recover", "tool_history"} else ("gemini", 400))
+    assert final[1:] == (("groq", 200) if scenario in {"recover", "tool_history"} else ("gemini", upstream_status))
     if retry:
         assert attempts[1][3] == ("success" if scenario in {"recover", "tool_history"} else "fallback")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+def test_mistral_422_reasoning_content_retry_then_fallback(tmp_path, monkeypatch, stream, retry_succeeds):
+    streaming = get_streaming_module()
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    error = {"detail": [{"type": "extra_forbidden",
+                         "loc": ["body", "messages", 2, "assistant", "reasoning_content"],
+                         "msg": "Extra inputs are not permitted", "input": "private reasoning"}]}
+    outcomes = [(422, error)]
+    if retry_succeeds:
+        outcomes.append((200, "recovered"))
+    else:
+        outcomes.extend([(422, {"detail": [{"type": "value_error", "loc": ["body", "tools"]}]}),
+                         (200, "recovered")])
+    fake = FreePoolBadRequestClient(outcomes)
+    config = {
+        "providers": [
+            {"name": "mistral", "url": "http://mistral.local/v1", "api_key": "k1", "models": ["m1"]},
+            {"name": "backup", "url": "http://backup.local/v1", "api_key": "k2", "models": ["m2"]},
+        ],
+        "groups": {"free-models": {"strategy": "fallback", "members": [
+            {"provider": "mistral", "model": "m1"}, {"provider": "backup", "model": "m2"}
+        ]}},
+    }
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "reasoning_content": "private reasoning",
+         "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "ping", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "pong"},
+    ]
+    tools = [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}]
+    streaming._impl.config_data = config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(streaming._impl, "http_client", fake)
+        streaming._impl.config_data = config
+        response = client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
+                               json={"model": "free-models", "stream": stream, "messages": messages, "tools": tools})
+    assert response.status_code == 200
+    assert "recovered" in response.text
+    assert fake.hosts == (["mistral.local"] * 2 + ([] if retry_succeeds else ["backup.local"]))
+    original, sanitized = [r.extensions["json_payload"] for r in fake.requests[:2]]
+    assert original["messages"] == messages
+    expected = [dict(m) for m in messages]
+    expected[2].pop("reasoning_content")
+    assert sanitized["messages"] == expected
+    assert sanitized["tools"] == tools
+    if not retry_succeeds:
+        assert fake.requests[2].extensions["json_payload"]["messages"] == messages
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        attempts = conn.execute("SELECT status_code, action FROM ProviderAttempts ORDER BY attempt_no").fetchall()
+    assert attempts == ([(422, "retry_sanitized"), (200, "success")] if retry_succeeds else
+                        [(422, "retry_sanitized"), (422, "fallback"), (200, "success")])
+
+
+def test_422_reasoning_detection_uses_validation_location_not_echoed_input():
+    streaming = get_streaming_module()
+    detect = streaming._impl.is_unsupported_reasoning_content_error
+    error = {"detail": [{"type": "extra_forbidden", "loc": ["body", "messages", 2, "assistant", "reasoning_content"]}]}
+    assert detect(422, json.dumps(error))
+    assert detect(422, json.dumps([error]))
+    assert not detect(422, json.dumps({"detail": [{"type": "extra_forbidden", "loc": ["body", "tools"], "input": "reasoning_content unsupported"}]}))
+    assert not detect(422, "reasoning_content unsupported")
+    assert not detect(429, json.dumps(error))
+    assert detect(400, "reasoning_content is unsupported")

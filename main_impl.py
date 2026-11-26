@@ -602,14 +602,35 @@ def payload_without_reasoning_content(payload: Dict[str, Any]) -> Dict[str, Any]
 
 
 def is_unsupported_reasoning_content_error(status_code: int, error_text: str) -> bool:
-    if status_code != 400:
+    if status_code == 400:
+        lower = (error_text or "").lower()
+        return "reasoning_content" in lower and ("unsupported" in lower or "not supported" in lower)
+    if status_code != 422:
         return False
-    lower = (error_text or "").lower()
-    return "reasoning_content" in lower and ("unsupported" in lower or "not supported" in lower)
+    # Mistral's validation response includes the rejected field in loc.
+    # Never infer a rejection from the echoed input (which can contain arbitrary text).
+    try:
+        body = json.loads(error_text)
+    except (TypeError, ValueError):
+        return False
+    envelopes = body if isinstance(body, list) else [body]
+    for envelope in envelopes:
+        if not isinstance(envelope, dict):
+            continue
+        details = envelope.get("detail")
+        if not isinstance(details, list):
+            continue
+        for error in details:
+            if not isinstance(error, dict) or error.get("type") != "extra_forbidden":
+                continue
+            loc = error.get("loc")
+            if isinstance(loc, list) and "messages" in loc and loc[-1:] == ["reasoning_content"]:
+                return True
+    return False
 
 
 def free_pool_can_fallback_bad_request(model: str, payload: Dict[str, Any], endpoint_count: int) -> bool:
-    """Allow ambiguous upstream 400s only in the explicitly selected free pool.
+    """Allow ambiguous upstream 400/422 errors only in the explicitly selected free pool.
 
     A valid chat request can be rejected by one model's tool/schema dialect.
     Do not change direct model or other group semantics, and do not fan out
@@ -2629,8 +2650,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     started_at = datetime.utcnow().isoformat()
     last_error: Optional[str] = None
     fallback_statuses = {401, 403, 408, 409, 413, 425, 429, 500, 502, 503, 504}
-    fallback_400 = free_pool_can_fallback_bad_request(requested_model, payload, len(endpoints))
-    first_bad_request: Optional[tuple[bytes, str, str, str, str, str]] = None
+    fallback_client_error = free_pool_can_fallback_bad_request(requested_model, payload, len(endpoints))
+    first_client_error: Optional[tuple[int, bytes, str, str, str, str, str]] = None
 
     def timing(first_at: Optional[str] = None) -> tuple[str, Optional[float], float]:
         ended = datetime.utcnow().isoformat()
@@ -2779,10 +2800,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                     return Response(json.dumps(chat_completion_from_text(provider_model, text), ensure_ascii=False), status_code=200, media_type="application/json")
                 error_msg = raw_text
                 retry_model = codex_note_error(endpoint, response.status_code, error_msg) if "codex_note_error" in globals() else False
-                if fallback_400 and response.status_code == 400:
-                    if first_bad_request is None:
-                        first_bad_request = (content, response.headers.get("content-type", "application/json"), provider_name, provider_model, error_msg, first_response_at)
-                    record_attempt(number, provider_name, provider_model, 400, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
+                if fallback_client_error and response.status_code in {400, 422}:
+                    if first_client_error is None:
+                        first_client_error = (response.status_code, content, response.headers.get("content-type", "application/json"), provider_name, provider_model, error_msg, first_response_at)
+                    record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     continue
                 if retry_model or response.status_code in fallback_statuses:
                     apply_provider_cooldown_from_response(endpoint, response)
@@ -2874,10 +2895,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             await response.aclose()
             first_response_at = datetime.utcnow().isoformat()
             error_msg = content.decode("utf-8", errors="replace")
-            if fallback_400 and response.status_code == 400:
-                if first_bad_request is None:
-                    first_bad_request = (content, content_type, provider_name, provider_model, error_msg, first_response_at)
-                record_attempt(number, provider_name, provider_model, 400, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
+            if fallback_client_error and response.status_code in {400, 422}:
+                if first_client_error is None:
+                    first_client_error = (response.status_code, content, content_type, provider_name, provider_model, error_msg, first_response_at)
+                record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                 continue
             if response.status_code in fallback_statuses:
                 apply_provider_cooldown_from_response(endpoint, response)
@@ -2900,11 +2921,11 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             last_error = error_msg
             continue
 
-    if first_bad_request is not None:
-        content, content_type, provider_name, provider_model, error_msg, first_response_at = first_bad_request
+    if first_client_error is not None:
+        client_status, content, content_type, provider_name, provider_model, error_msg, first_response_at = first_client_error
         ended_at, first_ms, total_ms = timing(first_response_at)
-        insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 400, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg, request_id=request_id)
-        return Response(content, status_code=400, media_type=content_type)
+        insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, client_status, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg, request_id=request_id)
+        return Response(content, status_code=client_status, media_type=content_type)
 
     ended_at, first_ms, total_ms = timing(None)
     last_endpoint = endpoints[-1] if endpoints else {}

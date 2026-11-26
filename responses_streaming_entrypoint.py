@@ -366,8 +366,8 @@ async def chat_completions(
     started_monotonic = time.monotonic()
     started_at = datetime.utcnow().isoformat()
     last_error: Optional[str] = None
-    fallback_400 = _impl.free_pool_can_fallback_bad_request(requested_model, payload, len(endpoints))
-    first_bad_request: Optional[tuple[bytes, str, str, str, str, str]] = None
+    fallback_client_error = _impl.free_pool_can_fallback_bad_request(requested_model, payload, len(endpoints))
+    first_client_error: Optional[tuple[int, bytes, str, str, str, str, str]] = None
 
     def timing(first_at: Optional[str] = None) -> tuple[str, Optional[float], float]:
         ended_at = datetime.utcnow().isoformat()
@@ -651,10 +651,10 @@ async def chat_completions(
 
                 error_msg = raw_text
                 retry_model = _impl.codex_note_error(endpoint, upstream_status, error_msg) if hasattr(_impl, "codex_note_error") else False
-                if fallback_400 and upstream_status == 400:
-                    if first_bad_request is None:
-                        first_bad_request = (content, content_type, provider_name, provider_model, error_msg, first_response_at)
-                    record_attempt(number, provider_name, provider_model, 400, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
+                if fallback_client_error and upstream_status in {400, 422}:
+                    if first_client_error is None:
+                        first_client_error = (upstream_status, content, content_type, provider_name, provider_model, error_msg, first_response_at)
+                    record_attempt(number, provider_name, provider_model, upstream_status, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     continue
                 if retry_model or upstream_status in _FALLBACK_STATUSES:
                     record_attempt(number, provider_name, provider_model, upstream_status, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
@@ -813,16 +813,16 @@ async def chat_completions(
             last_error = error_msg
             continue
 
-    if first_bad_request is not None:
-        content, content_type, provider_name, provider_model, error_msg, first_response_at = first_bad_request
+    if first_client_error is not None:
+        client_status, content, content_type, provider_name, provider_model, error_msg, first_response_at = first_client_error
         ended_at, first_ms, total_ms = timing(first_response_at)
         _impl.insert_log(
             api_key_value, api_key_name, requested_model, requested_model,
-            provider_name, provider_model, 400, started_at,
+            provider_name, provider_model, client_status, started_at,
             first_response_at, ended_at, first_ms, total_ms, prompt_text,
             None, error_msg, request_id=request_id,
         )
-        return Response(content, status_code=400, media_type=content_type)
+        return Response(content, status_code=client_status, media_type=content_type)
 
     ended_at, first_ms, total_ms = timing(None)
     last_endpoint = endpoints[-1] if endpoints else {}

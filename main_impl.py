@@ -627,7 +627,7 @@ def free_pool_can_fallback_bad_request(model: str, payload: Dict[str, Any], endp
         return False
     if any(
         not isinstance(message, dict)
-        or message.get("role") not in {"system", "developer", "user", "assistant", "tool", "function"}
+        or message.get("role") not in ("system", "developer", "user", "assistant", "tool", "function")
         or ("content" not in message and not message.get("tool_calls") and not message.get("function_call"))
         for message in messages
     ):

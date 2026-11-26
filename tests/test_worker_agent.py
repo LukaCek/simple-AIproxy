@@ -613,8 +613,25 @@ def test_failed_heartbeat_forces_reconnect_with_safe_diagnostic(tmp_path, monkey
     monkeypatch.setattr(worker, "_send_diagnostics", pending)
     monkeypatch.setattr(worker, "_receive_ws_messages", pending)
     async def scenario():
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(worker.run(), timeout=0.15)
+        disconnected = asyncio.Event()
+        original_diag = worker._diag
+
+        def observe_diag(kind, code, **kwargs):
+            original_diag(kind, code, **kwargs)
+            if kind == "network" and code == "heartbeat_failed":
+                disconnected.set()
+
+        monkeypatch.setattr(worker, "_diag", observe_diag)
+        task = asyncio.create_task(worker.run())
+        try:
+            # Synchronize on the actual persisted diagnostic instead of
+            # assuming CI filesystem/snapshot operations finish in 150 ms.
+            await asyncio.wait_for(disconnected.wait(), timeout=10)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
     asyncio.run(scenario())
     assert worker._last_disconnect_code == "heartbeat_failed"
     assert worker._last_disconnect_at > 0

@@ -531,14 +531,14 @@ class FreePoolBadRequestClient(SequencedStreamingRouteClient):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("scenario", ["recover", "exhaust", "mixed_exhaust", "direct", "other_group", "malformed"])
+@pytest.mark.parametrize("scenario", ["recover", "tool_history", "exhaust", "mixed_exhaust", "direct", "other_group", "malformed", "malformed_role"])
 def test_free_pool_upstream_400_fallback(tmp_path, monkeypatch, stream, scenario):
     streaming = get_streaming_module()
     setup_streaming_key_db(streaming, tmp_path, monkeypatch)
     first_error = {"error": {"code": 400, "message": "provider-specific bad request"}}
     second_error = {"error": {"message": "second provider rejected"}}
     outcomes = [(400, first_error)]
-    if scenario == "recover":
+    if scenario in {"recover", "tool_history"}:
         outcomes.append((200, "recovered"))
     elif scenario == "exhaust":
         outcomes.append((400, second_error))
@@ -560,7 +560,17 @@ def test_free_pool_upstream_400_fallback(tmp_path, monkeypatch, stream, scenario
     messages = [{"role": "user", "content": "start"}]
     if scenario == "malformed":
         messages = [{"content": "missing role"}]
+    if scenario == "malformed_role":
+        messages = [{"role": {}, "content": "bad role"}]
     payload = {"model": model, "messages": messages, "stream": stream}
+    if scenario == "tool_history":
+        messages.extend([
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "ping", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "pong"},
+        ])
+        payload["tools"] = [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}]
     streaming._impl.config_data = desired_config
     with TestClient(streaming.app) as client:
         monkeypatch.setattr(streaming._impl, "http_client", fake)
@@ -571,11 +581,12 @@ def test_free_pool_upstream_400_fallback(tmp_path, monkeypatch, stream, scenario
             json=payload,
         )
 
-    retry = scenario in {"recover", "exhaust", "mixed_exhaust"}
+    retry = scenario in {"recover", "tool_history", "exhaust", "mixed_exhaust"}
     assert fake.hosts == (["gemini.local", "groq.local"] if retry else ["gemini.local"])
     for request in fake.requests:
         assert request.extensions["json_payload"]["messages"] == messages
-    if scenario == "recover":
+        assert request.extensions["json_payload"].get("tools") == payload.get("tools")
+    if scenario in {"recover", "tool_history"}:
         assert response.status_code == 200
         assert "recovered" in response.text
     else:
@@ -591,6 +602,6 @@ def test_free_pool_upstream_400_fallback(tmp_path, monkeypatch, stream, scenario
     assert len(attempts) == (2 if retry else 1)
     assert attempts[0][3] == ("fallback" if retry else "returned_error")
     assert all(row[0] == final[0] for row in attempts)
-    assert final[1:] == (("groq", 200) if scenario == "recover" else ("gemini", 400))
+    assert final[1:] == (("groq", 200) if scenario in {"recover", "tool_history"} else ("gemini", 400))
     if retry:
-        assert attempts[1][3] == ("success" if scenario == "recover" else "fallback")
+        assert attempts[1][3] == ("success" if scenario in {"recover", "tool_history"} else "fallback")

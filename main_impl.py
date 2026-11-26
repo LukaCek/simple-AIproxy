@@ -608,6 +608,35 @@ def is_unsupported_reasoning_content_error(status_code: int, error_text: str) ->
     return "reasoning_content" in lower and ("unsupported" in lower or "not supported" in lower)
 
 
+def free_pool_can_fallback_bad_request(model: str, payload: Dict[str, Any], endpoint_count: int) -> bool:
+    """Allow ambiguous upstream 400s only in the explicitly selected free pool.
+
+    A valid chat request can be rejected by one model's tool/schema dialect.
+    Do not change direct model or other group semantics, and do not fan out
+    obviously malformed chat envelopes. The configured candidate list remains
+    the retry bound; no fields or tool history are discarded.
+    """
+    if model != "free-models" or endpoint_count < 2:
+        return False
+    with config_lock:
+        group = config_data.get("groups", {}).get(model, {})
+        if not isinstance(group, dict) or group.get("strategy") != "fallback":
+            return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    if any(
+        not isinstance(message, dict)
+        or message.get("role") not in {"system", "developer", "user", "assistant", "tool", "function"}
+        or ("content" not in message and not message.get("tool_calls") and not message.get("function_call"))
+        for message in messages
+    ):
+        return False
+    if "tools" in payload and payload["tools"] is not None and not isinstance(payload["tools"], list):
+        return False
+    return True
+
+
 def extract_prompt(payload: Dict[str, Any]) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -2600,6 +2629,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     started_at = datetime.utcnow().isoformat()
     last_error: Optional[str] = None
     fallback_statuses = {401, 403, 408, 409, 413, 425, 429, 500, 502, 503, 504}
+    fallback_400 = free_pool_can_fallback_bad_request(requested_model, payload, len(endpoints))
+    first_bad_request: Optional[tuple[bytes, str, str, str, str, str]] = None
 
     def timing(first_at: Optional[str] = None) -> tuple[str, Optional[float], float]:
         ended = datetime.utcnow().isoformat()
@@ -2748,6 +2779,11 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                     return Response(json.dumps(chat_completion_from_text(provider_model, text), ensure_ascii=False), status_code=200, media_type="application/json")
                 error_msg = raw_text
                 retry_model = codex_note_error(endpoint, response.status_code, error_msg) if "codex_note_error" in globals() else False
+                if fallback_400 and response.status_code == 400:
+                    if first_bad_request is None:
+                        first_bad_request = (content, response.headers.get("content-type", "application/json"), provider_name, provider_model, error_msg, first_response_at)
+                    record_attempt(number, provider_name, provider_model, 400, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
+                    continue
                 if retry_model or response.status_code in fallback_statuses:
                     apply_provider_cooldown_from_response(endpoint, response)
                     record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
@@ -2838,6 +2874,11 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             await response.aclose()
             first_response_at = datetime.utcnow().isoformat()
             error_msg = content.decode("utf-8", errors="replace")
+            if fallback_400 and response.status_code == 400:
+                if first_bad_request is None:
+                    first_bad_request = (content, content_type, provider_name, provider_model, error_msg, first_response_at)
+                record_attempt(number, provider_name, provider_model, 400, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
+                continue
             if response.status_code in fallback_statuses:
                 apply_provider_cooldown_from_response(endpoint, response)
                 record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
@@ -2858,6 +2899,12 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             record_attempt(number, provider_name, provider_model, 502, "fallback_exception", error_msg, attempt_started_at, attempt_started_monotonic)
             last_error = error_msg
             continue
+
+    if first_bad_request is not None:
+        content, content_type, provider_name, provider_model, error_msg, first_response_at = first_bad_request
+        ended_at, first_ms, total_ms = timing(first_response_at)
+        insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 400, started_at, first_response_at, ended_at, first_ms, total_ms, prompt_text, None, error_msg, request_id=request_id)
+        return Response(content, status_code=400, media_type=content_type)
 
     ended_at, first_ms, total_ms = timing(None)
     last_endpoint = endpoints[-1] if endpoints else {}

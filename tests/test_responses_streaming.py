@@ -3,6 +3,7 @@ import json
 import sqlite3
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -515,3 +516,81 @@ def test_streaming_429_cooldown_skips_provider_on_next_request(tmp_path, monkeyp
             ).fetchall()
         ]
     assert actions == ["fallback", "success", "cooldown_skip", "success"]
+
+
+class FreePoolBadRequestClient(SequencedStreamingRouteClient):
+    async def send(self, request, stream=False):
+        if request.extensions["json_payload"].get("stream"):
+            return await super().send(request, stream=stream)
+        self.requests.append(request)
+        self.hosts.append(request.url.host)
+        status_code, payload = self.responses.pop(0)
+        if status_code == 200:
+            payload = {"choices": [{"message": {"role": "assistant", "content": payload}}]}
+        return httpx.Response(status_code, json=payload, request=request)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("scenario", ["recover", "exhaust", "mixed_exhaust", "direct", "other_group", "malformed"])
+def test_free_pool_upstream_400_fallback(tmp_path, monkeypatch, stream, scenario):
+    streaming = get_streaming_module()
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    first_error = {"error": {"code": 400, "message": "provider-specific bad request"}}
+    second_error = {"error": {"message": "second provider rejected"}}
+    outcomes = [(400, first_error)]
+    if scenario == "recover":
+        outcomes.append((200, "recovered"))
+    elif scenario == "exhaust":
+        outcomes.append((400, second_error))
+    elif scenario == "mixed_exhaust":
+        outcomes.append((429, second_error))
+    fake = FreePoolBadRequestClient(outcomes)
+    members = [{"provider": "gemini", "model": "gemini-test"}, {"provider": "groq", "model": "groq-test"}]
+    desired_config = {
+        "providers": [
+            {"name": "gemini", "url": "http://gemini.local/v1", "api_key": "k1", "models": ["gemini-test"]},
+            {"name": "groq", "url": "http://groq.local/v1", "api_key": "k2", "models": ["groq-test"]},
+        ],
+        "groups": {
+            "free-models": {"strategy": "fallback", "members": members},
+            "other": {"strategy": "fallback", "members": members},
+        },
+    }
+    model = {"direct": "gemini-test", "other_group": "other"}.get(scenario, "free-models")
+    messages = [{"role": "user", "content": "start"}]
+    if scenario == "malformed":
+        messages = [{"content": "missing role"}]
+    payload = {"model": model, "messages": messages, "stream": stream}
+    streaming._impl.config_data = desired_config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(streaming._impl, "http_client", fake)
+        streaming._impl.config_data = desired_config
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json=payload,
+        )
+
+    retry = scenario in {"recover", "exhaust", "mixed_exhaust"}
+    assert fake.hosts == (["gemini.local", "groq.local"] if retry else ["gemini.local"])
+    for request in fake.requests:
+        assert request.extensions["json_payload"]["messages"] == messages
+    if scenario == "recover":
+        assert response.status_code == 200
+        assert "recovered" in response.text
+    else:
+        assert response.status_code == 400
+        assert response.json() == first_error
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        attempts = conn.execute(
+            "SELECT request_id, provider_name, status_code, action FROM ProviderAttempts ORDER BY attempt_no"
+        ).fetchall()
+        final = conn.execute(
+            "SELECT request_id, provider_name, status_code FROM Logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert len(attempts) == (2 if retry else 1)
+    assert attempts[0][3] == ("fallback" if retry else "returned_error")
+    assert all(row[0] == final[0] for row in attempts)
+    assert final[1:] == (("groq", 200) if scenario == "recover" else ("gemini", 400))
+    if retry:
+        assert attempts[1][3] == ("success" if scenario == "recover" else "fallback")

@@ -368,6 +368,7 @@ async def chat_completions(
     last_error: Optional[str] = None
     fallback_client_error = _impl.free_pool_can_fallback_bad_request(requested_model, payload, len(endpoints))
     first_client_error: Optional[tuple[int, bytes, str, str, str, str, str]] = None
+    unavailable_skip: Optional[tuple[str, str]] = None
 
     def timing(first_at: Optional[str] = None) -> tuple[str, Optional[float], float]:
         ended_at = datetime.utcnow().isoformat()
@@ -418,13 +419,16 @@ async def chat_completions(
             payload, endpoint, provider_model
         )
         cooldown_remaining = _impl.provider_cooldown_remaining(endpoint)
-        if fallback_client_error:
-            cooldown_remaining = max(cooldown_remaining, _impl.provider_cooldown_remaining(
-                endpoint, scope=_impl.FREE_POOL_UNAVAILABLE_SCOPE
-            ))
+        unavailable_remaining = (_impl.provider_cooldown_remaining(
+            endpoint, scope=_impl.FREE_POOL_UNAVAILABLE_SCOPE
+        ) if fallback_client_error else 0.0)
+        cooldown_remaining = max(cooldown_remaining, unavailable_remaining)
         if cooldown_remaining > 0:
             number, attempt_started_at, attempt_started_monotonic = begin_attempt()
-            cooldown_reason = f"provider cooldown active ({cooldown_remaining:.1f}s remaining)"
+            if unavailable_remaining > 0:
+                unavailable_skip = (provider_name, provider_model)
+            cooldown_kind = "free-pool unavailable model" if unavailable_remaining > 0 else "provider cooldown"
+            cooldown_reason = f"{cooldown_kind} active ({cooldown_remaining:.1f}s remaining)"
             record_attempt(
                 number,
                 provider_name,
@@ -657,7 +661,7 @@ async def chat_completions(
                 retry_model = _impl.codex_note_error(endpoint, upstream_status, error_msg) if hasattr(_impl, "codex_note_error") else False
                 if fallback_client_error and upstream_status in _impl.FREE_POOL_CLIENT_ERROR_STATUSES:
                     _impl.free_pool_unavailable_cooldown(endpoint, upstream_status, error_msg)
-                    if first_client_error is None:
+                    if first_client_error is None or (first_client_error[0] in {404, 410} and upstream_status in {400, 422}):
                         first_client_error = (upstream_status, content, content_type, provider_name, provider_model, error_msg, first_response_at)
                     record_attempt(number, provider_name, provider_model, upstream_status, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
                     continue
@@ -821,13 +825,26 @@ async def chat_completions(
     if first_client_error is not None:
         client_status, content, content_type, provider_name, provider_model, error_msg, first_response_at = first_client_error
         ended_at, first_ms, total_ms = timing(first_response_at)
+        public_status = 503 if client_status in {404, 410} else client_status
         _impl.insert_log(
             api_key_value, api_key_name, requested_model, requested_model,
-            provider_name, provider_model, client_status, started_at,
+            provider_name, provider_model, public_status, started_at,
             first_response_at, ended_at, first_ms, total_ms, prompt_text,
             None, error_msg, request_id=request_id,
         )
+        if public_status == 503:
+            return _impl.free_pool_unavailable_response()
         return Response(content, status_code=client_status, media_type=content_type)
+
+    if unavailable_skip is not None:
+        provider_name, provider_model = unavailable_skip
+        ended_at, first_ms, total_ms = timing(None)
+        _impl.insert_log(
+            api_key_value, api_key_name, requested_model, requested_model,
+            provider_name, provider_model, 503, started_at, None, ended_at,
+            first_ms, total_ms, prompt_text, None, last_error, request_id=request_id,
+        )
+        return _impl.free_pool_unavailable_response()
 
     ended_at, first_ms, total_ms = timing(None)
     last_endpoint = endpoints[-1] if endpoints else {}

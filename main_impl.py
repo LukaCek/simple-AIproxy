@@ -2701,7 +2701,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
     fallback_statuses = {401, 403, 408, 409, 413, 425, 429, 500, 502, 503, 504}
     fallback_client_error = free_pool_can_fallback_bad_request(requested_model, payload, len(endpoints))
     first_client_error: Optional[tuple[int, bytes, str, str, str, str, str]] = None
-    unavailable_skip: Optional[tuple[str, str]] = None
+    unavailable_skip: Optional[tuple[str, str, str]] = None
 
     def timing(first_at: Optional[str] = None) -> tuple[str, Optional[float], float]:
         ended = datetime.utcnow().isoformat()
@@ -2769,10 +2769,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
         cooldown_remaining = max(cooldown_remaining, unavailable_remaining)
         if cooldown_remaining > 0:
             number, attempt_started_at, attempt_started_monotonic = begin_attempt()
-            if unavailable_remaining > 0:
-                unavailable_skip = (provider_name, provider_model)
             cooldown_kind = "free-pool unavailable model" if unavailable_remaining > 0 else "provider cooldown"
             cooldown_reason = f"{cooldown_kind} active ({cooldown_remaining:.1f}s remaining)"
+            if unavailable_remaining > 0:
+                unavailable_skip = (provider_name, provider_model, cooldown_reason)
             record_attempt(
                 number,
                 provider_name,
@@ -2990,9 +2990,9 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
         return Response(content, status_code=client_status, media_type=content_type)
 
     if unavailable_skip is not None:
-        provider_name, provider_model = unavailable_skip
+        provider_name, provider_model, unavailable_reason = unavailable_skip
         ended_at, first_ms, total_ms = timing(None)
-        insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 503, started_at, None, ended_at, first_ms, total_ms, prompt_text, None, last_error, request_id=request_id)
+        insert_log(api_key_value, api_key_name, requested_model, requested_model, provider_name, provider_model, 503, started_at, None, ended_at, first_ms, total_ms, prompt_text, None, unavailable_reason, request_id=request_id)
         return free_pool_unavailable_response()
 
     ended_at, first_ms, total_ms = timing(None)

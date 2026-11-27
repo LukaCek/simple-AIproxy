@@ -779,3 +779,39 @@ def test_unavailable_cooldown_does_not_infer_model_error_from_echoed_message(mon
     impl.free_pool_unavailable_cooldown(endpoint, 404, json.dumps(
         {"error": {"message": "Input 'model not found' could not be processed"}}))
     assert impl.provider_cooldown_remaining(endpoint, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) == 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("first_status,second_status", [(410, 422), (400, 410)])
+def test_free_pool_exhaustion_prefers_request_error(tmp_path, monkeypatch, stream, first_status, second_status):
+    streaming = get_streaming_module()
+    impl = streaming._impl
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    error = {"error": {"message": "request rejected"}}
+    gone = {"error": {"message": "Gone"}}
+    fake = FreePoolBadRequestClient([
+        (first_status, gone if first_status == 410 else error),
+        (second_status, gone if second_status == 410 else error),
+    ])
+    config = {
+        "providers": [
+            {"name": "one", "url": "http://one.local/v1", "api_key": "k1", "models": ["m1"]},
+            {"name": "two", "url": "http://two.local/v1", "api_key": "k2", "models": ["m2"]},
+        ],
+        "groups": {"free-models": {"strategy": "fallback", "members": [
+            {"provider": "one", "model": "m1"}, {"provider": "two", "model": "m2"},
+        ]}},
+    }
+    impl.config_data = config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(impl, "http_client", fake)
+        impl.config_data = config
+        response = client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
+                               json={"model": "free-models", "stream": stream,
+                                     "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == (second_status if first_status == 410 else first_status)
+    assert response.json() == error
+    assert fake.hosts == ["one.local", "two.local"]
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        assert conn.execute("SELECT provider_name, status_code FROM Logs ORDER BY id DESC LIMIT 1").fetchone() == (
+            "two" if first_status == 410 else "one", response.status_code)

@@ -418,6 +418,10 @@ async def chat_completions(
             payload, endpoint, provider_model
         )
         cooldown_remaining = _impl.provider_cooldown_remaining(endpoint)
+        if fallback_client_error:
+            cooldown_remaining = max(cooldown_remaining, _impl.provider_cooldown_remaining(
+                endpoint, scope=_impl.FREE_POOL_UNAVAILABLE_SCOPE
+            ))
         if cooldown_remaining > 0:
             number, attempt_started_at, attempt_started_monotonic = begin_attempt()
             cooldown_reason = f"provider cooldown active ({cooldown_remaining:.1f}s remaining)"
@@ -651,7 +655,8 @@ async def chat_completions(
 
                 error_msg = raw_text
                 retry_model = _impl.codex_note_error(endpoint, upstream_status, error_msg) if hasattr(_impl, "codex_note_error") else False
-                if fallback_client_error and upstream_status in {400, 422}:
+                if fallback_client_error and upstream_status in _impl.FREE_POOL_CLIENT_ERROR_STATUSES:
+                    _impl.free_pool_unavailable_cooldown(endpoint, upstream_status, error_msg)
                     if first_client_error is None:
                         first_client_error = (upstream_status, content, content_type, provider_name, provider_model, error_msg, first_response_at)
                     record_attempt(number, provider_name, provider_model, upstream_status, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)

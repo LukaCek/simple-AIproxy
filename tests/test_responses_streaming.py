@@ -531,7 +531,7 @@ class FreePoolBadRequestClient(SequencedStreamingRouteClient):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("upstream_status", [400, 422])
+@pytest.mark.parametrize("upstream_status", [400, 404, 410, 422])
 @pytest.mark.parametrize("scenario", ["recover", "tool_history", "exhaust", "mixed_exhaust", "direct", "other_group", "malformed", "malformed_role"])
 def test_free_pool_upstream_client_error_fallback(tmp_path, monkeypatch, stream, upstream_status, scenario):
     streaming = get_streaming_module()
@@ -673,3 +673,63 @@ def test_422_reasoning_detection_uses_validation_location_not_echoed_input():
     assert not detect(422, "reasoning_content unsupported")
     assert not detect(429, json.dumps(error))
     assert detect(400, "reasoning_content is unsupported")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status_code,error_body,quarantine", [
+    (410, {"error": {"message": "Gone"}}, True),
+    (404, {"error": {"code": "model_not_found", "message": "model missing"}}, True),
+    (404, {"error": {"message": "resource not found"}}, False),
+])
+def test_free_pool_unavailable_model_cooldown_and_recheck(tmp_path, monkeypatch, stream, status_code, error_body, quarantine):
+    streaming = get_streaming_module()
+    impl = streaming._impl
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    monkeypatch.setattr(impl, "FREE_POOL_UNAVAILABLE_COOLDOWN_SECONDS", 300)
+    # Second request must skip a quarantined model, but an ambiguous 404
+    # must be attempted again. Direct requests bypass the free-pool quarantine.
+    outcomes = [(status_code, error_body), (200, "backup one")]
+    if not quarantine:
+        outcomes.append((status_code, error_body))
+    outcomes.extend([(200, "backup two"), (200, "direct"), (200, "recovered")])
+    fake = FreePoolBadRequestClient(outcomes)
+    config = {
+        "providers": [
+            {"name": "gone", "url": "http://gone.local/v1", "api_key": "k1", "models": ["m1"]},
+            {"name": "backup", "url": "http://backup.local/v1", "api_key": "k2", "models": ["m2"]},
+        ],
+        "groups": {"free-models": {"strategy": "fallback", "members": [
+            {"provider": "gone", "model": "m1"}, {"provider": "backup", "model": "m2"}
+        ]}},
+    }
+    endpoint = {"name": "gone", "model": "m1"}
+    impl.config_data = config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(impl, "http_client", fake)
+        impl.config_data = config
+
+        def post(model):
+            return client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
+                               json={"model": model, "stream": stream, "messages": [{"role": "user", "content": "hi"}]})
+
+        assert "backup one" in post("free-models").text
+        assert (impl.provider_cooldown_remaining(endpoint, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) > 0) == quarantine
+        assert impl.provider_cooldown_remaining(endpoint) == 0
+        assert impl.provider_cooldown_remaining({"name": "gone", "model": "other"}, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) == 0
+        assert "backup two" in post("free-models").text
+        assert "direct" in post("m1").text
+        # Expire only this scoped entry; no sleep or external provider probes.
+        with impl.provider_cooldowns_lock:
+            impl.provider_cooldowns[f"{impl.FREE_POOL_UNAVAILABLE_SCOPE}::{impl.provider_cooldown_key(endpoint)}"] = 0
+        assert "recovered" in post("free-models").text
+        assert impl.provider_cooldown_remaining(endpoint, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) == 0
+
+    expected = ["gone.local", "backup.local"]
+    if not quarantine:
+        expected.append("gone.local")
+    expected.extend(["backup.local", "gone.local", "gone.local"])
+    assert fake.hosts == expected
+    assert not fake.responses
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        actions = [row[0] for row in conn.execute("SELECT action FROM ProviderAttempts ORDER BY id")]
+    assert actions == ["fallback", "success", "cooldown_skip" if quarantine else "fallback", "success", "success", "success"]

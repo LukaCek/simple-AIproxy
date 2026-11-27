@@ -46,6 +46,7 @@ UPSTREAM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AIPROXY_UPSTREAM_TIMEOUT_SEC
 PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("AIPROXY_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
 PROVIDER_TIMEOUT_COOLDOWN_SECONDS = float(os.getenv("AIPROXY_PROVIDER_TIMEOUT_COOLDOWN_SECONDS", "30"))
 PROVIDER_TRANSIENT_COOLDOWN_SECONDS = float(os.getenv("AIPROXY_PROVIDER_TRANSIENT_COOLDOWN_SECONDS", "20"))
+FREE_POOL_UNAVAILABLE_COOLDOWN_SECONDS = float(os.getenv("AIPROXY_FREE_POOL_UNAVAILABLE_COOLDOWN_SECONDS", "300"))
 MIN_COMPLETION_TOKENS = int(os.getenv("AIPROXY_MIN_COMPLETION_TOKENS", "1024"))
 OLLAMA_DISABLE_THINKING = os.getenv("AIPROXY_OLLAMA_DISABLE_THINKING", "false").lower() not in {"0", "false", "no"}
 
@@ -434,8 +435,10 @@ def provider_cooldown_key(endpoint: Dict[str, Any]) -> str:
     return f"{endpoint.get('name', '')}::{endpoint.get('model', '')}"
 
 
-def provider_cooldown_remaining(endpoint: Dict[str, Any]) -> float:
+def provider_cooldown_remaining(endpoint: Dict[str, Any], *, scope: str = "") -> float:
     key = provider_cooldown_key(endpoint)
+    if scope:
+        key = f"{scope}::{key}"
     now = time.monotonic()
     with provider_cooldowns_lock:
         expires_at = provider_cooldowns.get(key)
@@ -448,11 +451,13 @@ def provider_cooldown_remaining(endpoint: Dict[str, Any]) -> float:
         return remaining
 
 
-def set_provider_cooldown(endpoint: Dict[str, Any], seconds: float) -> None:
+def set_provider_cooldown(endpoint: Dict[str, Any], seconds: float, *, scope: str = "") -> None:
     duration = max(0.0, float(seconds))
     if duration <= 0:
         return
     key = provider_cooldown_key(endpoint)
+    if scope:
+        key = f"{scope}::{key}"
     expires_at = time.monotonic() + duration
     with provider_cooldowns_lock:
         provider_cooldowns[key] = max(provider_cooldowns.get(key, 0.0), expires_at)
@@ -629,8 +634,43 @@ def is_unsupported_reasoning_content_error(status_code: int, error_text: str) ->
     return False
 
 
+FREE_POOL_CLIENT_ERROR_STATUSES = frozenset({400, 404, 410, 422})
+FREE_POOL_UNAVAILABLE_SCOPE = "free-pool-unavailable"
+
+
+def free_pool_unavailable_cooldown(endpoint: Dict[str, Any], status_code: int, error_text: str) -> None:
+    """Temporarily skip a gone endpoint or an explicitly missing model in the free pool.
+
+    A generic 404 may be request-specific. Fall back without quarantining it.
+    Use only structured error fields, never echoed input or arbitrary JSON text.
+    Expiration allows demand-driven rechecking; no extra provider requests.
+    """
+    unavailable = status_code == 410
+    if status_code == 404:
+        try:
+            body = json.loads(error_text)
+        except (TypeError, ValueError):
+            return
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            code = str(error.get("code") or "").lower()
+            kind = str(error.get("type") or "").lower()
+            message = str(error.get("message") or "").lower()
+            unavailable = (
+                code in {"model_not_found", "model_not_available", "model_not_supported", "unknown_model"}
+                or kind in {"model_not_found", "model_not_available", "unknown_model"}
+                or ("model" in message and any(marker in message for marker in (
+                    "does not exist", "not found", "no longer available", "not supported", "unknown model"
+                )))
+            )
+    if unavailable:
+        set_provider_cooldown(
+            endpoint, FREE_POOL_UNAVAILABLE_COOLDOWN_SECONDS, scope=FREE_POOL_UNAVAILABLE_SCOPE
+        )
+
+
 def free_pool_can_fallback_bad_request(model: str, payload: Dict[str, Any], endpoint_count: int) -> bool:
-    """Allow ambiguous upstream 400/422 errors only in the explicitly selected free pool.
+    """Allow upstream 400/404/410/422 errors only in the explicitly selected free pool.
 
     A valid chat request can be rejected by one model's tool/schema dialect.
     Do not change direct model or other group semantics, and do not fan out
@@ -2713,6 +2753,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             last_error = reason
             continue
         cooldown_remaining = provider_cooldown_remaining(endpoint)
+        if fallback_client_error:
+            cooldown_remaining = max(cooldown_remaining, provider_cooldown_remaining(
+                endpoint, scope=FREE_POOL_UNAVAILABLE_SCOPE
+            ))
         if cooldown_remaining > 0:
             number, attempt_started_at, attempt_started_monotonic = begin_attempt()
             cooldown_reason = f"provider cooldown active ({cooldown_remaining:.1f}s remaining)"
@@ -2800,7 +2844,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
                     return Response(json.dumps(chat_completion_from_text(provider_model, text), ensure_ascii=False), status_code=200, media_type="application/json")
                 error_msg = raw_text
                 retry_model = codex_note_error(endpoint, response.status_code, error_msg) if "codex_note_error" in globals() else False
-                if fallback_client_error and response.status_code in {400, 422}:
+                if fallback_client_error and response.status_code in FREE_POOL_CLIENT_ERROR_STATUSES:
+                    free_pool_unavailable_cooldown(endpoint, response.status_code, error_msg)
                     if first_client_error is None:
                         first_client_error = (response.status_code, content, response.headers.get("content-type", "application/json"), provider_name, provider_model, error_msg, first_response_at)
                     record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)
@@ -2895,7 +2940,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks, 
             await response.aclose()
             first_response_at = datetime.utcnow().isoformat()
             error_msg = content.decode("utf-8", errors="replace")
-            if fallback_client_error and response.status_code in {400, 422}:
+            if fallback_client_error and response.status_code in FREE_POOL_CLIENT_ERROR_STATUSES:
+                free_pool_unavailable_cooldown(endpoint, response.status_code, error_msg)
                 if first_client_error is None:
                     first_client_error = (response.status_code, content, content_type, provider_name, provider_model, error_msg, first_response_at)
                 record_attempt(number, provider_name, provider_model, response.status_code, "fallback", error_msg, attempt_started_at, attempt_started_monotonic)

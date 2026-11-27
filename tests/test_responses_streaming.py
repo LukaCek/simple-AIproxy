@@ -531,7 +531,7 @@ class FreePoolBadRequestClient(SequencedStreamingRouteClient):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("upstream_status", [400, 422])
+@pytest.mark.parametrize("upstream_status", [400, 404, 410, 422])
 @pytest.mark.parametrize("scenario", ["recover", "tool_history", "exhaust", "mixed_exhaust", "direct", "other_group", "malformed", "malformed_role"])
 def test_free_pool_upstream_client_error_fallback(tmp_path, monkeypatch, stream, upstream_status, scenario):
     streaming = get_streaming_module()
@@ -590,6 +590,9 @@ def test_free_pool_upstream_client_error_fallback(tmp_path, monkeypatch, stream,
     if scenario in {"recover", "tool_history"}:
         assert response.status_code == 200
         assert "recovered" in response.text
+    elif retry and upstream_status in {404, 410}:
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "free_pool_unavailable"
     else:
         assert response.status_code == upstream_status
         assert response.json() == first_error
@@ -603,7 +606,7 @@ def test_free_pool_upstream_client_error_fallback(tmp_path, monkeypatch, stream,
     assert len(attempts) == (2 if retry else 1)
     assert attempts[0][3] == ("fallback" if retry else "returned_error")
     assert all(row[0] == final[0] for row in attempts)
-    assert final[1:] == (("groq", 200) if scenario in {"recover", "tool_history"} else ("gemini", upstream_status))
+    assert final[1:] == (("groq", 200) if scenario in {"recover", "tool_history"} else ("gemini", response.status_code))
     if retry:
         assert attempts[1][3] == ("success" if scenario in {"recover", "tool_history"} else "fallback")
 
@@ -673,3 +676,142 @@ def test_422_reasoning_detection_uses_validation_location_not_echoed_input():
     assert not detect(422, "reasoning_content unsupported")
     assert not detect(429, json.dumps(error))
     assert detect(400, "reasoning_content is unsupported")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("recovery", ["direct", "expiry"])
+@pytest.mark.parametrize("status_code,error_body,quarantine", [
+    (410, {"error": {"message": "Gone"}}, True),
+    (404, {"error": {"code": "model_not_found", "message": "model missing"}}, True),
+    (404, {"error": {"message": "resource not found"}}, False),
+])
+def test_free_pool_unavailable_model_cooldown_and_recheck(tmp_path, monkeypatch, stream, recovery, status_code, error_body, quarantine):
+    streaming = get_streaming_module()
+    impl = streaming._impl
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    monkeypatch.setattr(impl, "FREE_POOL_UNAVAILABLE_COOLDOWN_SECONDS", 300)
+    # Second request must skip a quarantined model, but an ambiguous 404
+    # must be attempted again. Direct requests bypass the free-pool quarantine.
+    outcomes = [(status_code, error_body), (200, "backup one")]
+    if not quarantine:
+        outcomes.append((status_code, error_body))
+    outcomes.append((200, "backup two"))
+    if recovery == "direct":
+        outcomes.append((200, "direct"))
+    outcomes.append((200, "recovered"))
+    fake = FreePoolBadRequestClient(outcomes)
+    config = {
+        "providers": [
+            {"name": "gone", "url": "http://gone.local/v1", "api_key": "k1", "models": ["m1"]},
+            {"name": "backup", "url": "http://backup.local/v1", "api_key": "k2", "models": ["m2"]},
+        ],
+        "groups": {"free-models": {"strategy": "fallback", "members": [
+            {"provider": "gone", "model": "m1"}, {"provider": "backup", "model": "m2"}
+        ]}},
+    }
+    endpoint = {"name": "gone", "model": "m1"}
+    impl.config_data = config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(impl, "http_client", fake)
+        impl.config_data = config
+
+        def post(model):
+            return client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
+                               json={"model": model, "stream": stream, "messages": [{"role": "user", "content": "hi"}]})
+
+        assert "backup one" in post("free-models").text
+        assert (impl.provider_cooldown_remaining(endpoint, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) > 0) == quarantine
+        assert impl.provider_cooldown_remaining(endpoint) == 0
+        assert impl.provider_cooldown_remaining({"name": "gone", "model": "other"}, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) == 0
+        assert "backup two" in post("free-models").text
+        if recovery == "direct":
+            assert "direct" in post("m1").text
+            assert impl.provider_cooldown_remaining(endpoint, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) == 0
+        else:
+            # Expire only this scoped entry; no sleep or external provider probes.
+            with impl.provider_cooldowns_lock:
+                impl.provider_cooldowns[f"{impl.FREE_POOL_UNAVAILABLE_SCOPE}::{impl.provider_cooldown_key(endpoint)}"] = 0
+        assert "recovered" in post("free-models").text
+        assert impl.provider_cooldown_remaining(endpoint, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) == 0
+
+    expected = ["gone.local", "backup.local"]
+    if not quarantine:
+        expected.append("gone.local")
+    expected.extend(["backup.local"] + (["gone.local"] if recovery == "direct" else []) + ["gone.local"])
+    assert fake.hosts == expected
+    assert not fake.responses
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        actions = [row[0] for row in conn.execute("SELECT action FROM ProviderAttempts ORDER BY id")]
+    assert actions == ["fallback", "success", "cooldown_skip" if quarantine else "fallback", "success"] + (["success"] if recovery == "direct" else []) + ["success"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_single_free_model_unavailable_then_cooldown(tmp_path, monkeypatch, stream):
+    streaming = get_streaming_module()
+    impl = streaming._impl
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    monkeypatch.setattr(impl, "FREE_POOL_UNAVAILABLE_COOLDOWN_SECONDS", 300)
+    fake = FreePoolBadRequestClient([(410, {"error": {"message": "Gone"}})])
+    config = {
+        "providers": [{"name": "gone", "url": "http://gone.local/v1", "api_key": "k1", "models": ["m1"]}],
+        "groups": {"free-models": {"strategy": "fallback", "members": [{"provider": "gone", "model": "m1"}]}},
+    }
+    impl.config_data = config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(impl, "http_client", fake)
+        impl.config_data = config
+        for _ in range(2):
+            response = client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
+                                   json={"model": "free-models", "stream": stream,
+                                         "messages": [{"role": "user", "content": "hi"}]})
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "free_pool_unavailable"
+    assert fake.hosts == ["gone.local"]
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        assert conn.execute("SELECT action FROM ProviderAttempts ORDER BY id").fetchall() == [("fallback",), ("cooldown_skip",)]
+        assert conn.execute("SELECT status_code FROM Logs ORDER BY id").fetchall() == [(503,), (503,)]
+
+
+def test_unavailable_cooldown_does_not_infer_model_error_from_echoed_message(monkeypatch):
+    impl = get_streaming_module()._impl
+    monkeypatch.setattr(impl, "provider_cooldowns", {})
+    endpoint = {"name": "provider", "model": "m1"}
+    impl.free_pool_unavailable_cooldown(endpoint, 404, json.dumps(
+        {"error": {"message": "Input 'model not found' could not be processed"}}))
+    assert impl.provider_cooldown_remaining(endpoint, scope=impl.FREE_POOL_UNAVAILABLE_SCOPE) == 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("first_status,second_status", [(410, 422), (400, 410)])
+def test_free_pool_exhaustion_prefers_request_error(tmp_path, monkeypatch, stream, first_status, second_status):
+    streaming = get_streaming_module()
+    impl = streaming._impl
+    setup_streaming_key_db(streaming, tmp_path, monkeypatch)
+    error = {"error": {"message": "request rejected"}}
+    gone = {"error": {"message": "Gone"}}
+    fake = FreePoolBadRequestClient([
+        (first_status, gone if first_status == 410 else error),
+        (second_status, gone if second_status == 410 else error),
+    ])
+    config = {
+        "providers": [
+            {"name": "one", "url": "http://one.local/v1", "api_key": "k1", "models": ["m1"]},
+            {"name": "two", "url": "http://two.local/v1", "api_key": "k2", "models": ["m2"]},
+        ],
+        "groups": {"free-models": {"strategy": "fallback", "members": [
+            {"provider": "one", "model": "m1"}, {"provider": "two", "model": "m2"},
+        ]}},
+    }
+    impl.config_data = config
+    with TestClient(streaming.app) as client:
+        monkeypatch.setattr(impl, "http_client", fake)
+        impl.config_data = config
+        response = client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
+                               json={"model": "free-models", "stream": stream,
+                                     "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == (second_status if first_status == 410 else first_status)
+    assert response.json() == error
+    assert fake.hosts == ["one.local", "two.local"]
+    with sqlite3.connect(tmp_path / "streaming.db") as conn:
+        assert conn.execute("SELECT provider_name, status_code FROM Logs ORDER BY id DESC LIMIT 1").fetchone() == (
+            "two" if first_status == 410 else "one", response.status_code)

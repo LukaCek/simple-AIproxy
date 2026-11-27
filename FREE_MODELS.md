@@ -95,9 +95,20 @@ At runtime:
   of immediately retrying it.
 - a provider-specific compatibility `400` complaining about historical
   assistant `reasoning_content` is retried once after stripping only that
-  unsupported field. Other `400` errors are returned rather than hidden by a
-  blind fallback.
-- successful requests clear stale cooldown state.
+  unsupported field; a narrowly identified `422` validation error receives the
+  same compatibility retry.
+- only for a structurally valid request to the `free-models` fallback group,
+  upstream `400`, `404`, `410`, and `422` can advance to the next eligible endpoint.
+  Direct model requests and other groups keep their original error behavior.
+- `410`, or a `404` with an explicit missing-model error code/type or exact
+  missing-model message, temporarily quarantines only that credential/model in
+  the free pool. Generic `404` does not quarantine. After expiry, the next
+  eligible request can try again; a successful direct call also clears quarantine.
+- if the pool is exhausted after an upstream `404`/`410` or a quarantine skip,
+  return `503` (`free_pool_unavailable`) instead of suggesting that the alias
+  itself was deleted. A recorded `400`/`422` takes precedence and retains its
+  original upstream body. Other exhaustion behavior is unchanged.
+- successful requests clear stale cooldown state; no retry after streaming starts.
 
 Cooldown state is in memory and resets when the process restarts.
 
@@ -114,6 +125,7 @@ AIPROXY_FREE_MODELS_CACHE_PATH=/app/cache/free-models-registry.json
 AIPROXY_PROVIDER_RATE_LIMIT_COOLDOWN_SECONDS=60
 AIPROXY_PROVIDER_TIMEOUT_COOLDOWN_SECONDS=30
 AIPROXY_PROVIDER_TRANSIENT_COOLDOWN_SECONDS=20
+AIPROXY_FREE_POOL_UNAVAILABLE_COOLDOWN_SECONDS=300 # 0 disables quarantine
 ```
 
 The production Docker Compose configuration mounts both `app.db` and `./cache`, so UI-managed provider credentials and the last-known-good registry survive container recreation.

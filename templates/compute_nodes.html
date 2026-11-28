@@ -2,6 +2,19 @@
 {% block content %}
 <section class="space-y-6">
   <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div><h2 class="text-xl font-semibold">Worker dashboard</h2>
+      <p id="live-status" role="status" class="mt-1 text-xs text-slate-500">Waiting for telemetry…</p></div>
+      <div class="flex gap-2"><button id="live-toggle" type="button" class="rounded-lg border px-3 py-2 text-sm" aria-pressed="true">Pause live</button>
+      <button id="live-refresh" type="button" class="rounded-lg border px-3 py-2 text-sm">Refresh now</button></div>
+    </div>
+    <div id="live-totals" class="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4"></div>
+    <div id="live-workers" class="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3"></div>
+    <p class="mt-3 text-xs text-slate-500">Refresh every 5 seconds; worker telemetry may arrive less frequently. Speeds are last measured benchmarks, not live token rates.</p>
+    <a href="#worker-details" class="mt-3 inline-block text-sm underline">Worker settings and diagnostics</a>
+  </div>
+
+  <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
     <h2 class="text-xl font-semibold">Compute nodes</h2>
     <p class="mt-2 text-sm text-slate-600">Outbound-only CPU workers. Unknown or friend's computers are untrusted by default. Each machine must enroll with a one-time token.</p>
     <div class="mt-4 flex flex-wrap gap-3">
@@ -15,8 +28,8 @@
       <p class="mt-2 text-sm">Use it in WORKER_ENROLLMENT_TOKEN inside worker/.env on the remote Docker host. Once enrolled, the worker stores its own identity.</p>
     </div>
   </div>
-  <div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-    <h2 class="text-lg font-semibold">Models managed by SimpleAI Proxy</h2>
+  <details class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+    <summary class="cursor-pointer text-lg font-semibold">Models managed by SimpleAI Proxy</summary>
     <div class="mt-3 flex flex-wrap items-center gap-3 rounded-lg bg-slate-50 p-3 text-sm">
       <label for="placement">Model placement</label>
       <select id="placement" class="rounded-lg border p-2">
@@ -67,9 +80,9 @@
         <span class="text-xs text-slate-500">Policy version {{ policy.revision }} · Save again to re-test the selected models</span>
       </div>
     </form>
-  </div>
+  </details>
   <div id="notice" role="status" class="hidden rounded-lg border p-3 text-sm"></div>
-  <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+  <div id="worker-details" class="grid grid-cols-1 gap-4 lg:grid-cols-2">
   {% for node in nodes %}
     <article data-node-id="{{ node.id }}" class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
       <div class="flex items-center justify-between gap-2">
@@ -384,14 +397,78 @@ function refreshConnectionHealth(node, card) {
     " · RTT is WSS round-trip latency, not AI inference latency";
 }
 // Refresh only the live parts of node cards; never reset the admin form.
+let liveEnabled = true;
+function liveElement(tag, cls, value) {
+  const el = document.createElement(tag);
+  el.className = cls;
+  if(value !== undefined) el.textContent = value;
+  return el;
+}
+function renderLiveWorkers(nodes) {
+  const now = Date.now()/1000;
+  const totals = document.getElementById("live-totals");
+  const grid = document.getElementById("live-workers");
+  totals.replaceChildren();
+  grid.replaceChildren();
+  const fresh = n => n.online && n.last_seen > 0 && now-n.last_seen <= 45;
+  const busy = n => fresh(n) && (n.models?.busy || n.models?.running_tasks > 0);
+  for(const [label,value] of [["Registered",nodes.length],["Online",nodes.filter(n=>n.online).length],
+    ["Running",nodes.filter(busy).length],["Ready",nodes.filter(n=>fresh(n)&&n.models?.ready).length]]) {
+    const tile = liveElement("div","rounded-xl bg-slate-50 p-3");
+    tile.append(liveElement("p","text-xs text-slate-500",label),liveElement("p","text-2xl font-semibold",String(value)));
+    totals.append(tile);
+  }
+  for(const n of nodes) {
+    const m=n.models||{}, h=n.hardware||{}, caps=m.capabilities||{};
+    const testing=Object.entries(caps).filter(([_,v])=>v.status==="testing").map(([k])=>k);
+    const errors=Object.values(caps).filter(v=>v.status==="error").length;
+    const state=n.revoked?"Revoked":!n.online?"Offline":!fresh(n)?"Stale telemetry":busy(n)?"Running inference":testing.length?"Testing models":m.ready?"Ready / idle":errors?"Model errors":"Not ready";
+    const card=liveElement("article","rounded-xl border border-slate-200 p-4 space-y-2");
+    card.append(liveElement("h3","font-semibold break-words",n.name),
+      liveElement("p","text-sm font-medium "+(busy(n)?"text-blue-700":fresh(n)&&m.ready?"text-green-700":"text-amber-700"),state),
+      liveElement("p","text-xs break-words text-slate-600","Loaded model: "+(m.active||"none")),
+      liveElement("p","text-xs text-slate-600","Active slots: "+(fresh(n)?String(m.running_tasks??0):"unknown")+" · Model errors: "+errors));
+    if(testing.length && fresh(n)) card.append(liveElement("p","text-xs break-words","Testing: "+testing.join(", ")));
+    function meter(label,used,limit) {
+      if(!Number.isFinite(used)||!Number.isFinite(limit)||limit<=0||used<0) {
+        card.append(liveElement("p","text-xs text-slate-500",label+": unavailable"));return;
+      }
+      const percent=Math.max(0,Math.min(100,used/limit*100));
+      card.append(liveElement("p","text-xs text-slate-600",label+": "+(used/1073741824).toFixed(1)+" / "+(limit/1073741824).toFixed(1)+" GiB"));
+      const bar=liveElement("div","h-2 rounded-full bg-slate-100 overflow-hidden");
+      const fill=liveElement("div","h-full bg-slate-500 rounded-full");
+      fill.style.width=percent+"%";bar.append(fill);card.append(bar);
+    }
+    meter("RAM limit minus available (estimate)",h.memory_limit_bytes-h.memory_available_bytes,h.memory_limit_bytes);
+    meter("Model storage",m.disk_used_bytes,m.disk_limit_bytes);
+    const speed=caps[m.active]?.benchmark?.generation_tps;
+    card.append(liveElement("p","text-xs text-slate-600","Benchmark: "+(Number.isFinite(speed)?speed+" tok/s":"unavailable")),
+      liveElement("p","text-xs text-slate-600","WSS RTT: "+(fresh(n)&&Number.isFinite(m.network?.ping_rtt_ms)?m.network.ping_rtt_ms+" ms":"unknown")),
+      liveElement("p","text-xs text-slate-500","Last telemetry: "+(n.last_seen?displayUpdateTime(n.last_seen):"never")));
+    grid.append(card);
+  }
+  if(!nodes.length) grid.append(liveElement("p","text-sm text-slate-500","No workers registered."));
+}
+document.getElementById("live-toggle").onclick = () => {
+  liveEnabled=!liveEnabled;
+  const button=document.getElementById("live-toggle");
+  button.textContent=liveEnabled?"Pause live":"Resume live";
+  button.setAttribute("aria-pressed",String(liveEnabled));
+  if(liveEnabled) refreshNodeStatuses();
+  else document.getElementById("live-status").textContent="Paused — values are last known.";
+};
+document.getElementById("live-refresh").onclick = () => refreshNodeStatuses(true);
+
 let refreshingNodes = false;
-async function refreshNodeStatuses() {
-  if(refreshingNodes || document.hidden) return;
+async function refreshNodeStatuses(force = false) {
+  if(refreshingNodes || document.hidden || (!liveEnabled && !force)) return;
   refreshingNodes = true;
   try {
     const response = await fetch("/admin/api/compute/nodes", {cache: "no-store"});
-    if(!response.ok) return;
+    if(!response.ok) throw new Error("Worker telemetry unavailable");
     const body = await response.json();
+    renderLiveWorkers(body.nodes || []);
+    document.getElementById("live-status").textContent=(liveEnabled?"Live · ":"Paused · ")+"Last refreshed "+new Date().toLocaleTimeString();
     for(const node of body.nodes || []) {
       const card = Array.from(document.querySelectorAll("[data-node-id]"))
         .find(el => el.dataset.nodeId === node.id);
@@ -432,6 +509,7 @@ async function refreshNodeStatuses() {
       }
     }
   } catch(err) {
+    document.getElementById("live-status").textContent="Refresh failed — displayed values are last known.";
     // Temporary network failures must not block manual admin controls.
   } finally { refreshingNodes = false; }
 }
